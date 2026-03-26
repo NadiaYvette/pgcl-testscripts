@@ -442,9 +442,9 @@ echo "========================================"
 
 # Check kernel log for problems
 if [ -f /proc/kmsg ] || true; then
-    if dmesg 2>/dev/null | grep -vE "command line:|panic=" | grep -qE "BUG:|BUG |Oops|panic|Bad page state|WARNING:"; then
+    if dmesg 2>/dev/null | grep -viE "command line:|panic=" | grep -qE "BUG:|BUG |Oops|panic[^=]|Bad page state|WARNING:"; then
         echo "WARNING: kernel log contains errors!"
-        dmesg | grep -vE "command line:|panic=" | grep -E "BUG:|BUG |Oops|panic|Bad page state|WARNING:" | head -10
+        dmesg | grep -viE "command line:|panic=" | grep -E "BUG:|BUG |Oops|panic[^=]|Bad page state|WARNING:" | head -10
     fi
 fi
 
