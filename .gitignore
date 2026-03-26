@@ -1,0 +1,21 @@
+# Build outputs
+tmp/
+userspace/build/
+userspace/initramfs/*.cpio.gz
+userspace/initramfs/arm/
+userspace/initramfs/riscv64/
+
+# Sysroots (large, reproducible from musl/glibc)
+userspace/sysroot/
+userspace/hppa-sysroot/
+
+# Disk images
+*.img
+*.fd
+
+# Logs
+*.log
+
+# Editor
+*~
+*.swp
