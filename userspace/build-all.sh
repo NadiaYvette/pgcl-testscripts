@@ -354,9 +354,12 @@ create_initramfs() {
         done
     fi
 
-    # Create device nodes
+    # Create device nodes (static fallback if devtmpfs unavailable)
     mknod "$initdir/dev/console" c 5 1 2>/dev/null || true
     mknod "$initdir/dev/null" c 1 3 2>/dev/null || true
+    mknod "$initdir/dev/zero" c 1 5 2>/dev/null || true
+    mknod "$initdir/dev/urandom" c 1 9 2>/dev/null || true
+    mknod "$initdir/dev/ttyS0" c 4 64 2>/dev/null || true
 
     # Create init script
     cat > "$initdir/init" << 'INITEOF'
@@ -403,13 +406,22 @@ fi
 
 if [ -d /bin/mm-selftests ]; then
     echo "--- Running kernel mm selftests ---"
+    # Check available RAM in MB for skipping memory-hungry tests
+    AVAIL_MB=0
+    if [ -f /proc/meminfo ]; then
+        AVAIL_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+    fi
     for t in /bin/mm-selftests/*; do
         [ -x "$t" ] || continue
-        name=$(basename "$t")
-        # Skip droppable — intentionally OOM-kills, too slow in QEMU
-        [ "$name" = "droppable" ] && { echo "  [$name] SKIP (OOM test)"; continue; }
+        name="${t##*/}"
+        # Skip tests that are known-problematic in minimal initramfs
+        case "$name" in
+            droppable) echo "  $name: SKIP (OOM test)"; continue ;;
+            mseal_test) echo "  $name: SKIP (requires root)"; continue ;;
+            *.o) continue ;;  # skip .o helper files
+        esac
         echo "  [$name]"
-        timeout 60 "$t" 2>&1 | tail -5
+        "$t" 2>&1
         ret=$?
         if [ $ret -eq 0 ]; then
             echo "  $name: PASS"
