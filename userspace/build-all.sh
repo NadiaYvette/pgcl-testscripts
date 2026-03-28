@@ -56,7 +56,7 @@ declare -A QEMU_CMD
 QEMU_CMD=(
   [x86_64]="qemu-system-x86_64 -M pc -m 1G -smp 4 -nographic -no-reboot"
   [aarch64]="qemu-system-aarch64 -M virt -cpu cortex-a53 -m 1G -smp 4 -nographic -no-reboot"
-  [arm]="qemu-system-arm -M virt -m 512M -nographic -no-reboot"
+  [arm]="qemu-system-arm -M virt -cpu cortex-a15 -m 2G -nographic -no-reboot"
   [riscv64]="qemu-system-riscv64 -M virt -m 1G -smp 4 -nographic -no-reboot -bios default"
   [powerpc64]="qemu-system-ppc64 -M powernv -m 1G -smp 4 -nographic -no-reboot"
   [s390x]="qemu-system-s390x -m 1G -smp 1 -nographic -no-reboot -nodefaults -serial stdio"
