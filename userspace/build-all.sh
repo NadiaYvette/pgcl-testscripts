@@ -322,7 +322,7 @@ create_initramfs() {
         cp "$bb_bin" "$initdir/bin/busybox"
         chmod +x "$initdir/bin/busybox"
         # Create symlinks for common commands
-        for cmd in sh ash ls cat echo mount mkdir mknod grep sleep \
+        for cmd in sh ash ls cat echo mount mkdir mknod grep sed sleep \
                    dmesg free ps top wc head tail stty getconf \
                    basename timeout uname \
                    poweroff reboot sysctl vi; do
