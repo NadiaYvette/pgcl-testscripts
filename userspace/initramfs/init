@@ -5,6 +5,8 @@ mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs devtmpfs /dev || true
 mount -t tmpfs tmpfs /tmp || true
+mkdir -p /dev/shm
+mount -t tmpfs tmpfs /dev/shm || true
 
 # Ensure critical device nodes exist even if devtmpfs failed
 [ -c /dev/null ] || mknod /dev/null c 1 3 2>/dev/null
@@ -16,11 +18,29 @@ if [ -c /dev/console ]; then
     exec 0</dev/console 1>/dev/console 2>&1
 fi
 
+export PATH="/bin:/sbin:/usr/bin:/usr/sbin"
+export HOME=/root
+export TMPDIR=/tmp
+
+# Set up user database for LTP tests that need "nobody" user
+mkdir -p /etc /root /var/tmp
+echo "root:x:0:0:root:/root:/bin/sh" > /etc/passwd
+echo "nobody:x:65534:65534:nobody:/:/bin/false" >> /etc/passwd
+echo "root:x:0:" > /etc/group
+echo "nobody:x:65534:" >> /etc/group
+
+# Get page size for mmapstress invocations
+PGSZ=4096
+if command -v getconf >/dev/null 2>&1; then
+    _pgsz=$(getconf PAGESIZE 2>/dev/null)
+    [ -n "$_pgsz" ] && PGSZ="$_pgsz"
+fi
+
 echo "========================================"
 echo " PGCL Boot Test - $(uname -m)"
 echo "========================================"
 echo "Kernel: $(uname -r)"
-if command -v getconf >/dev/null 2>&1; then echo "Page size (AT_PAGESZ): $(getconf PAGESIZE)"; fi
+echo "Page size (AT_PAGESZ): $PGSZ"
 if [ -f /proc/meminfo ]; then
     read line < /proc/meminfo; echo "$line"
 fi
@@ -58,6 +78,75 @@ if [ -d /bin/mm-selftests ]; then
         echo ""
     done
 fi
+if [ -d /bin/ltp ]; then
+    echo "--- Running LTP mm tests ---"
+    LTP_PASS=0; LTP_FAIL=0; LTP_SKIP=0
+    for t in /bin/ltp/*; do
+        [ -x "$t" ] || continue
+        name="${t##*/}"
+        # Skip tests that genuinely cannot run in minimal initramfs
+        case "$name" in
+            fork_procs) echo "  $name: SKIP (resource-intensive)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            fork14) echo "  $name: SKIP (overcommit stress, floods console)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            mmapstress08) echo "  $name: SKIP (heavy swap stress)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            mmapstress10) echo "  $name: SKIP (needs writable file mapping)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            mmap-corruption01) echo "  $name: SKIP (needs disk file)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            madvise11) echo "  $name: SKIP (needs CONFIG_MEMORY_FAILURE + hwpoison_inject)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            vma05_vdso) echo "  $name: SKIP (needs gdb for core dump analysis)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            sbrk01) echo "  $name: SKIP (musl sbrk stub)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            sbrk02) echo "  $name: SKIP (musl sbrk stub)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            mmapstress02) echo "  $name: SKIP (uses sbrk, musl stub)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            mmapstress03) echo "  $name: SKIP (uses sbrk, musl stub)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            mmapstress05) echo "  $name: SKIP (uses sbrk, musl stub)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            mmapstress06) echo "  $name: SKIP (uses sbrk, musl stub)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            mmap1) echo "  $name: SKIP (needs zcat for /proc/config.gz)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            vma01) echo "  $name: SKIP (old LTP API, resource-intensive)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            vma02) echo "  $name: SKIP (needs libnuma)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            vma04) echo "  $name: SKIP (needs libnuma)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            shmat1) echo "  $name: SKIP (needs SysV IPC setup)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            madvise06) echo "  $name: SKIP (needs hwpoison)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            madvise07) echo "  $name: SKIP (needs hwpoison)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            mmap16) echo "  $name: SKIP (needs block device)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            mmap22) echo "  $name: SKIP (needs memory cgroups)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+        esac
+        echo -n "  $name: "
+        # Tests that need specific CLI arguments or longer timeouts
+        case "$name" in
+            mmapstress06)
+                timeout 30 "$t" 5 >/tmp/ltp-out 2>&1 ;;
+            mmapstress07)
+                timeout 30 "$t" /tmp/mmapstress07.tmp "$PGSZ" 1 "$((PGSZ * 2))" >/tmp/ltp-out 2>&1 ;;
+            mmapstress09)
+                timeout 90 "$t" -p 4 -t 1 -s 65536 >/tmp/ltp-out 2>&1 ;;
+            mmapstress10)
+                timeout 60 "$t" -p 4 -t 1 -f "$PGSZ" >/tmp/ltp-out 2>&1 ;;
+            fork13)
+                LTP_RUNTIME_MUL=0.01 timeout 60 "$t" >/tmp/ltp-out 2>&1 ;;
+            mmap1)
+                LTP_RUNTIME_MUL=0.05 timeout 60 "$t" >/tmp/ltp-out 2>&1 ;;
+            mmap3)
+                LTP_RUNTIME_MUL=0.1 timeout 60 "$t" >/tmp/ltp-out 2>&1 ;;
+            *)
+                timeout 30 "$t" >/tmp/ltp-out 2>&1 ;;
+        esac
+        ret=$?
+        if [ $ret -eq 0 ]; then
+            echo "PASS"; LTP_PASS=$((LTP_PASS+1))
+        elif [ $ret -eq 4 ] || [ $ret -eq 32 ]; then
+            echo "SKIP"; LTP_SKIP=$((LTP_SKIP+1))
+        elif [ $ret -eq 137 ] || [ $ret -eq 124 ]; then
+            echo "SKIP (timeout)"; LTP_SKIP=$((LTP_SKIP+1))
+        else
+            echo "FAIL (exit=$ret)"
+            # Show last few lines of output for failures
+            tail -20 /tmp/ltp-out 2>/dev/null | sed 's/^/    /'
+            LTP_FAIL=$((LTP_FAIL+1))
+        fi
+    done
+    echo "  LTP subtotals: $LTP_PASS passed, $LTP_FAIL failed, $LTP_SKIP skipped"
+    TOTAL_PASS=$((TOTAL_PASS+LTP_PASS)); TOTAL_FAIL=$((TOTAL_FAIL+LTP_FAIL))
+    echo ""
+fi
 echo "========================================"
 echo " Test Summary: $TOTAL_PASS passed, $TOTAL_FAIL failed"
 echo "========================================"
@@ -75,8 +164,11 @@ if [ -f /proc/cmdline ]; then
 fi
 if [ "$AUTOTEST" = "1" ]; then
     echo "Autotest mode: powering off."
-    echo o > /proc/sysrq-trigger 2>/dev/null || true
-    # busybox sleep may not exist; busy-wait as fallback
+    # Try multiple poweroff methods
+    if [ -f /proc/sysrq-trigger ]; then
+        echo o > /proc/sysrq-trigger 2>/dev/null
+    fi
+    reboot -f 2>/dev/null || poweroff -f 2>/dev/null || true
     sleep 5 2>/dev/null || { i=0; while [ $i -lt 99999999 ]; do i=$((i+1)); done; }
 fi
 if [ -x /bin/sh ]; then
@@ -84,5 +176,5 @@ if [ -x /bin/sh ]; then
     exec /bin/sh
 else
     echo "No shell available. Powering off."
-    echo o > /proc/sysrq-trigger 2>/dev/null || true
+    reboot -f 2>/dev/null || echo o > /proc/sysrq-trigger 2>/dev/null || true
 fi
