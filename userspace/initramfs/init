@@ -120,7 +120,7 @@ if [ -d /bin/ltp ]; then
             mmapstress06)
                 timeout 30 "$t" 5 >/tmp/ltp-out 2>&1 ;;
             mmapstress07)
-                timeout 30 "$t" /tmp/mmapstress07.tmp "$PGSZ" 1 "$((PGSZ * 2))" >/tmp/ltp-out 2>&1 ;;
+                timeout 30 "$t" /tmp/mmapstress07.tmp >/tmp/ltp-out 2>&1 ;;
             mmapstress09)
                 timeout 90 "$t" -p 4 -t 1 -s 65536 >/tmp/ltp-out 2>&1 ;;
             mmapstress10)
@@ -144,7 +144,11 @@ if [ -d /bin/ltp ]; then
         else
             echo "FAIL (exit=$ret)"
             # Show last few lines of output for failures
-            tail -20 /tmp/ltp-out 2>/dev/null | sed 's/^/    /'
+            if command -v sed >/dev/null 2>&1; then
+                tail -20 /tmp/ltp-out 2>/dev/null | sed 's/^/    /'
+            else
+                tail -20 /tmp/ltp-out 2>/dev/null
+            fi
             LTP_FAIL=$((LTP_FAIL+1))
         fi
     done
