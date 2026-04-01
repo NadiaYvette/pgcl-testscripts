@@ -354,6 +354,17 @@ create_initramfs() {
         done
     fi
 
+    # Install LTP tests if available
+    local ltp_dir="$BUILD_BASE/ltp-$arch"
+    if [ -d "$ltp_dir" ] && [ "$(ls "$ltp_dir" 2>/dev/null | wc -l)" -gt 0 ]; then
+        mkdir -p "$initdir/bin/ltp"
+        for t in "$ltp_dir"/*; do
+            if [ -f "$t" ] && [ -x "$t" ]; then
+                cp "$t" "$initdir/bin/ltp/"
+            fi
+        done
+    fi
+
     # Create device nodes (static fallback if devtmpfs unavailable)
     mknod "$initdir/dev/console" c 5 1 2>/dev/null || true
     mknod "$initdir/dev/null" c 1 3 2>/dev/null || true
@@ -361,7 +372,11 @@ create_initramfs() {
     mknod "$initdir/dev/urandom" c 1 9 2>/dev/null || true
     mknod "$initdir/dev/ttyS0" c 4 64 2>/dev/null || true
 
-    # Create init script
+    # Use the shared init script if available, otherwise create inline
+    if [ -f "$INITRAMFS_DIR/init" ]; then
+        cp "$INITRAMFS_DIR/init" "$initdir/init"
+        chmod +x "$initdir/init"
+    else
     cat > "$initdir/init" << 'INITEOF'
 #!/bin/sh
 mount -t proc proc /proc 2>/dev/null
@@ -467,6 +482,7 @@ else
 fi
 INITEOF
     chmod +x "$initdir/init"
+    fi  # end of else (shared init script not found)
 
     # Create cpio archive
     (cd "$initdir" && find . -print0 | cpio --null -o -H newc 2>/dev/null | gzip) > "$outfile"

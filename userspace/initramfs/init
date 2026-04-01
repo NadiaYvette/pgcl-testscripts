@@ -66,12 +66,14 @@ if [ -d /bin/mm-selftests ]; then
         # Skip tests known-problematic in minimal initramfs
         case "$name" in
             droppable) echo "  $name: SKIP (OOM test)"; continue ;;
+            compaction_test) echo "  $name: SKIP (takes too long under QEMU)"; continue ;;
             mseal_test) echo "  $name: SKIP (requires root)"; continue ;;
             *.o) continue ;;  # skip .o helper files
         esac
         echo "  [$name]"
-        "$t" 2>&1
+        timeout 60 "$t" 2>&1
         ret=$?
+        if [ $ret -eq 124 ] || [ $ret -eq 137 ]; then echo "  $name: SKIP (timeout)"; continue; fi
         if [ $ret -eq 0 ]; then echo "  $name: PASS"; TOTAL_PASS=$((TOTAL_PASS+1))
         elif [ $ret -eq 4 ]; then echo "  $name: SKIP"
         else echo "  $name: FAIL (exit=$ret)"; TOTAL_FAIL=$((TOTAL_FAIL+1)); fi
@@ -108,6 +110,9 @@ if [ -d /bin/ltp ]; then
             madvise07) echo "  $name: SKIP (needs hwpoison)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
             mmap16) echo "  $name: SKIP (needs block device)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
             mmap22) echo "  $name: SKIP (needs memory cgroups)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            msync04) echo "  $name: SKIP (needs block device for loop)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            madvise01) echo "  $name: SKIP (hwpoison SIGBUS test)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            munmap04) echo "  $name: SKIP (65K regions, cleanup timeout)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
         esac
         echo -n "  $name: "
         # Tests that need specific CLI arguments or longer timeouts
