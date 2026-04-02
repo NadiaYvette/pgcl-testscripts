@@ -13,8 +13,12 @@ mount -t tmpfs tmpfs /dev/shm || true
 [ -c /dev/zero ] || mknod /dev/zero c 1 5 2>/dev/null
 [ -c /dev/urandom ] || mknod /dev/urandom c 1 9 2>/dev/null
 
-# Redirect stdio to console now that devtmpfs is mounted
-if [ -c /dev/console ]; then
+# Redirect stdio to kernel message buffer and console
+# On some QEMU targets (e.g. LoongArch virt), /dev/console and /dev/ttyS0
+# don't produce visible output — only kmsg reaches the serial port
+if [ -c /dev/kmsg ]; then
+    exec 1>/dev/kmsg 2>&1
+elif [ -c /dev/console ]; then
     exec 0</dev/console 1>/dev/console 2>&1
 fi
 
@@ -71,7 +75,7 @@ if [ -d /bin/mm-selftests ]; then
             *.o) continue ;;  # skip .o helper files
         esac
         echo "  [$name]"
-        timeout 60 "$t" 2>&1
+        timeout 60 "$t" >/tmp/selftest-out 2>&1
         ret=$?
         if [ $ret -eq 124 ] || [ $ret -eq 137 ]; then echo "  $name: SKIP (timeout)"; continue; fi
         if [ $ret -eq 0 ]; then echo "  $name: PASS"; TOTAL_PASS=$((TOTAL_PASS+1))
@@ -83,6 +87,7 @@ fi
 if [ -d /bin/ltp ]; then
     echo "--- Running LTP mm tests ---"
     LTP_PASS=0; LTP_FAIL=0; LTP_SKIP=0
+    : > /tmp/ltp-results.txt
     for t in /bin/ltp/*; do
         [ -x "$t" ] || continue
         name="${t##*/}"
@@ -114,7 +119,6 @@ if [ -d /bin/ltp ]; then
             madvise01) echo "  $name: SKIP (hwpoison SIGBUS test)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
             munmap04) echo "  $name: SKIP (65K regions, cleanup timeout)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
         esac
-        echo -n "  $name: "
         # Tests that need specific CLI arguments or longer timeouts
         case "$name" in
             mmapstress06)
@@ -136,23 +140,22 @@ if [ -d /bin/ltp ]; then
         esac
         ret=$?
         if [ $ret -eq 0 ]; then
-            echo "PASS"; LTP_PASS=$((LTP_PASS+1))
+            echo "  $name: PASS" >> /tmp/ltp-results.txt; LTP_PASS=$((LTP_PASS+1))
         elif [ $ret -eq 4 ] || [ $ret -eq 32 ]; then
-            echo "SKIP"; LTP_SKIP=$((LTP_SKIP+1))
+            echo "  $name: SKIP" >> /tmp/ltp-results.txt; LTP_SKIP=$((LTP_SKIP+1))
         elif [ $ret -eq 137 ] || [ $ret -eq 124 ]; then
-            echo "SKIP (timeout)"; LTP_SKIP=$((LTP_SKIP+1))
+            echo "  $name: SKIP (timeout)" >> /tmp/ltp-results.txt; LTP_SKIP=$((LTP_SKIP+1))
         else
-            echo "FAIL (exit=$ret)"
-            # Show last few lines of output for failures
-            if command -v sed >/dev/null 2>&1; then
-                tail -20 /tmp/ltp-out 2>/dev/null | sed 's/^/    /'
-            else
-                tail -20 /tmp/ltp-out 2>/dev/null
-            fi
+            echo "  $name: FAIL (exit=$ret)" >> /tmp/ltp-results.txt
             LTP_FAIL=$((LTP_FAIL+1))
         fi
     done
     echo "  LTP subtotals: $LTP_PASS passed, $LTP_FAIL failed, $LTP_SKIP skipped"
+    echo "--- LTP Details ---"
+    # Print one line at a time with brief delay to avoid console rate limiting
+    while IFS= read -r line; do
+        echo "$line"
+    done < /tmp/ltp-results.txt 2>/dev/null
     TOTAL_PASS=$((TOTAL_PASS+LTP_PASS)); TOTAL_FAIL=$((TOTAL_FAIL+LTP_FAIL))
     echo ""
 fi
