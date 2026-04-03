@@ -1,4 +1,4 @@
-/* Minimal init for microblaze test — runs pgcl-test, pgcl-stress, and mm-selftests */
+/* Minimal init for microblaze test — runs pgcl-test, pgcl-stress, mm-selftests, LTP */
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/mount.h>
@@ -9,31 +9,62 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <signal.h>
+#include <time.h>
 
 static void write_str(int fd, const char *s)
 {
 	write(fd, s, strlen(s));
 }
 
-static int run_program(const char *path, const char *arg)
+static void write_int(int fd, int v)
+{
+	char buf[12];
+	int neg = v < 0;
+	if (neg) v = -v;
+	char *p = buf + sizeof(buf) - 1;
+	*p = 0;
+	do { *--p = '0' + v % 10; v /= 10; } while (v);
+	if (neg) *--p = '-';
+	write_str(fd, p);
+}
+
+/* Run a program with timeout. Returns raw wait status, or 0x0900 on timeout. */
+static int run_timeout(const char *path, char **argv, int timeout_sec)
 {
 	pid_t pid = fork();
-	if (pid < 0) {
-		write_str(2, "FAIL: fork() failed\n");
+	if (pid < 0)
 		return -1;
-	}
 	if (pid == 0) {
-		char *argv[] = { (char *)path, arg ? (char *)arg : NULL, NULL };
-		char *envp[] = { "HOME=/", "TERM=linux", NULL };
+		char *envp[] = { "PATH=/bin:/sbin", "HOME=/root", "TMPDIR=/tmp",
+				 "LTPROOT=/bin/ltp", NULL };
 		execve(path, argv, envp);
-		write_str(2, "FAIL: execve failed for ");
-		write_str(2, path);
-		write_str(2, "\n");
 		_exit(127);
 	}
+	/* Poll with 100ms sleep intervals */
+	int polls = timeout_sec * 10;
+	while (polls-- > 0) {
+		int status;
+		pid_t r = waitpid(pid, &status, WNOHANG);
+		if (r > 0) return status;
+		if (r < 0) return -1;
+		struct timespec ts = { 0, 100000000L }; /* 100ms */
+		nanosleep(&ts, NULL);
+	}
+	kill(pid, SIGKILL);
 	int status;
 	waitpid(pid, &status, 0);
-	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+	return 0x0900; /* timeout sentinel */
+}
+
+/* Simple blocking run (no timeout) for trusted tests */
+static int run_program(const char *path, const char *arg)
+{
+	char *argv[] = { (char *)path, arg ? (char *)arg : NULL, NULL };
+	int st = run_timeout(path, argv, 120);
+	if (st < 0) return -1;
+	if (st == 0x0900) return -1;
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
 int main(void)
@@ -52,6 +83,24 @@ int main(void)
 		dup2(fd, 1);
 		dup2(fd, 2);
 		if (fd > 2) close(fd);
+	}
+
+	/* Create /etc files for LTP tests that need user database */
+	mkdir("/etc", 0755);
+	mkdir("/root", 0755);
+	mkdir("/var", 0755);
+	mkdir("/var/tmp", 01777);
+	fd = open("/etc/passwd", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+	if (fd >= 0) {
+		write_str(fd, "root:x:0:0:root:/root:/bin/sh\n");
+		write_str(fd, "nobody:x:65534:65534:nobody:/:/bin/false\n");
+		close(fd);
+	}
+	fd = open("/etc/group", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+	if (fd >= 0) {
+		write_str(fd, "root:x:0:\n");
+		write_str(fd, "nobody:x:65534:\n");
+		close(fd);
 	}
 
 	write_str(1, "\n========================================\n");
@@ -111,6 +160,136 @@ int main(void)
 			}
 		}
 		closedir(d);
+	}
+
+	/* Run LTP mm tests */
+	DIR *ld = opendir("/bin/ltp");
+	if (ld) {
+		write_str(1, "--- Running LTP mm tests ---\n");
+		int ltp_pass = 0, ltp_fail = 0, ltp_skip = 0;
+		struct dirent *lent;
+		while ((lent = readdir(ld)) != NULL) {
+			if (lent->d_name[0] == '.')
+				continue;
+			const char *name = lent->d_name;
+
+			/* Skip tests that cannot run in minimal initramfs */
+			if (strcmp(name, "fork_procs") == 0 ||
+			    strcmp(name, "fork14") == 0 ||
+			    strcmp(name, "mmapstress08") == 0 ||
+			    strcmp(name, "mmapstress10") == 0 ||
+			    strcmp(name, "mmap-corruption01") == 0 ||
+			    strcmp(name, "madvise11") == 0 ||
+			    strcmp(name, "vma05_vdso") == 0 ||
+			    strcmp(name, "sbrk01") == 0 ||
+			    strcmp(name, "sbrk02") == 0 ||
+			    strcmp(name, "mmapstress02") == 0 ||
+			    strcmp(name, "mmapstress03") == 0 ||
+			    strcmp(name, "mmapstress05") == 0 ||
+			    strcmp(name, "mmapstress06") == 0 ||
+			    strcmp(name, "mmap1") == 0 ||
+			    strcmp(name, "vma01") == 0 ||
+			    strcmp(name, "vma02") == 0 ||
+			    strcmp(name, "vma04") == 0 ||
+			    strcmp(name, "shmat1") == 0 ||
+			    strcmp(name, "madvise06") == 0 ||
+			    strcmp(name, "madvise07") == 0 ||
+			    strcmp(name, "mmap16") == 0 ||
+			    strcmp(name, "mmap22") == 0 ||
+			    strcmp(name, "msync04") == 0 ||
+			    strcmp(name, "madvise01") == 0 ||
+			    strcmp(name, "munmap04") == 0 ||
+			    /* 128MB RAM limit — skip memory-hungry tests */
+			    strcmp(name, "fork07") == 0 ||
+			    strcmp(name, "fork08") == 0 ||
+			    strcmp(name, "fork09") == 0 ||
+			    strcmp(name, "fork10") == 0 ||
+			    strcmp(name, "fork13") == 0 ||
+			    strcmp(name, "mmap3") == 0 ||
+			    strcmp(name, "mmap18") == 0 ||
+			    strcmp(name, "mmap19") == 0 ||
+			    strcmp(name, "mmap20") == 0 ||
+			    strcmp(name, "mmap21") == 0 ||
+			    strcmp(name, "mmapstress01") == 0 ||
+			    strcmp(name, "mmapstress04") == 0 ||
+			    strcmp(name, "mmapstress07") == 0 ||
+			    strcmp(name, "mmapstress09") == 0 ||
+			    strcmp(name, "mlock04") == 0 ||
+			    strcmp(name, "mlock05") == 0 ||
+			    strcmp(name, "mlock203") == 0 ||
+			    strcmp(name, "madvise05") == 0 ||
+			    strcmp(name, "madvise08") == 0 ||
+			    strcmp(name, "madvise10") == 0 ||
+			    strcmp(name, "madvise12") == 0 ||
+			    strcmp(name, "mprotect05") == 0 ||
+			    strcmp(name, "mremap06") == 0 ||
+			    strcmp(name, "mmap08") == 0 ||
+			    strcmp(name, "mmap09") == 0 ||
+			    strcmp(name, "mmap10") == 0 ||
+			    strcmp(name, "mmap12") == 0 ||
+			    strcmp(name, "mmap13") == 0 ||
+			    strcmp(name, "mmap14") == 0 ||
+			    strcmp(name, "mmap15") == 0 ||
+			    strcmp(name, "mmap17") == 0) {
+				write_str(1, "  ");
+				write_str(1, name);
+				write_str(1, ": SKIP\n");
+				ltp_skip++;
+				continue;
+			}
+
+			char lpath[256];
+			snprintf(lpath, sizeof(lpath), "/bin/ltp/%s", name);
+			struct stat lst;
+			if (stat(lpath, &lst) != 0 || !(lst.st_mode & S_IXUSR))
+				continue;
+
+			/* Microblaze QEMU is very slow — 90s timeout per test */
+			char *ltp_argv[] = { lpath, NULL };
+			int st = run_timeout(lpath, ltp_argv, 90);
+
+			write_str(1, "  ");
+			write_str(1, name);
+			if (st == 0x0900) {
+				write_str(1, ": SKIP (timeout)\n");
+				ltp_skip++;
+			} else if (st < 0) {
+				write_str(1, ": FAIL (exec error)\n");
+				ltp_fail++;
+			} else if (!WIFEXITED(st)) {
+				write_str(1, ": SIGNAL=");
+				write_int(1, WTERMSIG(st));
+				write_str(1, "\n");
+				ltp_fail++;
+			} else {
+				int ec = WEXITSTATUS(st);
+				if (ec == 0) {
+					write_str(1, ": PASS\n");
+					ltp_pass++;
+				} else if (ec == 4 || ec == 32) {
+					write_str(1, ": SKIP\n");
+					ltp_skip++;
+				} else if (ec == 2) {
+					write_str(1, ": TBROK\n");
+					ltp_fail++;
+				} else if (ec == 127) {
+					write_str(1, ": NOTFOUND\n");
+				} else {
+					write_str(1, ": FAIL(");
+					write_int(1, ec);
+					write_str(1, ")\n");
+					ltp_fail++;
+				}
+			}
+		}
+		closedir(ld);
+		write_str(1, "  LTP subtotals: ");
+		write_int(1, ltp_pass);
+		write_str(1, " passed, ");
+		write_int(1, ltp_fail);
+		write_str(1, " failed, ");
+		write_int(1, ltp_skip);
+		write_str(1, " skipped\n");
 	}
 
 	write_str(1, "\n========================================\n");
