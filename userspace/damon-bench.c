@@ -26,6 +26,8 @@
 #include <signal.h>
 #include <pthread.h>
 
+static void alarm_nop(int sig) { (void)sig; }
+
 /* ── helpers ─────────────────────────────────────────────────────────── */
 
 static long read_vmstat(const char *key)
@@ -225,8 +227,20 @@ static void test_compaction(void)
 	madvise(p, sz, MADV_HUGEPAGE);
 	memset(p, 0x55, sz);
 
-	/* Also trigger explicit compaction */
-	write_file("/proc/sys/vm/compact_memory", "1");
+	/* Trigger explicit compaction in a child process with timeout
+	 * (compact_memory on 8GB QEMU can take minutes) */
+	{
+		pid_t cpid = fork();
+		if (cpid == 0) {
+			signal(SIGALRM, alarm_nop);
+			alarm(30);
+			write_file("/proc/sys/vm/compact_memory", "1");
+			_exit(0);
+		} else if (cpid > 0) {
+			int wst;
+			waitpid(cpid, &wst, 0);
+		}
+	}
 	sleep(2);
 
 	long migrate_after = read_vmstat("compact_migrate_scanned");
