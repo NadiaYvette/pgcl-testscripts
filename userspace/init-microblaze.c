@@ -129,10 +129,21 @@ int main(void)
 		while ((ent = readdir(d)) != NULL) {
 			if (ent->d_name[0] == '.')
 				continue;
-			/* Skip known-problematic tests and .o files */
+			/* Skip tests whose environment is unavailable on
+			 * this target.  compaction_test needs HUGETLB
+			 * which microblaze does not configure.
+			 * mremap_test does 2 GB allocations that cannot
+			 * succeed on a 128 MB platform.
+			 */
 			if (strcmp(ent->d_name, "droppable") == 0 ||
-			    strcmp(ent->d_name, "mseal_test") == 0)
+			    strcmp(ent->d_name, "mseal_test") == 0 ||
+			    strcmp(ent->d_name, "compaction_test") == 0 ||
+			    strcmp(ent->d_name, "mremap_test") == 0) {
+				write_str(1, "  ");
+				write_str(1, ent->d_name);
+				write_str(1, ": SKIP\n");
 				continue;
+			}
 			int len = strlen(ent->d_name);
 			if (len > 2 && ent->d_name[len-2] == '.' && ent->d_name[len-1] == 'o')
 				continue;
