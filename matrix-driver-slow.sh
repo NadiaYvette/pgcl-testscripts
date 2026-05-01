@@ -41,16 +41,14 @@ else
   make ARCH="$LA" ${CC:+CROSS_COMPILE=$CC} O="$KBUILD" "$DC" >/dev/null 2>&1 || { echo "DEFCONFIG FAIL"; exit 4; }
   if [ "$CONFIG" != "mainline" ]; then
     scripts/config --file "$KBUILD/.config" --set-val PAGE_MMUSHIFT "$CONFIG"
-    # Higher PGCL multipliers grow PAGE_SIZE; the buddy allocator's
-    # MAX_PAGE_ORDER + PAGE_SHIFT must not exceed SECTION_SIZE_BITS
-    # (mmzone.h check).  For PGCL=6 on x86 (SECTION_SIZE_BITS=27,
-    # PAGE_SHIFT=18) MAX_PAGE_ORDER must be <= 8.  Be conservative and
-    # cap it on all arches when CONFIG >= 6.
-    # Future: cells with CONFIG >= 6 hit multiple PAGE_SIZE-scaled
-    # landmines (asm-offsets MAX_PAGE_ORDER+PAGE_SHIFT > SECTION_SIZE
-    # check on x86_64; fs/fat/dir.c stack frame >2048 bytes; etc.)
-    # that need targeted patches before they build cleanly.  Treat
-    # PGCL=6 as advisory for now.
+    # PGCL widens PAGE_SIZE by 2^PAGE_MMUSHIFT.  Two scaling cliffs:
+    #   - mmzone.h: MAX_PAGE_ORDER + PAGE_SHIFT must stay under
+    #     SECTION_SIZE_BITS.  Each arch's Kconfig has a PGCL-aware
+    #     ARCH_FORCE_MAX_ORDER ladder (see linux commit 35b392dd4234)
+    #     so olddefconfig auto-clamps.
+    #   - fs/fat: bhs[MAX_BUF_PER_PAGE] stack arrays (commit
+    #     3e7034d73aa6 heap-allocates them).
+    # No driver-side workaround needed once those kernel patches land.
   fi
   case "$ARCH" in
     ppc64)       scripts/config --file "$KBUILD/.config" --enable PPC_4K_PAGES --disable PPC_64K_PAGES --disable PPC_16K_PAGES ;;
