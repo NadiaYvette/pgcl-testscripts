@@ -1,0 +1,26 @@
+Catch stale _mapcount at free time, even without CONFIG_DEBUG_VM.
+Apply on top of the printk instrumentation.
+
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -1374,6 +1374,17 @@ __always_inline bool __free_pages_prepare(struct page *page,
+ 			(page + i)->flags.f &= ~PAGE_FLAGS_CHECK_AT_PREP;
+ 		}
+ 	}
++	/*
++	 * PGCL diag: detect stale _mapcount at free time even when
++	 * CONFIG_DEBUG_VM=n.  If we see one, print and self-heal so
++	 * the corruption doesn't propagate to the next allocator.
++	 */
++	if (unlikely(atomic_read(&page->_mapcount) != -1)) {
++		pr_alert("PGCL_FREE_BAD pfn=%lx mc=%d rc=%d mapping=%px order=%d anon=%d swap=%d comm=%s\n",
++			 page_to_pfn(page), atomic_read(&page->_mapcount),
++			 page_ref_count(page), page->mapping, order,
++			 folio_test_anon(folio), folio_test_swapbacked(folio),
++			 current->comm);
++		dump_stack();
++		atomic_set(&page->_mapcount, -1);
++	}
+ 	if (folio_test_anon(folio)) {
+ 		mod_mthp_stat(order, MTHP_STAT_NR_ANON, -1);
+ 		folio->mapping = NULL;

@@ -1,0 +1,72 @@
+From: PGCL Bug 6 audit
+Subject: trace rmap events from pgcl-stress to diagnose SHMEM regression
+
+Adds printk_ratelimited dumps for every __folio_add_rmap and
+__folio_remove_rmap when current->comm starts with "pgcl-stress".
+Also unconditionally enriches the filemap_unaccount_folio BUG with
+folio fields prior to dump_page (so we always see them even if
+dump_page is throttled).
+
+---
+ mm/filemap.c |  6 ++++++
+ mm/rmap.c    | 28 ++++++++++++++++++++++++++++
+ 2 files changed, 34 insertions(+)
+
+diff --git a/mm/filemap.c b/mm/filemap.c
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -154,6 +154,12 @@ static void filemap_unaccount_folio(struct address_space *mapping,
+ 	long nr;
+
+ 	VM_BUG_ON_FOLIO(folio_mapped(folio), folio);
++	if (unlikely(folio_mapped(folio))) {
++		pr_alert("PGCL_DBG unaccount pfn=%lx mc=%d rc=%d swap=%d anon=%d large=%d order=%d index=%lu mapping=%px\n",
++			 folio_pfn(folio), atomic_read(&folio->_mapcount),
++			 folio_ref_count(folio), folio_test_swapbacked(folio),
++			 folio_test_anon(folio), folio_test_large(folio),
++			 folio_order(folio), folio->index, folio->mapping);
++	}
+ 	if (!IS_ENABLED(CONFIG_DEBUG_VM) && unlikely(folio_mapped(folio))) {
+ 		pr_alert("BUG: Bad page cache in process %s  pfn:%05lx\n",
+ 			 current->comm, folio_pfn(folio));
+diff --git a/mm/rmap.c b/mm/rmap.c
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1417,6 +1417,17 @@ static void __folio_mod_stat(struct folio *folio, int nr, int nr_pmdmapped)
+ 	}
+ }
+
++static inline bool pgcl_dbg_traced(void)
++{
++	return strncmp(current->comm, "pgcl-stress", 11) == 0;
++}
++
++#define PGCL_RMAP_TRACE(op, folio, nr_pages, level)			\
++	printk_ratelimited(KERN_INFO "PGCL_RMAP_" op " comm=%s pfn=%lx mc=%d rc=%d nr=%d lvl=%d anon=%d swap=%d large=%d\n", \
++		current->comm, folio_pfn(folio), atomic_read(&(folio)->_mapcount), \
++		folio_ref_count(folio), nr_pages, level, folio_test_anon(folio), \
++		folio_test_swapbacked(folio), folio_test_large(folio))
++
+ static __always_inline void __folio_add_rmap(struct folio *folio,
+ 		struct page *page, int nr_pages, struct vm_area_struct *vma,
+ 		enum pgtable_level level)
+@@ -1424,6 +1435,9 @@ static __always_inline void __folio_add_rmap(struct folio *folio,
+ 	atomic_t *mapped = &folio->_nr_pages_mapped;
+ 	const int orig_nr_pages = nr_pages;
+ 	int first = 0, nr = 0, nr_pmdmapped = 0;
++
++	if (pgcl_dbg_traced())
++		PGCL_RMAP_TRACE("ADD", folio, nr_pages, level);
+
+ 	__folio_rmap_sanity_checks(folio, page, nr_pages, level);
+
+@@ -1846,6 +1860,9 @@ static __always_inline void __folio_remove_rmap(struct folio *folio,
+ 	atomic_t *mapped = &folio->_nr_pages_mapped;
+ 	int last = 0, nr = 0, nr_pmdmapped = 0;
+ 	bool partially_mapped = false;
++
++	if (pgcl_dbg_traced())
++		PGCL_RMAP_TRACE("REM", folio, nr_pages, level);
+
+ 	__folio_rmap_sanity_checks(folio, page, nr_pages, level);
+

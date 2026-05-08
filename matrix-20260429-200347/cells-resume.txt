@@ -1,0 +1,13 @@
+/home/nyc/src/linux x86_64 4
+/home/nyc/src/linux-mainline aarch64 mainline
+/home/nyc/src/linux aarch64 4
+/home/nyc/src/linux-mainline riscv64 mainline
+/home/nyc/src/linux riscv64 4
+/home/nyc/src/linux-mainline ppc64 mainline
+/home/nyc/src/linux ppc64 4
+/home/nyc/src/linux-mainline s390x mainline
+/home/nyc/src/linux s390x 4
+/home/nyc/src/linux-mainline sparc64 mainline
+/home/nyc/src/linux sparc64 4
+/home/nyc/src/linux-mainline loongarch64 mainline
+/home/nyc/src/linux loongarch64 4
