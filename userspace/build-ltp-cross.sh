@@ -99,11 +99,20 @@ build_arch() {
 
     local built=0 failed=0
 
+    # Build libgcc stubs for loongarch64 (corrupted libgcc.a in binutils 2.45)
+    local libgcc_stubs=""
+    if [ "$arch" = "loongarch64" ] && [ -f "$SCRIPT_DIR/loongarch64-libgcc-stubs.c" ]; then
+        libgcc_stubs="/tmp/loongarch64-libgcc-stubs.o"
+        $cc -c -O2 -w "$SCRIPT_DIR/loongarch64-libgcc-stubs.c" -o "$libgcc_stubs" 2>/dev/null
+    fi
+
     link_test() {
         local out="$1"; shift
         local src="$1"; shift
         if [ -n "$ldextra" ]; then
             $cc $cflags $ldextra "$src" "$LTP_SRC/lib/libltp.a" -lpthread -lc -lgcc "$sysroot/lib/crtn.o" -o "$out" 2>/dev/null
+        elif [ -n "$libgcc_stubs" ]; then
+            $cc $cflags -nodefaultlibs -o "$out" "$src" "$LTP_SRC/lib/libltp.a" "$libgcc_stubs" -lpthread -lc 2>/dev/null
         else
             $cc $cflags -o "$out" "$src" "$LTP_SRC/lib/libltp.a" -lpthread 2>/dev/null
         fi

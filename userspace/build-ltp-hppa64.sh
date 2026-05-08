@@ -6,10 +6,22 @@ SYSROOT="$HOME/src/pgcl/userspace/sysroot/hppa64"
 OUTDIR="$HOME/src/pgcl/userspace/build/ltp-hppa64"
 LIBTMP="/tmp/ltp-lib-hppa64"
 CC="hppa64-linux-gnu-gcc"
-LD="/tmp/binutils-hppa64/bin/hppa64-linux-gnu-ld"
+LD="$HOME/src/pgcl/tmp/hppa64-toolchain/bin/hppa64-linux-gnu-ld"
 STRIP="hppa64-linux-gnu-strip"
 LIBGCC=$(hppa64-linux-gnu-gcc -print-file-name=libgcc.a)
+STUBS_SRC="$HOME/src/pgcl/userspace/hppa64-glibc-stubs.c"
 STUBS="/tmp/hppa64-glibc-stubs.o"
+
+# CRT files from glibc sysroot (provides _start with proper dp initialization)
+CRT1="$SYSROOT/lib/crt1.o"
+CRTI="$SYSROOT/lib/crti.o"
+CRTN="$SYSROOT/lib/crtn.o"
+
+# Build stubs if missing or source changed
+if [ ! -f "$STUBS" ] || [ "$STUBS_SRC" -nt "$STUBS" ]; then
+    echo "Building glibc stubs..."
+    $CC -c -O2 -w "$STUBS_SRC" -o "$STUBS"
+fi
 
 rm -rf "$OUTDIR"
 mkdir -p "$OUTDIR"
@@ -41,10 +53,16 @@ compile_and_link() {
         fi
     fi
 
-    if ! $LD -static --defsym '$global$=0' --allow-multiple-definition \
+    # Link with crt1.o (provides _start + dp init) and define $global$=__gp
+    if ! $LD -static --allow-multiple-definition \
+        -e _start \
+        --defsym '$global$=__gp' \
         -o "$OUTDIR/$name" \
+        "$CRT1" "$CRTI" \
         "$STUBS" "$obj" "$LIBTMP/libltp.a" \
-        -L"$SYSROOT/lib" -lc -lpthread -lc "$LIBGCC" -lc 2>/dev/null; then
+        -L"$SYSROOT/lib" -lc -lpthread -lc "$LIBGCC" -lc \
+        "$CRTN" 2>/dev/null ||
+       [ ! -f "$OUTDIR/$name" ]; then
         failed=$((failed+1))
         fail_list="$fail_list $name"
         rm -f "$obj"
@@ -74,6 +92,10 @@ for dir in mmapstress vma; do
     done
 done
 
+# Strip PT_INTERP (hppa64 glibc always adds it even for static) and debug symbols
+for f in "$OUTDIR"/*; do
+    python3 /tmp/strip-interp.py "$f" 2>/dev/null
+done
 $STRIP "$OUTDIR"/* 2>/dev/null || true
 
 echo ""

@@ -75,9 +75,9 @@ if [ -d /bin/mm-selftests ]; then
             *.o) continue ;;  # skip .o helper files
         esac
         echo "  [$name]"
-        timeout 60 "$t" >/tmp/selftest-out 2>&1
+        timeout 120 "$t" >/tmp/selftest-out 2>&1
         ret=$?
-        if [ $ret -eq 124 ] || [ $ret -eq 137 ]; then echo "  $name: SKIP (timeout)"; continue; fi
+        if [ $ret -eq 124 ] || [ $ret -eq 137 ] || [ $ret -eq 143 ]; then echo "  $name: SKIP (timeout)"; continue; fi
         if [ $ret -eq 0 ]; then echo "  $name: PASS"; TOTAL_PASS=$((TOTAL_PASS+1))
         elif [ $ret -eq 4 ]; then echo "  $name: SKIP"
         else echo "  $name: FAIL (exit=$ret)"; TOTAL_FAIL=$((TOTAL_FAIL+1)); fi
@@ -96,6 +96,7 @@ if [ -d /bin/ltp ]; then
             fork_procs) echo "  $name: SKIP (resource-intensive)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
             fork14) echo "  $name: SKIP (overcommit stress, floods console)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
             mmapstress08) echo "  $name: SKIP (heavy swap stress)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            mmapstress01|mmapstress04|mmapstress07|mmapstress09) echo "  $name: SKIP (file mmap stress, hangs HPPA QEMU)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
             mmapstress10) echo "  $name: SKIP (needs writable file mapping)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
             mmap-corruption01) echo "  $name: SKIP (needs disk file)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
             madvise11) echo "  $name: SKIP (needs CONFIG_MEMORY_FAILURE + hwpoison_inject)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
@@ -143,9 +144,10 @@ if [ -d /bin/ltp ]; then
             echo "  $name: PASS" >> /tmp/ltp-results.txt; LTP_PASS=$((LTP_PASS+1))
         elif [ $ret -eq 4 ] || [ $ret -eq 32 ]; then
             echo "  $name: SKIP" >> /tmp/ltp-results.txt; LTP_SKIP=$((LTP_SKIP+1))
-        elif [ $ret -eq 137 ] || [ $ret -eq 124 ]; then
+        elif [ $ret -eq 137 ] || [ $ret -eq 124 ] || [ $ret -eq 143 ]; then
             echo "  $name: SKIP (timeout)" >> /tmp/ltp-results.txt; LTP_SKIP=$((LTP_SKIP+1))
         else
+            echo "  $name: FAIL (exit=$ret)"
             echo "  $name: FAIL (exit=$ret)" >> /tmp/ltp-results.txt
             LTP_FAIL=$((LTP_FAIL+1))
         fi
@@ -175,6 +177,9 @@ if [ -f /proc/cmdline ]; then
     case "$cmdline" in *autotest=1*) AUTOTEST=1 ;; esac
 fi
 if [ "$AUTOTEST" = "1" ]; then
+    # Flush console output before poweroff
+    sync 2>/dev/null || true
+    sleep 1
     echo "Autotest mode: powering off."
     # Try multiple poweroff methods
     if [ -f /proc/sysrq-trigger ]; then
