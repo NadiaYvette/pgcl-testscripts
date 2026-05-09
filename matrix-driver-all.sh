@@ -46,7 +46,7 @@ case "$ARCH" in
   hppa)        LA=parisc;     CC=hppa-linux-gnu-;          DC=generic-32bit_defconfig;QEMU="qemu-system-hppa -M C3700 -m 3G -nographic -no-reboot";                            KIMG=vmlinux;                          CONSOLE=ttyS0 ;;
   mips64)      LA=mips;       CC=mips64-linux-gnu-;        DC=malta_defconfig;        QEMU="qemu-system-mips64 -M malta -cpu MIPS64R2-generic -m 2G -nographic -no-reboot";     KIMG=vmlinux;                          CONSOLE=ttyS0 ;;
   arm)         LA=arm;        CC=arm-linux-gnu-;           DC=multi_v7_defconfig;     QEMU="qemu-system-arm -M virt -cpu cortex-a15 -m 768M -nographic -no-reboot";             KIMG=arch/arm/boot/zImage;             CONSOLE=ttyAMA0 ;;
-  arm-lpae)    LA=arm;        CC=arm-linux-gnu-;           DC=vexpress_defconfig;     QEMU="qemu-system-arm -M vexpress-a15 -cpu cortex-a15 -m 2G -nographic -no-reboot";       KIMG=arch/arm/boot/zImage;             CONSOLE=ttyAMA0 ;;
+  arm-lpae)    LA=arm;        CC=arm-linux-gnu-;           DC=vexpress_defconfig;     QEMU="qemu-system-arm -M virt -cpu cortex-a15 -m 2G -nographic -no-reboot";              KIMG=arch/arm/boot/zImage;             CONSOLE=ttyAMA0 ;;
   hppa64)      LA=parisc;     CC=hppa64-linux-gnu-;        DC=generic-64bit_defconfig;QEMU="qemu-system-hppa -M C3700 -m 8G -nographic -no-reboot";                            KIMG=vmlinux;                          CONSOLE=ttyS0 ;;
   microblaze)  LA=microblaze; CC=microblaze-linux-gnu-;    DC=defconfig;              QEMU="qemu-system-microblaze -M petalogix-s3adsp1800 -nographic -no-reboot";              KIMG=arch/microblaze/boot/linux.bin;   CONSOLE=ttyUL0 ;;
   *) echo "ERROR: unknown arch $ARCH"; exit 2 ;;
@@ -121,12 +121,11 @@ case "$ARCH" in
   *) INITRD_ARG="-initrd $INITRAMFS/initramfs-$ARCH.cpio.gz" ;;
 esac
 
-# arm-lpae needs a DTB for vexpress-a15.  Without -dtb the kernel produces
-# no console output and the cell times out silently.
+# arm-lpae uses -M virt (cortex-a15 + LPAE).  -M vexpress-a15 needs a DTB
+# and the older platform code path doesn't reliably produce console output
+# even with the right DTB; -M virt is far more forgiving and still exercises
+# the LPAE long-descriptor page-table code paths in the kernel.
 EXTRA_QEMU=""
-if [ "$ARCH" = "arm-lpae" ] && [ -f "$KBUILD/arch/arm/boot/dts/arm/vexpress-v2p-ca15-tc1.dtb" ]; then
-    EXTRA_QEMU="-dtb $KBUILD/arch/arm/boot/dts/arm/vexpress-v2p-ca15-tc1.dtb"
-fi
 
 # Per-arch QEMU timeout (slow emulated arches need larger budgets)
 case "$ARCH" in
@@ -155,7 +154,7 @@ if [ "$ARCH" = "loongarch64" ]; then
   timeout "$TIMEOUT" $QEMU \
       -drive file="$DISKIMG",format=raw,if=virtio \
       -bios /usr/share/edk2/loongarch64/QEMU_EFI.fd \
-      2>&1 | tail -300
+      2>&1 | tail -3000
   RC=${PIPESTATUS[0]}
   rm -f "$DISKIMG"; rm -rf "$ESPDIR"
 else
@@ -163,7 +162,7 @@ else
     -kernel "$KBUILD/$KIMG" \
     $INITRD_ARG \
     $EXTRA_QEMU \
-    -append "console=$CONSOLE panic=1 autotest=1" 2>&1 | tail -300
+    -append "console=$CONSOLE panic=1 autotest=1" 2>&1 | tail -3000
   RC=${PIPESTATUS[0]}
 fi
 
