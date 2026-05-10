@@ -47,7 +47,7 @@ case "$ARCH" in
   mips64)      LA=mips;       CC=mips64-linux-gnu-;        DC=malta_defconfig;        QEMU="qemu-system-mips64 -M malta -cpu MIPS64R2-generic -m 2G -nographic -no-reboot";     KIMG=vmlinux;                          CONSOLE=ttyS0 ;;
   arm)         LA=arm;        CC=arm-linux-gnu-;           DC=multi_v7_defconfig;     QEMU="qemu-system-arm -M virt -cpu cortex-a15 -m 768M -nographic -no-reboot";             KIMG=arch/arm/boot/zImage;             CONSOLE=ttyAMA0 ;;
   arm-lpae)    LA=arm;        CC=arm-linux-gnu-;           DC=vexpress_defconfig;     QEMU="qemu-system-arm -M virt -cpu cortex-a15 -m 2G -nographic -no-reboot";              KIMG=arch/arm/boot/zImage;             CONSOLE=ttyAMA0 ;;
-  hppa64)      LA=parisc;     CC=hppa64-linux-gnu-;        DC=generic-64bit_defconfig;QEMU="qemu-system-hppa -M C3700 -m 8G -nographic -no-reboot";                            KIMG=vmlinux;                          CONSOLE=ttyS0 ;;
+  hppa64)      LA=parisc64;   CC=hppa64-linux-gnu-;        DC=generic-64bit_defconfig;QEMU="qemu-system-hppa -M C3700 -m 8G -nographic -no-reboot";                            KIMG=vmlinux;                          CONSOLE=ttyS0 ;;
   microblaze)  LA=microblaze; CC=microblaze-linux-gnu-;    DC=defconfig;              QEMU="qemu-system-microblaze -M petalogix-s3adsp1800 -nographic -no-reboot";              KIMG=arch/microblaze/boot/linux.bin;   CONSOLE=ttyUL0 ;;
   *) echo "ERROR: unknown arch $ARCH"; exit 2 ;;
 esac
@@ -94,7 +94,16 @@ case "$ARCH" in
   arm-lpae)
     scripts/config --file "$KBUILD/.config" --enable ARM_LPAE ;;
   m68k)
-    scripts/config --file "$KBUILD/.config" --enable GOLDFISH --enable GOLDFISH_TTY ;;
+    # m68k -M virt requires CONFIG_VIRT (Mac/Atari/Amiga multi_defconfig
+    # doesn't enable it).  Without it, the kernel never inits goldfish UART
+    # and produces zero console output.  Also disable NE2000 — it crashes
+    # in ne_drv_probe during do_one_initcall on m68k-virt, which kills
+    # init-thread (pid 1) and panics the kernel before userspace runs.
+    scripts/config --file "$KBUILD/.config" \
+        --enable VIRT --enable VIRTIO_MMIO --enable VIRTIO_MENU \
+        --enable RTC_DRV_GOLDFISH \
+        --enable GOLDFISH --enable GOLDFISH_TTY \
+        --disable NE2000 ;;
 esac
 
 make ARCH="$LA" ${CC:+CROSS_COMPILE=$CC} O="$KBUILD" olddefconfig >/dev/null 2>&1
