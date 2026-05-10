@@ -1,0 +1,2 @@
+/home/nyc/src/linux aarch64 6
+/home/nyc/src/linux arm-lpae 6

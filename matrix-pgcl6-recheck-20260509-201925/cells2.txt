@@ -1,0 +1,5 @@
+/home/nyc/src/linux s390x 6
+/home/nyc/src/linux x86_64 6
+/home/nyc/src/linux alpha 6
+/home/nyc/src/linux m68k 6
+/home/nyc/src/linux mips64 6
