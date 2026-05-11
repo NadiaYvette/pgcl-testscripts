@@ -1,0 +1,16 @@
+/home/nyc/src/linux x86_64 5
+/home/nyc/src/linux aarch64 5
+/home/nyc/src/linux riscv64 5
+/home/nyc/src/linux ppc64 5
+/home/nyc/src/linux s390x 5
+/home/nyc/src/linux sparc64 5
+/home/nyc/src/linux loongarch64 5
+/home/nyc/src/linux alpha 5
+/home/nyc/src/linux riscv32 5
+/home/nyc/src/linux m68k 5
+/home/nyc/src/linux hppa 5
+/home/nyc/src/linux mips64 5
+/home/nyc/src/linux arm 5
+/home/nyc/src/linux arm-lpae 5
+/home/nyc/src/linux hppa64 5
+/home/nyc/src/linux microblaze 5
