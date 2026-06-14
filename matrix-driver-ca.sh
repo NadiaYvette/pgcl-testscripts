@@ -52,7 +52,7 @@ case "$ARCH" in
   *) echo "ERROR: unknown arch $ARCH"; exit 2 ;;
 esac
 
-KBUILD="$D/kernel-build-matrix/$CONFIG/$ARCH"
+KBUILD="$D/kernel-build-ca/$CONFIG/$ARCH"
 rm -rf "$KBUILD"; mkdir -p "$KBUILD"
 
 cd "$LINUX_DIR" || exit 3

@@ -91,35 +91,38 @@ if [ -d /bin/ltp ]; then
     for t in /bin/ltp/*; do
         [ -x "$t" ] || continue
         name="${t##*/}"
-        # Skip tests that genuinely cannot run in minimal initramfs
+        # Skip tests that genuinely cannot run in minimal initramfs.
+        # Write SKIP reasons to file only — keep console pressure low
+        # so slow UARTs (m68k goldfish, sparc64 sun4u) don't drop the
+        # subtotals/FAIL LIST lines we actually care about.
+        skip_reason=""
         case "$name" in
-            fork_procs) echo "  $name: SKIP (resource-intensive)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            fork14) echo "  $name: SKIP (overcommit stress, floods console)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            mmapstress08) echo "  $name: SKIP (heavy swap stress)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            mmapstress01|mmapstress04|mmapstress07|mmapstress09) echo "  $name: SKIP (file mmap stress, hangs HPPA QEMU)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            mmapstress10) echo "  $name: SKIP (needs writable file mapping)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            mmap-corruption01) echo "  $name: SKIP (needs disk file)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            madvise11) echo "  $name: SKIP (needs CONFIG_MEMORY_FAILURE + hwpoison_inject)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            vma05_vdso) echo "  $name: SKIP (needs gdb for core dump analysis)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            sbrk01) echo "  $name: SKIP (musl sbrk stub)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            sbrk02) echo "  $name: SKIP (musl sbrk stub)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            mmapstress02) echo "  $name: SKIP (uses sbrk, musl stub)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            mmapstress03) echo "  $name: SKIP (uses sbrk, musl stub)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            mmapstress05) echo "  $name: SKIP (uses sbrk, musl stub)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            mmapstress06) echo "  $name: SKIP (uses sbrk, musl stub)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            mmap1) echo "  $name: SKIP (needs zcat for /proc/config.gz)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            vma01) echo "  $name: SKIP (old LTP API, resource-intensive)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            vma02) echo "  $name: SKIP (needs libnuma)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            vma04) echo "  $name: SKIP (needs libnuma)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            shmat1) echo "  $name: SKIP (needs SysV IPC setup)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            madvise06) echo "  $name: SKIP (needs hwpoison)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            madvise07) echo "  $name: SKIP (needs hwpoison)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            mmap16) echo "  $name: SKIP (needs block device)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            mmap22) echo "  $name: SKIP (needs memory cgroups)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            msync04) echo "  $name: SKIP (needs block device for loop)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            madvise01) echo "  $name: SKIP (hwpoison SIGBUS test)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
-            munmap04) echo "  $name: SKIP (65K regions, cleanup timeout)"; LTP_SKIP=$((LTP_SKIP+1)); continue ;;
+            fork_procs) skip_reason="resource-intensive" ;;
+            fork14) skip_reason="overcommit stress, floods console" ;;
+            mmapstress08) skip_reason="heavy swap stress" ;;
+            mmapstress01|mmapstress04|mmapstress07|mmapstress09) skip_reason="file mmap stress, hangs HPPA QEMU" ;;
+            mmapstress10) skip_reason="needs writable file mapping" ;;
+            mmap-corruption01) skip_reason="needs disk file" ;;
+            madvise11) skip_reason="needs CONFIG_MEMORY_FAILURE + hwpoison_inject" ;;
+            vma05_vdso) skip_reason="needs gdb for core dump analysis" ;;
+            sbrk01|sbrk02) skip_reason="musl sbrk stub" ;;
+            mmapstress02|mmapstress03|mmapstress05|mmapstress06) skip_reason="uses sbrk, musl stub" ;;
+            mmap1) skip_reason="needs zcat for /proc/config.gz" ;;
+            vma01) skip_reason="old LTP API, resource-intensive" ;;
+            vma02|vma04) skip_reason="needs libnuma" ;;
+            shmat1) skip_reason="needs SysV IPC setup" ;;
+            madvise06|madvise07) skip_reason="needs hwpoison" ;;
+            mmap16) skip_reason="needs block device" ;;
+            mmap22) skip_reason="needs memory cgroups" ;;
+            msync04) skip_reason="needs block device for loop" ;;
+            madvise01) skip_reason="hwpoison SIGBUS test" ;;
+            munmap04) skip_reason="65K regions, cleanup timeout" ;;
         esac
+        if [ -n "$skip_reason" ]; then
+            echo "  $name: SKIP ($skip_reason)" >> /tmp/ltp-results.txt
+            LTP_SKIP=$((LTP_SKIP+1))
+            continue
+        fi
         # Tests that need specific CLI arguments or longer timeouts
         case "$name" in
             mmapstress06)
@@ -136,6 +139,13 @@ if [ -d /bin/ltp ]; then
                 LTP_RUNTIME_MUL=0.05 timeout 60 "$t" >/tmp/ltp-out 2>&1 ;;
             mmap3)
                 LTP_RUNTIME_MUL=0.1 timeout 60 "$t" >/tmp/ltp-out 2>&1 ;;
+            fork07|fork09)
+                # Fork-heavy tests can hit the LTP 30s internal alarm on
+                # slow QEMU targets under PGCL=6 (256KB pages amplify
+                # fork/fd-table setup costs).  Raise both the LTP
+                # framework alarm (LTP_TIMEOUT_MUL) and the outer
+                # wall-clock timeout so the test runs to completion.
+                LTP_TIMEOUT_MUL=4 timeout 180 "$t" >/tmp/ltp-out 2>&1 ;;
             *)
                 timeout 30 "$t" >/tmp/ltp-out 2>&1 ;;
         esac
@@ -148,11 +158,31 @@ if [ -d /bin/ltp ]; then
             echo "  $name: SKIP (timeout)" >> /tmp/ltp-results.txt; LTP_SKIP=$((LTP_SKIP+1))
         else
             echo "  $name: FAIL (exit=$ret)"
+            # Dump last 5 lines of test output IMMEDIATELY to console
+            # so they survive even if the trailing detail loop is
+            # truncated by autotest poweroff / UART back-pressure.
+            tail -5 /tmp/ltp-out 2>/dev/null | while IFS= read -r ln; do
+                echo "    $ln"
+            done
             echo "  $name: FAIL (exit=$ret)" >> /tmp/ltp-results.txt
+            echo "$name" >> /tmp/ltp-fail-names.txt
+            echo "    --- $name output ---" >> /tmp/ltp-results.txt
+            tail -8 /tmp/ltp-out >> /tmp/ltp-results.txt 2>/dev/null
+            echo "    --- end $name output ---" >> /tmp/ltp-results.txt
             LTP_FAIL=$((LTP_FAIL+1))
         fi
     done
     echo "  LTP subtotals: $LTP_PASS passed, $LTP_FAIL failed, $LTP_SKIP skipped"
+    if [ -s /tmp/ltp-fail-names.txt ]; then
+        # Compact one-liner that survives console truncation.
+        # Some embedded shells (sparc64 sash etc.) trip on $(tr ... <file);
+        # fall back to a plain read-loop.
+        FAIL_LIST=""
+        while read fn; do
+            FAIL_LIST="$FAIL_LIST $fn"
+        done < /tmp/ltp-fail-names.txt
+        echo "  LTP FAIL LIST:$FAIL_LIST"
+    fi
     echo "--- LTP Details ---"
     # Print one line at a time with brief delay to avoid console rate limiting
     while IFS= read -r line; do

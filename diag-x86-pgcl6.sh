@@ -156,6 +156,7 @@ case "$ARCH" in
   aarch64)               TIMEOUT=1800 ;; # PGCL=6 LTP end-to-end
   loongarch64)           TIMEOUT=1800 ;; # PGCL=6 LTP end-to-end
   riscv32|riscv64)       TIMEOUT=1800 ;; # PGCL=6 LTP end-to-end
+  x86_64)                TIMEOUT=900 ;; # diag: longer + earlyprintk
   *)                     TIMEOUT=300 ;;
 esac
 

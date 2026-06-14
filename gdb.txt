@@ -1,0 +1,7 @@
+warning: Currently logging to gdb.txt.  Turn the logging off and on to make the new setting effective.
+warning: Currently logging to gdb.txt.  Turn the logging off and on to make the new setting effective.
+0xffffffffbfc00000 in ?? ()
+Breakpoint 1 at 0xffffffff801015e4
+Cannot execute this command while the target is running.
+Use the "interrupt" command to stop the target
+and then try again.

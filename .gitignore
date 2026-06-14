@@ -24,3 +24,33 @@ laptop-boot-video/
 # Editor
 *~
 *.swp
+
+# Test-run outputs / build trees / packaged artifacts (all reproducible, not source)
+ca-out/
+linux-base/
+pgcl-laptop-rpms/
+overnight-traces/
+unsil-matrix-out/
+matrix-*/
+pgcl6-*/
+cowfixB-*/
+touch-test-*/
+*-smoke/
+*.out
+*.rpm
+*.src.rpm
+
+# Backup/scratch junk
+*.bak
+*.bak2
+*.orig
+*.preretest
+*.preretest2
+.last-*-dir
+
+# Compiled test binaries (sources are tracked as *.c / *.S)
+userspace/minit
+userspace/initramfs/minit
+userspace/hole-debug
+userspace/fork09-probe
+userspace/mremap06-repro

@@ -1,0 +1,233 @@
+diff --git a/mm/filemap.c b/mm/filemap.c
+index fb1d5499a98f..1d38ac48475f 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -3805,6 +3805,10 @@ static int filemap_set_ptes_cluster(struct vm_fault *vmf,
+ 
+ 	if (nr_set) {
+ 		int j;
++		if (folio_test_swapbacked(folio) && !folio_test_anon(folio))
++			pr_err("PGCLDBG SETP_C pfn=%lx idx=%lu pid=%d comm=%.16s addr=%lx nr_set=%d\n",
++			       folio_pfn(folio), folio->index, current->pid,
++			       current->comm, addr, nr_set);
+ 		for (j = 0; j < nr_set; j++)
+ 			folio_add_file_rmap_ptes(folio, page, 1, vma);
+ 		update_mmu_cache_range(vmf, vma, addr, ptep, PAGE_MMUCOUNT);
+diff --git a/mm/memory.c b/mm/memory.c
+index ade221e95ecd..88fa89d7928b 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1740,6 +1740,12 @@ static __always_inline void zap_present_folio_ptes(struct mmu_gather *tlb,
+ 		*any_skipped = zap_install_uffd_wp_if_needed(vma, addr, pte,
+ 							     nr, details, ptent);
+ 
++	if (folio_test_swapbacked(folio) && !folio_test_anon(folio))
++		pr_err("PGCLDBG ZAP_P pfn=%lx idx=%lu pid=%d comm=%.16s nr=%u addr=%lx delay=%d mc_pre=%d\n",
++		       folio_pfn(folio), folio->index, current->pid,
++		       current->comm, nr, addr, (int)delay_rmap,
++		       atomic_read(&folio->_mapcount) + 1);
++
+ 	if (!delay_rmap)
+ 		folio_remove_rmap_ptes(folio, page, nr, vma);
+ 	if (unlikely(__tlb_remove_folio_pages(tlb, page, nr, delay_rmap))) {
+@@ -1838,6 +1844,8 @@ static inline int zap_nonpresent_ptes(struct mmu_gather *tlb,
+ {
+ 	softleaf_t entry;
+ 	int nr = 1;
++	const char *np_kind = "other";
++	struct folio *np_folio = NULL;
+ 
+ 	*any_skipped = true;
+ 	entry = softleaf_from_pte(ptent);
+@@ -1858,6 +1866,7 @@ static inline int zap_nonpresent_ptes(struct mmu_gather *tlb,
+ 		rss[mm_counter(folio)]--;
+ 		folio_remove_rmap_pte(folio, page, vma);
+ 		folio_put(folio);
++		np_kind = "dev"; np_folio = folio;
+ 	} else if (softleaf_is_swap(entry)) {
+ 		/* Genuine swap entries, hence a private anon pages */
+ 		if (!should_zap_cows(details))
+@@ -1866,12 +1875,14 @@ static inline int zap_nonpresent_ptes(struct mmu_gather *tlb,
+ 		nr = swap_pte_batch(pte, max_nr, ptent);
+ 		rss[MM_SWAPENTS] -= nr;
+ 		swap_put_entries_direct(entry, nr);
++		np_kind = "swap";
+ 	} else if (softleaf_is_migration(entry)) {
+ 		struct folio *folio = softleaf_to_folio(entry);
+ 
+ 		if (!should_zap_folio(details, folio))
+ 			return 1;
+ 		rss[mm_counter(folio)]--;
++		np_kind = "migr"; np_folio = folio;
+ 	} else if (softleaf_is_uffd_wp_marker(entry)) {
+ 		/*
+ 		 * For anon: always drop the marker; for file: only
+@@ -1879,6 +1890,7 @@ static inline int zap_nonpresent_ptes(struct mmu_gather *tlb,
+ 		 */
+ 		if (!vma_is_anonymous(vma) && !zap_drop_markers(details))
+ 			return 1;
++		np_kind = "uffd";
+ 	} else if (softleaf_is_guard_marker(entry)) {
+ 		/*
+ 		 * Ordinary zapping should not remove guard PTE
+@@ -1887,10 +1899,12 @@ static inline int zap_nonpresent_ptes(struct mmu_gather *tlb,
+ 		 */
+ 		if (!zap_drop_markers(details))
+ 			return 1;
++		np_kind = "guard";
+ 	} else if (softleaf_is_hwpoison(entry) ||
+ 		   softleaf_is_poison_marker(entry)) {
+ 		if (!should_zap_cows(details))
+ 			return 1;
++		np_kind = "poison";
+ 	} else {
+ 		/* We should have covered all the swap entry types */
+ 		pr_alert("unrecognized swap entry 0x%lx\n", entry.val);
+@@ -1899,6 +1913,16 @@ static inline int zap_nonpresent_ptes(struct mmu_gather *tlb,
+ 	clear_not_present_full_ptes(vma->vm_mm, addr, pte, nr, tlb->fullmm);
+ 	*any_skipped = zap_install_uffd_wp_if_needed(vma, addr, pte, nr, details, ptent);
+ 
++	if (np_folio && folio_test_swapbacked(np_folio) &&
++	    !folio_test_anon(np_folio))
++		pr_err("PGCLDBG ZAP_NP pfn=%lx idx=%lu pid=%d comm=%.16s nr=%d addr=%lx kind=%s mc_pre=%d\n",
++		       folio_pfn(np_folio), np_folio->index, current->pid,
++		       current->comm, nr, addr, np_kind,
++		       atomic_read(&np_folio->_mapcount) + 1);
++	else if (!np_folio && (np_kind[0] == 'g' || np_kind[0] == 'u'))
++		pr_err("PGCLDBG ZAP_NP pid=%d comm=%.16s nr=%d addr=%lx kind=%s\n",
++		       current->pid, current->comm, nr, addr, np_kind);
++
+ 	return nr;
+ }
+ 
+@@ -6151,6 +6175,10 @@ void set_pte_range(struct vm_fault *vmf, struct folio *folio,
+ 		folio_add_new_anon_rmap(folio, vma, addr, RMAP_EXCLUSIVE);
+ 		folio_add_lru_vma(folio, vma);
+ 	} else {
++		if (folio_test_swapbacked(folio) && !folio_test_anon(folio))
++			pr_err("PGCLDBG SETP_R pfn=%lx idx=%lu pid=%d comm=%.16s addr=%lx nr=%u nr_ptes=%u\n",
++			       folio_pfn(folio), folio->index, current->pid,
++			       current->comm, addr, nr, nr_ptes);
+ 		folio_add_file_rmap_ptes(folio, page, nr, vma);
+ 	}
+ 	set_ptes(vma->vm_mm, addr, vmf->pte, entry, nr_ptes);
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 25360c19c3ac..cafb045dca15 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -462,6 +462,11 @@ static bool remove_migration_pte(struct folio *folio,
+ 								pvmw.address + (unsigned long)i * MMUPAGE_SIZE,
+ 								rmap_flags);
+ 			} else {
++				if (folio_test_swapbacked(folio) && !folio_test_anon(folio))
++					pr_err("PGCLDBG SETP_M pfn=%lx idx=%lu pid=%d comm=%.16s addr=%lx nr=%u\n",
++					       folio_pfn(folio), folio->index,
++					       current->pid, current->comm,
++					       pvmw.address, nr_pages);
+ 				for (i = 0; i < nr_pages; i++)
+ 					folio_add_file_rmap_pte(folio, new, vma);
+ 			}
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 756ef0a93ebc..7e799e5ed256 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1270,6 +1270,41 @@ unsigned long tear_down_vmas(struct mm_struct *mm, struct vma_iterator *vmi,
+ }
+ 
+ /* Release all mmaps. */
++/*
++ * PGCLDBG (overnight 2026-05-15 #3): exit_mmap mapcount audit probe.
++ * Walk every present PTE in every VMA of the mm right before unmap_vmas
++ * runs.  For each present PTE pointing to a shmem folio, log a line that
++ * lets us correlate against the rmap-helper INC/DEC probes:
++ *   PGCLDBG EXIT_EXPECT pfn=X idx=Y addr=Z pid=N comm=...
++ * Post-process: for each (pid, pfn) tuple, count EXIT_EXPECT events vs
++ * folio_remove_rmap_pte DEC events.  If EXIT_EXPECT fires N times but
++ * DEC only fires N-K times for that pid+pfn, K PTEs were silently lost.
++ */
++static int pgcldbg_exit_audit_pte_entry(pte_t *pte, unsigned long addr,
++		unsigned long next, struct mm_walk *walk)
++{
++	pte_t pteval = ptep_get(pte);
++	struct page *page;
++	struct folio *folio;
++
++	if (!pte_present(pteval))
++		return 0;
++	if (!pfn_valid(pte_pfn(pteval)))
++		return 0;
++	page = pfn_to_page(pte_pfn(pteval));
++	folio = page_folio(page);
++	if (folio_test_swapbacked(folio) && !folio_test_anon(folio))
++		pr_err("PGCLDBG EXIT_EXPECT pfn=%lx idx=%lu addr=%lx pid=%d comm=%.16s mc=%d\n",
++			folio_pfn(folio), folio->index, addr,
++			current->pid, current->comm,
++			folio_mapcount(folio));
++	return 0;
++}
++
++static const struct mm_walk_ops pgcldbg_exit_audit_ops = {
++	.pte_entry = pgcldbg_exit_audit_pte_entry,
++};
++
+ void exit_mmap(struct mm_struct *mm)
+ {
+ 	struct mmu_gather tlb;
+@@ -1292,6 +1327,14 @@ void exit_mmap(struct mm_struct *mm)
+ 		goto destroy;
+ 	}
+ 
++	/* PGCLDBG: audit every present-shmem PTE about to be torn down */
++	{
++		VMA_ITERATOR(audit_vmi, mm, 0);
++		struct vm_area_struct *avma;
++		for_each_vma(audit_vmi, avma)
++			walk_page_vma(avma, &pgcldbg_exit_audit_ops, NULL);
++	}
++
+ 	unmap_all_init(&unmap, &vmi, vma);
+ 	flush_cache_mm(mm);
+ 	tlb_gather_mmu_fullmm(&tlb, mm);
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 5a1d534179f5..88b61a1857d7 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1801,6 +1801,11 @@ static __always_inline void __folio_add_file_rmap(struct folio *folio,
+ void folio_add_file_rmap_ptes(struct folio *folio, struct page *page,
+ 		int nr_pages, struct vm_area_struct *vma)
+ {
++	if (folio_test_swapbacked(folio) && !folio_test_anon(folio))
++		pr_err("PGCLDBG INC pfn=%lx idx=%lu pid=%d comm=%.16s mc_pre=%d nr=%d\n",
++		       folio_pfn(folio), folio->index,
++		       current->pid, current->comm,
++		       folio_mapcount(folio), nr_pages);
+ 	__folio_add_file_rmap(folio, page, nr_pages, vma, PGTABLE_LEVEL_PTE);
+ }
+ 
+@@ -1969,6 +1974,11 @@ static __always_inline void __folio_remove_rmap(struct folio *folio,
+ void folio_remove_rmap_ptes(struct folio *folio, struct page *page,
+ 		int nr_pages, struct vm_area_struct *vma)
+ {
++	if (folio_test_swapbacked(folio) && !folio_test_anon(folio))
++		pr_err("PGCLDBG DEC pfn=%lx idx=%lu pid=%d comm=%.16s mc_pre=%d nr=%d\n",
++		       folio_pfn(folio), folio->index,
++		       current->pid, current->comm,
++		       folio_mapcount(folio), nr_pages);
+ 	__folio_remove_rmap(folio, page, nr_pages, vma, PGTABLE_LEVEL_PTE);
+ }
+ 
+diff --git a/mm/userfaultfd.c b/mm/userfaultfd.c
+index 2e5f7f434c5f..ab6dddb76041 100644
+--- a/mm/userfaultfd.c
++++ b/mm/userfaultfd.c
+@@ -383,6 +383,10 @@ static int mfill_atomic_install_pte(pmd_t *dst_pmd,
+ 		goto out_unlock;
+ 
+ 	if (page_in_cache) {
++		if (folio_test_swapbacked(folio) && !folio_test_anon(folio))
++			pr_err("PGCLDBG SETP_U pfn=%lx idx=%lu pid=%d comm=%.16s addr=%lx\n",
++			       folio_pfn(folio), folio->index, current->pid,
++			       current->comm, dst_addr);
+ 		folio_add_file_rmap_pte(folio, page, dst_vma);
+ 	} else {
+ 		folio_add_new_anon_rmap(folio, dst_vma, dst_addr, RMAP_EXCLUSIVE);

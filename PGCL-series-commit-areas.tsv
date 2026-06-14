@@ -1,0 +1,136 @@
+8a4cf95f3067	arch/Kconfig,arch/x86,fs,include,kernel,lib,mm	PGCL: Page clustering (larpage) forward-port to Linux 6.19
+4b84a11505f1	arch/x86,mm	PGCL: enable fault-around, fix rmap/RSS accounting, fix remap_pte_range
+7fa68c8860c6	mm	PGCL: fix PAGE_CACHE/vm_pgoff unit mismatch across mm/ subsystems
+822e1419ebb2	include	PGCL: make set_ptes/clear_full_ptes/modify_prot_commit_ptes MMUPAGE-aware
+105be1b39c96	arch/arm64,arch/powerpc,arch/x86,drivers,fs,include,init,io_uring/memmap.c,kernel,mm,net,sound,virt/kvm/guest_memfd.c	PGCL: fix COW clustering, SMP boot, i915 driver, and TTM buddy manager
+a08c960447cc	drivers,mm	PGCL: fix fill_px GPU page table corruption, add swap-in prefetch
+5d16bd1daf99	mm	PGCL: add pgcl_pte_batch() for batched zap of sub-page PTEs
+2ec2c2881cd6	arch/x86,drivers	PGCL: fix EFI boot, efifb, simpledrm, and i915 deep audit leftovers
+75d6c97ae36a	include,mm	PGCL: add batch PTE optimizations for copy, mremap, mprotect, mlock
+2af00f068f00	mm	PGCL: fix Bad page state by correcting sub-page accounting in fork/zap/COW
+9567ec305d3b	mm	PGCL: fix pgcl_pte_batch zap path and remove debug instrumentation
+124d03fbf480	include,mm	PGCL: fix pgcl_pte_batch for MMUPAGE-granular PFN comparison
+545187cf3819	mm	PGCL: revert pgcl_page_folio, fix anon clustering rmap, disable khugepaged
+8c5e215e1c5a	mm	PGCL: enable COW clustering + fix fork batch rmap counting
+a6e76353c79e	mm	PGCL: fix swap prefetch CONFIG_SWAP guard + comment cleanup
+835d39043fa7	mm	PGCL: fix filemap set_pte portability + remove debug prints
+6e4d756cf55c	arch/alpha,arch/mips,arch/powerpc,arch/s390,arch/sparc,include,mm	PGCL: cross-arch fixes for PAGE_MMUSHIFT=4 compilation
+ea5159d1aaa1	arch/arm64,arch/powerpc,arch/s390,arch/sparc,drivers	PGCL: fix arm64, s390, powerpc, sparc cross-compilation with PAGE_MMUSHIFT=4
+6c28df619ec0	arch/arm64,mm	PGCL: fix vmalloc vmap_pte_range PTE stride for huge PTE mappings
+a6adda3730f8	arch/arm64	arm64: fix PAGE_SIZE vs MMUPAGE_SIZE in page table and fixmap code
+9a77fea8602a	arch/riscv,include,init,mm	PGCL: riscv64 boot with PAGE_MMUSHIFT=4 + cross-arch PTE portability
+f584511326f1	arch/arm,arch/loongarch,arch/m68k,arch/mips,arch/powerpc	PGCL: fix cross-arch page table geometry for mips, loongarch, powerpc, arm32, m68k
+12c08cb119d0	mm	PGCL: fix __tlb_remove_page_size call for v7.0-rc4
+dc68bdb4fae2	include	PGCL: fix vma_pages() deadlock — use MMUPAGE_SHIFT not PAGE_SHIFT
+3606b3406dfb	arch/arm64,arch/loongarch,arch/mips,arch/powerpc,arch/riscv,arch/s390,arch/sparc	PGCL: fix ELF_EXEC_PAGESIZE across all architectures
+676d26aa8a5b	arch/s390,lib	s390/boot, zlib: use MMUPAGE_SIZE for boot decompressor workspace
+1680771cf9f9	arch/arm64,arch/powerpc,arch/riscv,arch/s390,arch/x86,fs,include,lib,mm,net	PGCL: sessions 35-36 fixes — mincore, mmap, madvise, vDSO, 9p I/O
+abb7cdbe8866	arch/arm64,arch/csky,arch/loongarch,arch/microblaze,arch/mips,arch/parisc,arch/riscv,arch/sh,arch/sparc,fs,mm	PGCL: fix shared library mmap — use MMUPAGE granularity in arch sys_mmap wrappers
+eadd0f98662a	arch/powerpc	PGCL: fix powerpc text patching — use MMUPAGE granularity for fixmap PTEs
+9ec400eff930	arch/sparc	PGCL: sparc64 PAGE_MMUSHIFT=4 boot — TSB, TLB, set_ptes, hugetlb fixes
+5b8027a9745d	arch/arm,arch/powerpc	PGCL: fix ppc64 ftrace OOL + arm32 SHMLBA for PAGE_MMUSHIFT=4
+486b248b6911	mm	PGCL: fix remap_pfn_range alignment and size for MMUPAGE granularity
+3de56b2efdd6	arch/arm,drivers,fs,init,kernel,mm	PGCL: arm32 PAGE_MMUSHIFT=4 boot — 15/15 pgcl-test + 8/8 pgcl-stress PASS
+fe5a73f74de7	arch/powerpc,arch/sparc,mm	PGCL: fix swap entry encoding on sparc64/ppc64, page_table_check MMUPAGE fixes
+7532dbf70d5f	arch/powerpc,arch/sparc,fs,include,mm	PGCL: fix slub overflow, btrfs assertion, sparc64 TLB, swap readahead for large PAGE_SIZE
+b0a85db27f2a	arch/alpha,arch/arm,arch/mips,drivers,fs,include,init,kernel	PGCL: alpha boot, mips TLB fixes, debug print cleanup, arm32 regression fix
+27d0a1f06208	arch/mips	PGCL: mips initrd alignment and memory boundary fixes
+9f131bf61806	arch/loongarch,include	PGCL: loongarch64 PAGE_MMUSHIFT=4 boot — 15/15 pgcl-test + 8/8 pgcl-stress PASS
+ef32ae77dd96	arch/parisc,arch/riscv,include	PGCL: hppa32/hppa64/riscv32 PAGE_MMUSHIFT=4 boot — 15/15 pgcl-test + 8/8 pgcl-stress PASS
+17c01f10f1d9	arch/m68k,arch/microblaze	PGCL: m68k boot + microblaze cross-compile — m68k 15/15 pgcl-test + 8/8 pgcl-stress PASS
+7d8922709b06	arch/alpha,arch/microblaze,arch/mips,arch/parisc,arch/powerpc	PGCL: alpha/mips64/microblaze/hppa fixes — 15 arches boot, expanded test suite
+e9c29ad5b35d	arch/mips,arch/parisc,arch/powerpc,arch/sparc,fs,include,mm	PGCL: unify set_ptes nr convention — nr always means PTE/MMUPAGE count
+8619b76a6f2c	mm	PGCL: fix __split_huge_zero_page_pmd loop bounds and mTHP set_ptes accounting
+6e2093abe74d	arch/arm64,arch/mips,arch/powerpc,arch/riscv,block/blk-settings.c,include,lib	PGCL: fix ptdump W+X accounting, MIPS64 vDSO fork crash, block layer PAGE_SECTORS
+c4b624383548	arch/alpha	PGCL: fix alpha pmd_page/pud_page hardware-vs-kernel PFN and CRB console remap
+feb32311f2ca	arch/alpha	PGCL: fix alpha osf_sys getpagesize and pci-sysfs vm_pgoff granularity
+b618cce15b97	arch/microblaze	microblaze: fix pre-existing C ABI save area bug in entry.S
+b4f79cac8bde	arch/arm64,arch/powerpc,arch/x86,fs,mm	PGCL: fix TLB flush stride, LDT mapping granularity, and PAGEMAP_SCAN walk
+687bfc0f1237	arch/parisc	PGCL: fix parisc TLB flush and PCI DMA stride for MMUPAGE granularity
+9218c643888a	fs,mm,tools	PGCL: Fix smaps RSS accounting and VMA lookup for MMUSHIFT>0
+94e961c51026	arch/microblaze	microblaze: use petalogix-s3adsp1800 device tree for QEMU boot
+030d2ba9d14d	arch/mips	PGCL: fix mips64 HPAGE_SHIFT for THP with PAGE_MMUSHIFT>0
+da3fc3e93bf0	arch/sparc,tools	PGCL: fix sparc64 THP TSB over-insertion in update_mmu_cache_range
+263c4dc62885	mm	PGCL: fix set_pte_range nr for large folio PTE count with PAGE_MMUSHIFT>0
+febd001d15d9	arch/arm	arm32 LPAE+PGCL: fix pud_pgtable PAGE_MASK, free_initmem, SWAPPER_PG_DIR_SIZE, linker script
+81112b58e9e7	kernel	PGCL: fix futex EFAULT on shared mappings with PAGE_MMUSHIFT>0
+6d96e8907b81	fs,ipc/shm.c,mm	PGCL: fix SIGBUS granularity, shm alignment, smaps mapcount, anon clustering
+2e8ba64ffe41	tools	selftests/mm: mlock2-tests: suppress PGCL clustering with MADV_RANDOM
+1bcde1b4e48c	arch/alpha,arch/sparc	PGCL: fix sparc64 cache aliasing pgoff and alpha zero page alignment
+94858864e076	arch/alpha	PGCL: fix sparc64 cache aliasing pgoff and alpha zero page alignment
+14c78ca47735	arch/arm	ARM: DMA: Fix HighMem kmap overflow with PGCL
+7d53be535bb1	arch/arm,include	ARM32 TLB flush: use MMUPAGE_SHIFT/MMUPAGE_MASK for hardware page granularity
+f8f55ab04781	arch/arm	ARM32 vDSO: use MMUPAGE_SIZE/MMUPAGE_SHIFT for vDSO page layout
+c549e5d0e373	arch/alpha,arch/arc,arch/arm64,arch/csky,arch/loongarch,arch/powerpc,arch/sparc,arch/x86,include	Fix SHMLBA to use MMUPAGE_SIZE for shared memory alignment
+03f1af4b3cee	arch/loongarch	LoongArch PGCL: fix boot with PAGE_MMUSHIFT=4
+df25f473a581	arch/loongarch	LoongArch vDSO: fix PGCL sub-page mapping for special mappings
+87e0990d3f80	arch/loongarch	LoongArch: fix stack_top() VDSO size alignment for PGCL
+07eb401bf1c0	arch/x86,mm	PGCL: fix 7.1 merge window API changes — compound_info rename, unused vars
+c8c784bfce49	mm	PGCL: fix map_anon_folio_pte_nopf/pf for page clustering correctness
+5e836a511d28	mm	PGCL: fix empty_zero_page alignment overflow on alpha/microblaze
+5043b2b5589f	arch/sparc	sparc64: fix VPTE_SIZE to use MMUPAGE_SHIFT for correct TASK_SIZE
+9c6fab20c7e9	arch/mips,arch/sparc	PGCL: fix sparc64 vDSO mapping offset and mmap fallback alignment
+670a41740217	arch/arm64,arch/sparc	PGCL: fix arm64/sparc arch_setup_zero_pages for empty_zero_page misalignment
+cfef19dc0c67	drivers	PGCL: fix mmap_mem_prepare pgoff/PFN unit mismatch
+50b3314c9582	arch/microblaze	microblaze: fix THREAD_SIZE_ORDER vs THREAD_SIZE mismatch with PGCL
+48e83ee761b7	arch/microblaze	microblaze: align swapper_pg_dir to MMUPAGE_SIZE
+12f06a4a2bc1	drivers	ACPI/osl: skip kmap path on LoongArch — fixes PGCL DSDT load failure
+9369ea1b2f8f	mm	mm/memory: drop unused nr_ptes in PGCL=0 branch of map_anon_folio_pte_nopf()
+2ec1208553f4	arch/x86,fs	x86, fs/fat: PGCL=6 build fixes — auto-cap MAX_PAGE_ORDER, heap bhs[]
+9e0279ae932e	arch/arm64,arch/loongarch,arch/mips,arch/riscv,arch/s390,arch/sparc	arch: PGCL — auto-cap ARCH_FORCE_MAX_ORDER for high PAGE_MMUSHIFT
+be314ff83078	arch/arm64,arch/loongarch,arch/mips,arch/riscv,arch/s390,arch/sparc,arch/x86	arch: PGCL — raise ARCH_FORCE_MAX_ORDER caps for HPAGE_PMD_ORDER headroom
+61fd1be7ca6f	Documentation	Documentation/mm: introduce sub-PMD superpages and walker inventory
+35e2bda14d75	mm	Phase 2b: folio_pte_batch_flags returns struct with kind classification
+b6b69379b34b	include,mm	mm: page_vma_mapped_walk yields one kernel page per step under PGCL
+5c8fc3acb61a	mm	mm/rmap: try_to_unmap_one consumes pvmw->nr_mmupages
+886d1ae96066	mm	mm/memory: drop do_anonymous_page +(rss-1) _mapcount compensation
+c30352064c4c	mm	mm/huge_memory: fix phantom head _mapcount post-split for partial mTHP
+7dcee907e3b5	mm	mm/huge_memory: force sub-folio _mapcount reset post-split
+2e4c4283d8b7	mm	mm/rmap: fix try_to_unmap_one early-exit dropping PTEs after partial yield
+5aa9ff637c3f	mm	mm/rmap: try_to_migrate_one consumes pvmw->nr_mmupages
+3fc2b7084a2a	mm	mm/rmap: folio_referenced_one consumes correct MMUPAGE units under PGCL
+e755bf47e2e0	mm	mm/rmap: page_vma_mkclean_one batches via pvmw->nr_mmupages
+146ab21a5d03	mm	mm: remove_migration_pte consumes pvmw->nr_mmupages (and walker batches migration entries)
+5e2620b0e2f6	mm	mm: PGCL anon rmap convention unified at one event per PTE (Option A)
+39bc0dedac23	arch/riscv	riscv: ptrace: REGSET_CFI populate core_note_name
+d92c5108fee0	arch/x86,mm	mm, x86: PGCL=6 boot fixes — early_memremap chunk size, early_pgt_buf
+70eb3c553f17	arch/arm64	arm64: mmu: declare_vma assertion uses MMUPAGE alignment
+86fb580fb948	arch/s390	s390/mm: vmem modify_pagetable assertion uses MMUPAGE alignment
+1cf93b17081a	mm	mm/ioremap: generic_ioremap_prot aligns by MMUPAGE_SIZE
+bdea8d7d876b	arch/arm64	arm64: mm: free_initmem alignment WARN uses MMUPAGE_SIZE
+036a0e39c6be	arch/arm64	arm64: contpte: preserve sub-page offset when folding CONT range
+cc8f6cfb3463	include	vmlinux.lds.h: align .text.hot at MMUPAGE granularity, not PAGE_SIZE
+a1cf672a4cb7	arch/parisc	parisc: entry.S protect-isolation aligns at MMUPAGE_SIZE, not PAGE_SIZE
+29688b518603	arch/parisc,drivers	parisc: SBA/CCIO IOMMU programs IO-page granularity from MMUPAGE_SIZE
+5a703a677ce3	arch/loongarch,arch/mips,include	vmlinux.lds: fall back when MMUPAGE_SIZE not exposed; expose it on mips/loongarch
+903fcf02cc65	arch/parisc	parisc: bump SECTION_SIZE_BITS to 28 so PGCL=6 builds
+9662a9f6e69f	arch/alpha	alpha: entry.S non-strace path saves syscall nr to regs->r1/r2
+c80db5bf81e7	drivers	drm/imagination: pvr_mmu: derive device page from MMUPAGE_SIZE
+95a296a8f1fd	arch/mips	mips: shm_align_mask is hardware-cache, not kernel-page, granularity
+5a01253e00ff	arch/mips	mips: prepare PTE-table sub-page packing for PGCL
+57e2ee8de3b9	arch/mips	mips/pgtable_pte: document phase-2 packing TODO with diagnostic state
+280d692f5008	arch/mips	mips/pgtable_pte: rule out dcache-aliasing as Phase-2 packing hang cause
+441bcbf445b9	arch/mips,mm	mips/pgcl: enable full PTE-table packing; disable SPLIT_PTE_PTLOCKS
+7bb437bc17b5	arch/mips	mips: align mips_stack_top() down to PAGE_SIZE for PGCL safety
+83b861bd31ae	arch/mips,include,mm	mm: PACK_PTE_PTLOCKS — per-sub-table ptlocks for packed PTE tables
+8c8cbeb94e55	arch/parisc	parisc: flush_dcache_folio: convert folio->index to MMUPAGE units
+fd4ad3a67b31	arch/arm64,mm	mm, arm64: vmap_pte_range huge-pte uses paddr — fixes PGCL>0 SMP IPI
+92f949830f3e	mm	mm: unmap_mapping_range_tree query in MMUPAGE units
+a4163836cf92	mm	mm: filemap_map_pages clamp fault-around to vmf->pmd's PMD range
+3e8a58e4f590	arch/sparc	sparc64: skip hugetlb hstates whose order < order_base_2(__NR_USED_SUBPAGE)
+ba81206e7eff	fs	fs/userfaultfd: validate uffd ranges in MMUPAGE units, not PAGE units
+47e1e3622e35	mm	mm/userfaultfd: mfill_atomic copies one MMUPAGE per iteration, not one PAGE
+a4f3bb748a18	fs	fs/exec: align stack_top to MMUPAGE granularity, not PAGE
+5822968b843b	mm	mm/util: randomize_stack_top aligns to MMUPAGE, not PAGE
+e38e7ecb65eb	mm	mm/rmap: reset nr_pages to 1 each PVMW iteration in try_to_unmap_one and try_to_migrate_one
+cd7ebf833e33	include,mm	mm: PGCL sub-PAGE arithmetic — drop the vm_pgoff-tracks-vm_start assumption
+43125d913f06	arch/alpha	alpha: define __pte_val_to_phys (inverse of __phys_to_pte_val)
+a59b48f70f20	arch/parisc	parisc: NUM_PDC_RESULT 32 → 64 to absorb wide-firmware result overrun
+bba9c35aebcb	drivers	loongarch/efistub: align KASLR offset to PAGE_SIZE for PGCL
+d3f1e24dbb3c	mm	slub: cap oo_objects at MAX_OBJS_PER_PAGE to avoid slab->objects overflow
+ea353c69335c	mm	mm: insert arch MMU cache for every sub-PTE installed by anon/COW clustering
+3af338f0f73a	arch/arm	ARM: free_initmem must scan for PTE tables even when PAGE_MMUSHIFT == 0
+74957bd70f2b	mm	mm/mincore: avoid 32-bit overflow of end in do_mincore() under PGCL
+b98312a0c8f5	arch/sparc	sparc64: colour shared mmaps with MMUPAGE_MASK, not PAGE_MASK, under PGCL
+e98a90003ae6	arch/arm,arch/csky,arch/sparc,arch/xtensa	arm, csky, xtensa, sparc32: MMUPAGE-based cache colouring under PGCL
+a8bb04366ba4	mm	mm/shmem: scale default tmpfs max_inodes by PAGE_MMUCOUNT under PGCL
