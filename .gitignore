@@ -13,6 +13,11 @@ userspace/hppa-sysroot/
 *.img
 *.fd
 
+# Large boot/hang video captures + extracted frames (see HANG-VIDEO-TOOLKIT.md)
+laptop-boot-video/
+*.mp4
+*.mov
+
 # Logs
 *.log
 

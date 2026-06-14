@@ -1,0 +1,606 @@
+decompress	arch/x86/boot/compressed/acpi.c:46	Error getting RSDP address.
+decompress	arch/x86/boot/compressed/acpi.c:67	EFI support advertised, but unable to locate system table.
+decompress	arch/x86/boot/compressed/acpi.c:71	EFI config table not found.
+decompress	arch/x86/boot/compressed/acpi.c:294	Invalid zero length SRAT subtable.
+decompress	arch/x86/boot/compressed/acpi.c:309	Too many immovable memory regions, aborting.
+decompress	arch/x86/boot/compressed/efi.c:33	No EFI environment detected.
+decompress	arch/x86/boot/compressed/efi.c:44	EFI system table is located above 4GB and cannot be accessed.
+decompress	arch/x86/boot/compressed/efi.c:74	EFI system table not found.
+decompress	arch/x86/boot/compressed/efi.c:112	kexec EFI environment missing valid configuration table.
+decompress	arch/x86/boot/compressed/efi.c:178	Error: EFI config table entry located above 4GB.
+decompress	arch/x86/boot/compressed/ident_map_64.c:56	out of pgt_buf in !?
+decompress	arch/x86/boot/compressed/ident_map_64.c:64	pgt_buf running low in
+decompress	arch/x86/boot/compressed/ident_map_64.c:65	Need to raise BOOT_PGT_SIZE?
+decompress	arch/x86/boot/compressed/ident_map_64.c:106	Error: kernel_ident_mapping_init() failed
+decompress	arch/x86/boot/compressed/ident_map_64.c:358	Stopping.
+decompress	arch/x86/boot/compressed/kaslr.c:215	Repeatedly set hugeTLB page size of 1G!
+decompress	arch/x86/boot/compressed/kaslr.c:241	Failed to allocate space for tmp_cmdline
+decompress	arch/x86/boot/compressed/kaslr.c:547	slots_fetch_random() failed!?
+decompress	arch/x86/boot/compressed/kaslr.c:608	Aborted e820/efi memmap scan (slot_areas full)!
+decompress	arch/x86/boot/compressed/kaslr.c:637	Aborted e820/efi memmap scan when walking immovable regions(slot_areas full)!
+decompress	arch/x86/boot/compressed/kaslr.c:697	EFI memmap is above 4GB, can't be handled now on x86_32. EFI should be disabled.
+decompress	arch/x86/boot/compressed/kaslr.c:817	Aborted memory entries scan (more than 4 memmap= args)!
+decompress	arch/x86/boot/compressed/kaslr.c:833	Invalid physical address chosen!
+decompress	arch/x86/boot/compressed/kaslr.c:870	KASLR disabled: 'nokaslr' on cmdline.
+decompress	arch/x86/boot/compressed/kaslr.c:896	Physical KASLR disabled: no suitable memory region!
+decompress	arch/x86/boot/compressed/mem.c:40	TDX: Failed to accept memory
+decompress	arch/x86/boot/compressed/mem.c:44	Cannot accept memory: unknown platform
+decompress	arch/x86/boot/compressed/mem.c:63	EFI config table not found.
+decompress	arch/x86/boot/compressed/mem.c:73	Unknown version of unaccepted memory table
+decompress	arch/x86/boot/compressed/misc.c:230	No relocation needed...
+decompress	arch/x86/boot/compressed/misc.c:233	Performing relocations...
+decompress	arch/x86/boot/compressed/misc.c:258	32-bit relocation outside of kernel!
+decompress	arch/x86/boot/compressed/misc.c:269	64-bit relocation outside of kernel!
+decompress	arch/x86/boot/compressed/misc.c:298	Kernel is not a valid ELF file
+decompress	arch/x86/boot/compressed/misc.c:300	Parsing ELF...
+decompress	arch/x86/boot/compressed/misc.c:304	Failed to allocate space for phdrs
+decompress	arch/x86/boot/compressed/misc.c:315	Alignment of LOAD segment isn't multiple of 2MB
+decompress	arch/x86/boot/compressed/misc.c:456	early console in extract_kernel
+decompress	arch/x86/boot/compressed/misc.c:497	Destination physical address inappropriately aligned
+decompress	arch/x86/boot/compressed/misc.c:499	Destination virtual address inappropriately aligned
+decompress	arch/x86/boot/compressed/misc.c:502	Destination address too large
+decompress	arch/x86/boot/compressed/misc.c:504	Destination virtual address is beyond the kernel mapping area
+decompress	arch/x86/boot/compressed/misc.c:507	Destination address too large
+decompress	arch/x86/boot/compressed/misc.c:511	Destination virtual address changed when not relocatable
+decompress	arch/x86/boot/compressed/misc.c:514	Decompressing Linux...
+decompress	arch/x86/boot/compressed/misc.c:517	Accepting memory...
+decompress	arch/x86/boot/compressed/misc.c:523	done. Booting the kernel (entry_offset: 0x
+decompress	arch/x86/boot/compressed/sev.c:117	SEV-ES CPU Features missing.
+decompress	arch/x86/boot/compressed/sev.c:135	Can't map GHCB page encrypted
+decompress	arch/x86/boot/compressed/sev.c:143	Can't unmap GHCB page
+decompress	arch/x86/boot/compressed/sev.c:397	SEV-SNP support indicated by CC blob, but not CPUID.
+decompress	arch/x86/boot/compressed/sev.c:433	SEV-SNP supported indicated by CC blob, but not SEV status MSR.
+decompress	arch/x86/boot/compressed/string.c:71	Avoiding potentially unsafe overlapping memcpy()!
+decompress	arch/x86/boot/compressed/tdx.c:16	TDVMCALL failed. TDX module bug?
+realmode	arch/x86/boot/cpu.c:76	This kernel requires the following features not present on the CPU:
+realmode	arch/x86/boot/cpucheck.c:179	WARNING: Forcing PAE in CPU flags
+realmode	arch/x86/boot/cpucheck.c:184	WARNING: PAE disabled. Use parameter 'forcepae' to enable at your own risk!
+realmode	arch/x86/boot/cpucheck.c:221	This 32-bit kernel can not run on this Xeon Phi x200 processor due to a processor erratum. Use a 64-bit kernel, or enable PAE in this 32-bit kernel.
+realmode	arch/x86/boot/main.c:129	WARNING: Ancient bootloader, some functionality may be limited!
+realmode	arch/x86/boot/main.c:143	early console in setup code
+realmode	arch/x86/boot/main.c:150	Unable to boot - please use a kernel appropriate for your CPU.
+realmode	arch/x86/boot/pm.c:110	A20 gate not responding, unable to boot...
+realmode	arch/x86/boot/video.c:156	Mode: Resolution: Type:
+realmode	arch/x86/boot/video.c:205	Press <ENTER> to see video modes available, <SPACE> to continue, or wait 30 sec
+realmode	arch/x86/boot/video.c:222	Enter a video mode or "scan" to scan for additional modes:
+early-kernel	arch/x86/kernel/dumpstack.c:70	%s %s%pBb ?
+early-kernel	arch/x86/kernel/dumpstack.c:121	%sCode: %ph <%02x> %ph
+early-kernel	arch/x86/kernel/dumpstack.c:129	%sCode: Unable to access opcode bytes at 0x%lx.
+early-kernel	arch/x86/kernel/dumpstack.c:138	%sEIP: %pS
+early-kernel	arch/x86/kernel/dumpstack.c:140	%sRIP: %04x:%pS
+early-kernel	arch/x86/kernel/dumpstack.c:148	%sRSP: %04x:%016lx EFLAGS: %08lx
+early-kernel	arch/x86/kernel/dumpstack.c:193	%sCall Trace:
+early-kernel	arch/x86/kernel/dumpstack.c:396	Fatal exception in interrupt
+early-kernel	arch/x86/kernel/dumpstack.c:398	Fatal exception
+early-kernel	arch/x86/kernel/dumpstack.c:418	Oops: %s: %04lx [#%d]%s%s%s%s SMP DEBUG_PAGEALLOC KASAN PTI NOPTI
+early-kernel	arch/x86/kernel/e820.c:171	E820 table full; ignoring [mem %#010llx-%#010llx]
+early-kernel	arch/x86/kernel/e820.c:193	System RAM
+early-kernel	arch/x86/kernel/e820.c:194	device reserved
+early-kernel	arch/x86/kernel/e820.c:195	soft reserved
+early-kernel	arch/x86/kernel/e820.c:196	ACPI data
+early-kernel	arch/x86/kernel/e820.c:197	ACPI NVS
+early-kernel	arch/x86/kernel/e820.c:198	unusable
+early-kernel	arch/x86/kernel/e820.c:200	persistent RAM (type %u)
+early-kernel	arch/x86/kernel/e820.c:201	type %u
+early-kernel	arch/x86/kernel/e820.c:219	out of order E820 entry!
+early-kernel	arch/x86/kernel/e820.c:222	%s: [gap %#018Lx-%#018Lx]
+early-kernel	arch/x86/kernel/e820.c:228	%s: [mem %#018Lx-%#018Lx]
+early-kernel	arch/x86/kernel/e820.c:488	e820: update [mem %#010Lx-%#010Lx]
+early-kernel	arch/x86/kernel/e820.c:564	e820: remove [mem %#010Lx-%#010Lx]
+early-kernel	arch/x86/kernel/e820.c:615	modified physical RAM map:
+early-kernel	arch/x86/kernel/e820.c:700	Cannot find an available gap in the 32-bit address range
+early-kernel	arch/x86/kernel/e820.c:701	PCI devices with unassigned 32-bit BARs may not work!
+early-kernel	arch/x86/kernel/e820.c:712	[gap %#010lx-%#010lx] available for PCI devices
+early-kernel	arch/x86/kernel/e820.c:772	extended physical RAM map:
+early-kernel	arch/x86/kernel/e820.c:840	update e820_table_kexec for e820__memblock_alloc_reserved()
+early-kernel	arch/x86/kernel/e820.c:891	last_pfn = %#lx max_arch_pfn = %#lx
+early-kernel	arch/x86/kernel/e820.c:921	mem=nopentium ignored! (only supported on x86_32)
+early-kernel	arch/x86/kernel/e820.c:1023	Invalid user supplied memory map
+early-kernel	arch/x86/kernel/e820.c:1025	user-defined physical RAM map:
+early-kernel	arch/x86/kernel/e820.c:1226	e820: register RAM buffer resource [mem %#010llx-%#010llx]
+early-kernel	arch/x86/kernel/e820.c:1284	BIOS-provided physical RAM map:
+early-kernel	arch/x86/kernel/early_printk.c:376	ERROR: earlyprintk= %s already used
+early-kernel	arch/x86/kernel/setup.c:330	Cannot find place for new RAMDISK of size %lld
+early-kernel	arch/x86/kernel/setup.c:335	Allocated new RAMDISK: [mem %#010llx-%#010llx]
+early-kernel	arch/x86/kernel/setup.c:340	Copy RAMDISK failed
+early-kernel	arch/x86/kernel/setup.c:342	Move RAMDISK from [mem %#010llx-%#010llx] to [mem %#010llx-%#010llx]
+early-kernel	arch/x86/kernel/setup.c:375	RAMDISK: [mem %#010llx-%#010llx]
+early-kernel	arch/x86/kernel/setup.c:407	setup: failed to memremap ima_setup_data entry
+early-kernel	arch/x86/kernel/setup.c:419	Passed IMA kexec data, but CONFIG_IMA not set. Ignoring.
+early-kernel	arch/x86/kernel/setup.c:463	Passed KHO data, but CONFIG_KEXEC_HANDOVER not set. Ignoring.
+early-kernel	arch/x86/kernel/setup.c:469	setup: failed to memremap kho data (0x%llx, 0x%llx)
+early-kernel	arch/x86/kernel/setup.c:579	setup: failed to memremap setup_data entry
+early-kernel	arch/x86/kernel/setup.c:593	setup: failed to memremap indirect setup_data
+early-kernel	arch/x86/kernel/setup.c:624	Ignoring crashkernel for a Xen PV domain
+early-kernel	arch/x86/kernel/setup.c:732	reserving inaccessible SNB gfx pages
+early-kernel	arch/x86/kernel/setup.c:747	failed to reserve 0x%08lx
+early-kernel	arch/x86/kernel/setup.c:791	.text .data .bss are not marked as E820_TYPE_RAM!
+early-kernel	arch/x86/kernel/setup.c:835	Kernel Offset: 0x%lx from 0x%lx (relocation range: 0x%lx-0x%lx)
+early-kernel	arch/x86/kernel/setup.c:841	Kernel Offset: disabled
+early-kernel	arch/x86/kernel/setup.c:858	Notice: NX (Execute Disable) protection missing in CPU!
+early-kernel	arch/x86/kernel/setup.c:862	NX (Execute Disable) protection: active
+early-kernel	arch/x86/kernel/setup.c:865	Notice: NX (Execute Disable) protection cannot be enabled: non-PAE kernel!
+early-kernel	arch/x86/kernel/setup.c:909	Command line: %s
+early-kernel	arch/x86/kernel/setup.c:1022	Applying PPro RAM bug workaround: punching 256 kB hole at 1.75 GB physical.
+early-kernel	arch/x86/kernel/setup.c:1104	initial memory mapped: [mem 0x00000000-%#010lx]
+early-kernel	arch/x86/kernel/setup.c:1162	Secure boot disabled
+early-kernel	arch/x86/kernel/setup.c:1165	Secure boot enabled
+early-kernel	arch/x86/kernel/setup.c:1168	Secure boot could not be determined
+early-kernel	arch/x86/kernel/traps.c:326	:%s[%d] %s%s ip:%lx sp:%lx error:%lx
+early-kernel	arch/x86/kernel/traps.c:452	:%s at %pS
+early-kernel	arch/x86/kernel/traps.c:553	BUG: %s stack guard page was hit at %px (stack is %px..%px)
+early-kernel	arch/x86/kernel/traps.c:559	%s stack guard hit
+early-kernel	arch/x86/kernel/traps.c:711	:PANIC: double fault, error_code: 0x%lx
+early-kernel	arch/x86/kernel/traps.c:714	Machine halted.
+early-kernel	arch/x86/kernel/traps.c:822	:%s[%d] attempts to use CLI/STI, pretending it's a NOP, ip:%lx
+early-kernel	arch/x86/kernel/traps.c:1568	CR0.TS was set
+early-mm	arch/x86/mm/amdtopology.c:71	Scanning NUMA topology in Northbridge %d
+early-mm	arch/x86/mm/amdtopology.c:78	Number of physical nodes %d
+early-mm	arch/x86/mm/amdtopology.c:90	Skipping disabled node %d
+early-mm	arch/x86/mm/amdtopology.c:94	Ignoring excess node %d (%Lx:%Lx)
+early-mm	arch/x86/mm/amdtopology.c:100	Skipping node entry %d (base %Lx)
+early-mm	arch/x86/mm/amdtopology.c:105	Node %d using interleaving mode %Lx/%Lx
+early-mm	arch/x86/mm/amdtopology.c:110	Node %d already present, skipping
+early-mm	arch/x86/mm/amdtopology.c:132	Empty node %d
+early-mm	arch/x86/mm/amdtopology.c:136	Node %d bogus settings %Lx-%Lx.
+early-mm	arch/x86/mm/amdtopology.c:143	Node map not sorted %Lx,%Lx
+early-mm	arch/x86/mm/amdtopology.c:148	Node %d MemBase %016Lx Limit %016Lx
+early-mm	arch/x86/mm/amdtopology.c:167	BSP APIC ID: %02x
+early-mm	arch/x86/mm/dump_pagetables.c:264	x86/mm: Found insecure W+X mapping at address %pS
+early-mm	arch/x86/mm/dump_pagetables.c:481	x86/mm: Checked W+X mappings: FAILED, %lu W+X pages found.
+early-mm	arch/x86/mm/dump_pagetables.c:486	x86/mm: Checked W+X mappings: passed, no W+X pages found.
+early-mm	arch/x86/mm/dump_pagetables.c:517	x86/mm: Checking user space page tables
+early-mm	arch/x86/mm/extable.c:125	Bad FPU state detected at %pB, reinitializing FPU registers.
+early-mm	arch/x86/mm/extable.c:161	General protection fault in user access. Non-canonical address?
+early-mm	arch/x86/mm/extable.c:170	unchecked MSR access error: WRMSR to 0x%x (tried to write 0x%08x%08x) at rIP: 0x%lx (%pS)
+early-mm	arch/x86/mm/extable.c:177	unchecked MSR access error: RDMSR from 0x%x at rIP: 0x%lx (%pS)
+early-mm	arch/x86/mm/extable.c:310	PNPBIOS fault.. attempting recovery.
+early-mm	arch/x86/mm/extable.c:315	do_trap: can't hit this
+early-mm	arch/x86/mm/extable.c:425	PANIC: early exception 0x%02x IP %lx:%lx error %lx cr2 0x%lx
+early-mm	arch/x86/mm/fault.c:304	*pdpt = %016Lx
+early-mm	arch/x86/mm/fault.c:327	*pte = %0*Lx
+early-mm	arch/x86/mm/fault.c:362	PGD %lx
+early-mm	arch/x86/mm/fault.c:371	P4D %lx
+early-mm	arch/x86/mm/fault.c:379	PUD %lx
+early-mm	arch/x86/mm/fault.c:387	PMD %lx
+early-mm	arch/x86/mm/fault.c:395	PTE %lx
+early-mm	arch/x86/mm/fault.c:400	BAD
+early-mm	arch/x86/mm/fault.c:484	%s: NULL
+early-mm	arch/x86/mm/fault.c:489	%s: 0x%hx -- out of bounds
+early-mm	arch/x86/mm/fault.c:495	%s: 0x%hx -- GDT entry is not readable
+early-mm	arch/x86/mm/fault.c:504	%s: 0x%hx -- base=0x%lx limit=0x%x
+early-mm	arch/x86/mm/fault.c:526	kernel tried to execute NX-protected page - exploit attempt? (uid: %d)
+early-mm	arch/x86/mm/fault.c:531	unable to execute userspace code (SMEP?) (uid: %d)
+early-mm	arch/x86/mm/fault.c:536	BUG: kernel NULL pointer dereference, address: %px
+early-mm	arch/x86/mm/fault.c:539	BUG: unable to handle page fault for address: %px
+early-mm	arch/x86/mm/fault.c:542	#PF: %s %s in %s mode usersupervisorinstruction fetchwrite accessread accessuserkernel
+early-mm	arch/x86/mm/fault.c:548	#PF: error_code(0x%04lx) - %s not-present pagereserved bit violationprotection keys violationRMP violationpermissions violation
+early-mm	arch/x86/mm/fault.c:574	IDT: 0x%lx (limit=0x%hx) GDT: 0x%lx (limit=0x%hx)
+early-mm	arch/x86/mm/fault.c:602	%s: Corrupted page table at address %lx
+early-mm	arch/x86/mm/fault.c:706	Thread overran stack, or stack corrupted
+early-mm	arch/x86/mm/fault.c:713	CR2: %016lx
+early-mm	arch/x86/mm/fault.c:757	%s%s[%d]: segfault at %lx ip %px sp %px error %lx
+early-mm	arch/x86/mm/fault.c:767	likely on CPU %d (core %d, socket %d)
+early-mm	arch/x86/mm/fault.c:933	MCE: Killing %s:%d due to hardware memory corruption fault at %lx
+early-mm	arch/x86/mm/fault.c:1040	PMD has incorrect permission bits
+early-mm	arch/x86/mm/init.c:158	alloc_low_pages: can not alloc memory
+early-mm	arch/x86/mm/init.c:270	Using GB pages for direct mapping
+early-mm	arch/x86/mm/init.c:305	Incomplete global flushes, disabling PCID
+early-mm	arch/x86/mm/init.c:347	run out of range for init_memory_mapping
+early-mm	arch/x86/mm/init.c:509	[mem %#010lx-%#010lx] page %s
+early-mm	arch/x86/mm/init.c:556	init_memory_mapping: [mem %#010lx-%#010lx]
+early-mm	arch/x86/mm/init.c:661	Failed to release memory for alloc_low_pages()
+early-mm	arch/x86/mm/init.c:942	debug: unmapping init [mem %#010lx-%#010lx]
+early-mm	arch/x86/mm/init_32.c:450	try to clear pte for ram above max_low_pfn: pfn: %lx pmd: %p pmd phys: %lx, but pmd is big page and is not using pte !
+early-mm	arch/x86/mm/init_32.c:459	clearing pte for ram above max_low_pfn: pfn: %lx pmd: %p pmd phys: %lx pte: %p pte phys: %lx
+early-mm	arch/x86/mm/init_32.c:560	ignoring highmem size on non-highmem kernel!
+early-mm	arch/x86/mm/init_32.c:591	Warning only %ldMB will be used.
+early-mm	arch/x86/mm/init_32.c:592	Use a HIGHMEM enabled kernel.
+early-mm	arch/x86/mm/init_32.c:621	%ldMB HIGHMEM available.
+early-mm	arch/x86/mm/init_32.c:632	%ldMB LOWMEM available.
+early-mm	arch/x86/mm/init_32.c:635	mapped low ram: 0 - %08lx
+early-mm	arch/x86/mm/init_32.c:637	low ram: 0 - %08lx
+early-mm	arch/x86/mm/init_32.c:669	Checking if this processor honours the WP bit even in supervisor mode...
+early-mm	arch/x86/mm/init_32.c:680	Linux doesn't support CPUs with broken WP.
+early-mm	arch/x86/mm/init_32.c:736	NX-protecting the kernel data: %luk
+early-mm	arch/x86/mm/init_32.c:746	Write protecting kernel text and read-only data: %luk
+early-mm	arch/x86/mm/init_32.c:752	Testing CPA: Reverting %lx-%lx
+early-mm	arch/x86/mm/init_32.c:755	Testing CPA: write protecting again
+early-mm	arch/x86/mm/init_64.c:258	set_pte_phys: cannot allocate page data %s after bootmem
+early-mm	arch/x86/mm/init_64.c:262	spp_getpage %p
+early-mm	arch/x86/mm/init_64.c:273	PAGETABLE BUG #00! %p <-> %p
+early-mm	arch/x86/mm/init_64.c:285	PAGETABLE BUG #01! %p <-> %p
+early-mm	arch/x86/mm/init_64.c:297	PAGETABLE BUG #02! %p <-> %p
+early-mm	arch/x86/mm/init_64.c:309	PAGETABLE BUG #03!
+early-mm	arch/x86/mm/init_64.c:348	set_pte_vaddr %lx to %lx
+early-mm	arch/x86/mm/init_64.c:352	PGD FIXMAP MISSING, it should be setup in head.S!
+early-mm	arch/x86/mm/init_64.c:1368	Failed to pre-allocate %s pages for vmalloc area
+early-mm	arch/x86/mm/init_64.c:1409	Write protecting the kernel read-only data: %luk
+early-mm	arch/x86/mm/init_64.c:1433	Testing CPA: undo %lx-%lx
+early-mm	arch/x86/mm/init_64.c:1436	Testing CPA: again
+early-mm	arch/x86/mm/init_64.c:1505	x86/mm: Memory block size: %ldMB
+early-mm	arch/x86/mm/init_64.c:1538	[%lx-%lx] PMD -> [%p-%p] on node %d
+early-mm	arch/x86/mm/init_64.c:1666	[%lx-%lx] PMD -> [%p-%p] on node %d
+early-mm	arch/x86/mm/ioremap.c:204	ioremap: invalid physical address %llx
+early-mm	arch/x86/mm/ioremap.c:216	ioremap on RAM at %pa - %pa
+early-mm	arch/x86/mm/ioremap.c:241	ioremap memtype_reserve failed %d
+early-mm	arch/x86/mm/ioremap.c:247	ioremap error for 0x%llx-0x%llx, requested 0x%x, got 0x%x
+early-mm	arch/x86/mm/ioremap.c:316	caller %pS mapping multiple BARs
+early-mm	arch/x86/mm/ioremap.c:476	iounmap() called for ISA range not obtained using ioremap()
+early-mm	arch/x86/mm/ioremap.c:493	iounmap: bad address %p
+early-mm	arch/x86/mm/ioremap.c:664	failed to remap setup_data entry
+early-mm	arch/x86/mm/ioremap.c:692	failed to remap indirect setup_data
+early-mm	arch/x86/mm/ioremap.c:878	pmd %p != %p
+early-mm	arch/x86/mm/ioremap.c:880	fix_to_virt(FIX_BTMAP_BEGIN): %08lx
+early-mm	arch/x86/mm/ioremap.c:882	fix_to_virt(FIX_BTMAP_END): %08lx
+early-mm	arch/x86/mm/ioremap.c:885	FIX_BTMAP_END: %d
+early-mm	arch/x86/mm/ioremap.c:886	FIX_BTMAP_BEGIN: %d
+early-mm	arch/x86/mm/kasan_init_64.c:31	%pS: Failed to allocate page, nid=%d from=%lx
+early-mm	arch/x86/mm/kmmio.c:166	:no pte for addr 0x%08lx
+early-mm	arch/x86/mm/kmmio.c:178	:unexpected page level 0x%x.
+early-mm	arch/x86/mm/kmmio.c:200	kmmio page already armed.
+early-mm	arch/x86/mm/kmmio.c:202	:double-arm: addr 0x%08lx, ref %d, old %d
+early-mm	arch/x86/mm/kmmio.c:206	arming at 0x%08lx failed.
+early-mm	arch/x86/mm/kmmio.c:216	kmmio disarming at 0x%08lx failed.
+early-mm	arch/x86/mm/kmmio.c:276	:secondary hit for 0x%08lx CPU %d.
+early-mm	arch/x86/mm/kmmio.c:280	:unexpected secondary hit for address 0x%08lx on CPU %d.
+early-mm	arch/x86/mm/kmmio.c:288	:recursive probe hit on CPU %d, for address 0x%08lx. Ignoring.
+early-mm	arch/x86/mm/kmmio.c:290	:previous hit was at 0x%08lx.
+early-mm	arch/x86/mm/kmmio.c:345	:unexpected debug trap on CPU %d.
+early-mm	arch/x86/mm/kmmio.c:463	:Unable to set page fault.
+early-mm	arch/x86/mm/kmmio.c:567	:leaking kmmio_fault_page objects.
+early-mm	arch/x86/mm/kmmio.c:629	kmmio_page_table not empty at cleanup, any further tracing will leak memory.
+early-mm	arch/x86/mm/mem_encrypt.c:47	Memory Encryption Features active:
+early-mm	arch/x86/mm/mem_encrypt.c:51	Intel TDX
+early-mm	arch/x86/mm/mem_encrypt.c:54	AMD
+early-mm	arch/x86/mm/mem_encrypt.c:62	SME
+early-mm	arch/x86/mm/mem_encrypt.c:68	SEV
+early-mm	arch/x86/mm/mem_encrypt.c:72	SEV-ES
+early-mm	arch/x86/mm/mem_encrypt.c:76	SEV-SNP
+early-mm	arch/x86/mm/mem_encrypt.c:84	Unknown
+early-mm	arch/x86/mm/mem_encrypt_amd.c:236	Invalid level for kpte
+early-mm	arch/x86/mm/mem_encrypt_amd.c:268	kpte lookup for vaddr
+early-mm	arch/x86/mm/mem_encrypt_amd.c:563	failed to free unused decrypted pages
+early-mm	arch/x86/mm/mmio-mod.c:85	mmiotrace:Error in %s: no pte for page 0x%08lx
+early-mm	arch/x86/mm/mmio-mod.c:91	mmiotrace:4MB pages are not currently supported: 0x%08lx
+early-mm	arch/x86/mm/mmio-mod.c:95	mmiotrace:pte for 0x%lx: 0x%llx 0x%llx
+early-mm	arch/x86/mm/mmio-mod.c:108	mmiotrace:unexpected fault for address: 0x%08lx, last fault for address: 0x%08lx
+early-mm	arch/x86/mm/mmio-mod.c:111	mmiotrace:faulting IP is at %pS
+early-mm	arch/x86/mm/mmio-mod.c:112	mmiotrace:last faulting IP was at %pS
+early-mm	arch/x86/mm/mmio-mod.c:114	mmiotrace:eax: %08lx ebx: %08lx ecx: %08lx edx: %08lx
+early-mm	arch/x86/mm/mmio-mod.c:116	mmiotrace:esi: %08lx edi: %08lx ebp: %08lx esp: %08lx
+early-mm	arch/x86/mm/mmio-mod.c:119	mmiotrace:rax: %016lx rcx: %016lx rdx: %016lx
+early-mm	arch/x86/mm/mmio-mod.c:121	mmiotrace:rsi: %016lx rdi: %016lx rbp: %016lx rsp: %016lx
+early-mm	arch/x86/mm/mmio-mod.c:202	mmiotrace:unexpected post handler
+early-mm	arch/x86/mm/mmio-mod.c:233	mmiotrace:kmalloc failed in ioremap
+early-mm	arch/x86/mm/mmio-mod.c:271	mmiotrace:ioremap_*(0x%llx, 0x%lx) = %p
+early-mm	arch/x86/mm/mmio-mod.c:290	mmiotrace:Unmapping %p.
+early-mm	arch/x86/mm/mmio-mod.c:352	mmiotrace:purging non-iounmapped trace @0x%08lx, size 0x%lx.
+early-mm	arch/x86/mm/mmio-mod.c:375	mmiotrace:Failed to allocate mask
+early-mm	arch/x86/mm/mmio-mod.c:383	mmiotrace:Disabling non-boot CPUs...
+early-mm	arch/x86/mm/mmio-mod.c:389	mmiotrace:CPU%d is down.
+early-mm	arch/x86/mm/mmio-mod.c:391	mmiotrace:Error taking CPU%d down: %d
+early-mm	arch/x86/mm/mmio-mod.c:395	mmiotrace:multiple CPUs still online, may miss events.
+early-mm	arch/x86/mm/mmio-mod.c:405	mmiotrace:Re-enabling CPUs...
+early-mm	arch/x86/mm/mmio-mod.c:409	mmiotrace:enabled CPU%d.
+early-mm	arch/x86/mm/mmio-mod.c:411	mmiotrace:cannot re-enable CPU%d: %d
+early-mm	arch/x86/mm/mmio-mod.c:419	mmiotrace:multiple CPUs are online, may miss events. Suggest booting with maxcpus=1 kernel argument.
+early-mm	arch/x86/mm/mmio-mod.c:435	mmiotrace:MMIO tracing disabled.
+early-mm	arch/x86/mm/mmio-mod.c:441	mmiotrace:enabled.
+early-mm	arch/x86/mm/mmio-mod.c:460	mmiotrace:disabled.
+early-mm	arch/x86/mm/numa.c:88	numa_set_node: invalid cpu# (%d)
+early-mm	arch/x86/mm/numa.c:123	Node to cpumask map for %u nodes
+early-mm	arch/x86/mm/numa.c:214	%s NUMA turned offNo NUMA configuration found
+early-mm	arch/x86/mm/numa.c:216	Faking a node at [mem %#018Lx-%#018Lx]
+early-mm	arch/x86/mm/numa.c:344	cpu_to_node(%d): usage too early!
+early-mm	arch/x86/mm/numa.c:363	early_cpu_to_node(%d): no per_cpu area!
+early-mm	arch/x86/mm/numa.c:381	node_to_cpumask_map[%i] NULL
+early-mm	arch/x86/mm/numa.c:391	%s cpu %d node %d: mask now %*pbl numa_add_cpunuma_remove_cpu
+early-mm	arch/x86/mm/numa.c:420	cpumask_of_node(%d): (unsigned)node >= nr_node_ids(%u)
+early-mm	arch/x86/mm/numa.c:427	cpumask_of_node(%d): no node_to_cpumask_map!
+early-mm	arch/x86/mm/pat/cpa-test.c:74	%lx level %d but not PSE %Lx
+early-mm	arch/x86/mm/pat/cpa-test.c:94	4k %lu large %lu gb %lu x %lu[%lx-%lx] miss %lu
+early-mm	arch/x86/mm/pat/cpa-test.c:103	CPA max_pfn_mapped %lu but expected %lu
+early-mm	arch/x86/mm/pat/cpa-test.c:128	CPA self-test:
+early-mm	arch/x86/mm/pat/cpa-test.c:132	CPA Cannot vmalloc bitmap
+early-mm	arch/x86/mm/pat/cpa-test.c:196	CPA %d failed %d
+early-mm	arch/x86/mm/pat/cpa-test.c:202	CPA %lx: bad pte %Lx
+early-mm	arch/x86/mm/pat/cpa-test.c:207	CPA %lx: unexpected level %d
+early-mm	arch/x86/mm/pat/cpa-test.c:222	CPA lookup of %lx failed
+early-mm	arch/x86/mm/pat/cpa-test.c:228	CPA reverting failed: %d
+early-mm	arch/x86/mm/pat/cpa-test.c:233	CPA %lx: bad pte after revert %Lx
+early-mm	arch/x86/mm/pat/cpa-test.c:243	NOT PASSED. Please report.
+early-mm	arch/x86/mm/pat/memtype.c:80	x86/PAT: %s
+early-mm	arch/x86/mm/pat/memtype.c:223	x86/PAT: Configuration [0-7]: %s
+early-mm	arch/x86/mm/pat/memtype.c:233	x86/PAT: PAT enabled, but not supported by secondary CPU
+early-mm	arch/x86/mm/pat/memtype.c:461	x86/PAT: reserve_ram_pages_type failed [mem %#010Lx-%#010Lx], track 0x%x, req 0x%x
+early-mm	arch/x86/mm/pat/memtype.c:537	%s failed: [mem %#010Lx-%#010Lx], req %s
+early-mm	arch/x86/mm/pat/memtype.c:589	x86/PAT: memtype_reserve failed [mem %#010Lx-%#010Lx], track %s, req %s
+early-mm	arch/x86/mm/pat/memtype.c:633	x86/PAT: %s:%d freeing invalid memtype [mem %#010Lx-%#010Lx]
+early-mm	arch/x86/mm/pat/memtype.c:825	x86/PAT: %s:%d ioremap_change_attr failed %s for [mem %#010Lx-%#010Lx]
+early-mm	arch/x86/mm/pat/memtype.c:859	x86/PAT: %s:%d map pfn RAM range req %s for [mem %#010Lx-%#010Lx], got %s
+early-mm	arch/x86/mm/pat/memtype.c:877	x86/PAT: %s:%d map pfn expected mapping type %s for [mem %#010Lx-%#010Lx], got %s
+early-mm	arch/x86/mm/pat/memtype.h:8	x86/PAT:
+early-mm	arch/x86/mm/pat/memtype_interval.c:83	x86/PAT: %s:%d conflicting memory types %Lx-%Lx %s<->%s
+early-mm	arch/x86/mm/pat/set_memory.c:611	CPA %8s %10s: 0x%016lx - 0x%016lx PFN %lx req %016llx prevent %016llx
+early-mm	arch/x86/mm/pat/set_memory.c:699	CPA detected W^X violation: %016llx -> %016llx range: 0x%016lx - 0x%016lx PFN %lx
+early-mm	arch/x86/mm/pat/set_memory.c:1868	CPA: called for zero pte. vaddr = %lx cpa->vaddr = %lx
+early-mm	arch/x86/mm/pat/set_memory.c:2331	Could not invalidate pfn=0x%lx from 1:1 map
+early-mm	arch/x86/mm/pat/set_memory.c:2430	misaligned address: %#lx
+early-mm	arch/x86/mm/pat/set_memory.c:2475	CPA VMM failure to convert memory (addr=%p, numpages=%d) to %s: %d privateshared
+early-mm	arch/x86/mm/pat/set_memory.c:2767	Don't call after initializing SMP
+early-mm	arch/x86/mm/pat/set_memory.c:2810	Don't call after initializing SMP
+early-mm	arch/x86/mm/pf_in.c:167	mmiotrace: Unknown opcode 0x%02x
+early-mm	arch/x86/mm/pf_in.c:198	mmiotrace: Unknown opcode 0x%02x
+early-mm	arch/x86/mm/pf_in.c:327	mmiotrace: Error reg no# %d
+early-mm	arch/x86/mm/pf_in.c:388	mmiotrace: Error reg no# %d
+early-mm	arch/x86/mm/pf_in.c:413	mmiotrace: Not a register instruction, opcode 0x%02x
+early-mm	arch/x86/mm/pf_in.c:441	mmiotrace: Error width# %d
+early-mm	arch/x86/mm/pf_in.c:464	mmiotrace: Not an immediate instruction, opcode 0x%02x
+early-mm	arch/x86/mm/pf_in.c:490	mmiotrace: not a memory access instruction at 0x%lx, rm_mod=0x%02x
+early-mm	arch/x86/mm/pf_in.c:511	mmiotrace: Error: width.
+early-mm	arch/x86/mm/pgtable.c:557	Reserving virtual address space above 0x%08lx (rounded to 0x%08lx)
+early-mm	arch/x86/mm/pti.c:64	Kernel/User page tables isolation:%s
+early-mm	arch/x86/mm/pti.c:70	Kernel/User page tables isolation:%s
+early-mm	arch/x86/mm/pti.c:105	Kernel/User page tables isolation:PTI enabled, disabling INVLPGB
+early-mm	arch/x86/mm/pti.c:110	Kernel/User page tables isolation:PTI enabled, disabling FRED
+early-mm	arch/x86/mm/pti.c:189	attempt to walk user address
+early-mm	arch/x86/mm/pti.c:287	attempt to walk to user pte
+early-mm	arch/x86/mm/pti.c:584	Kernel/User page tables isolation:mapping partial kernel image into user address space
+early-mm	arch/x86/mm/pti.c:630	Kernel/User page tables isolation:enabled
+early-mm	arch/x86/mm/pti.c:643	** WARNING! WARNING! WARNING! WARNING! WARNING! WARNING! **
+early-mm	arch/x86/mm/pti.c:645	** You are using 32-bit PTI on a 64-bit PCID-capable CPU. **
+early-mm	arch/x86/mm/pti.c:646	** Your performance will increase dramatically if you **
+early-mm	arch/x86/mm/pti.c:647	** switch to a 64-bit kernel! **
+early-mm	arch/x86/mm/pti.c:649	** WARNING! WARNING! WARNING! WARNING! WARNING! WARNING! **
+early-mm	arch/x86/mm/srat.c:44	SRAT: PXM %u -> X2APIC 0x%04x ignored
+early-mm	arch/x86/mm/srat.c:49	SRAT: Too many proximity domains %x
+early-mm	arch/x86/mm/srat.c:55	SRAT: PXM %u -> APIC 0x%04x -> Node %u skipped apicid that is too big
+early-mm	arch/x86/mm/srat.c:61	SRAT: PXM %u -> APIC 0x%04x -> Node %u
+early-mm	arch/x86/mm/srat.c:84	SRAT: Too many proximity domains %x
+early-mm	arch/x86/mm/srat.c:95	SRAT: PXM %u -> APIC 0x%02x -> Node %u skipped apicid that is too big
+early-mm	arch/x86/mm/srat.c:102	SRAT: PXM %u -> APIC 0x%02x -> Node %u
+early-mm	arch/x86/mm/testmmiotrace.c:36	:write test.
+early-mm	arch/x86/mm/testmmiotrace.c:53	:read test.
+early-mm	arch/x86/mm/testmmiotrace.c:74	:read far test.
+early-mm	arch/x86/mm/testmmiotrace.c:84	:could not ioremap, aborting.
+early-mm	arch/x86/mm/testmmiotrace.c:125	:you have to use the module argument mmio_address.
+early-mm	arch/x86/mm/testmmiotrace.c:126	:DO NOT LOAD THIS MODULE UNLESS YOU REALLY KNOW WHAT YOU ARE DOING!
+early-mm	arch/x86/mm/testmmiotrace.c:130	:WARNING: mapping %lu kB @ 0x%08lx in PCI address space, and writing 16 kB of rubbish in there.
+early-mm	arch/x86/mm/testmmiotrace.c:135	:All done.
+early-mm	arch/x86/mm/testmmiotrace.c:141	:unloaded.
+efistub	drivers/firmware/efi/libstub/arm32-stub.c:31	Entering in %s mode with MMU %sabled HYPSVCendis
+efistub	drivers/firmware/efi/libstub/arm32-stub.c:39	allocate_pool() failed
+efistub	drivers/firmware/efi/libstub/arm32-stub.c:49	install_configuration_table() failed
+efistub	drivers/firmware/efi/libstub/arm32-stub.c:60	This LPAE kernel is not supported by your CPU
+efistub	drivers/firmware/efi/libstub/arm32-stub.c:99	Unable to allocate memory for uncompressed kernel.
+efistub	drivers/firmware/efi/libstub/arm32-stub.c:109	Free memory starts at 0x%lx, setting kernel_base to 0x%lx
+efistub	drivers/firmware/efi/libstub/arm64-stub.c:27	FIRMWARE BUG: efi_loaded_image_t::image_base has bogus value
+efistub	drivers/firmware/efi/libstub/arm64-stub.c:32	FIRMWARE BUG: kernel image not aligned on %dk boundary
+efistub	drivers/firmware/efi/libstub/arm64.c:51	Working around broken SetVirtualAddressMap()
+efistub	drivers/firmware/efi/libstub/arm64.c:77	This 64 KB granular kernel is not supported by your CPU
+efistub	drivers/firmware/efi/libstub/arm64.c:79	This 16 KB granular kernel is not supported by your CPU
+efistub	drivers/firmware/efi/libstub/efi-stub-entry.c:62	Failed to get loaded image protocol
+efistub	drivers/firmware/efi/libstub/efi-stub-entry.c:70	Booting Linux Kernel...
+efistub	drivers/firmware/efi/libstub/efi-stub-entry.c:77	Failed to relocate kernel
+efistub	drivers/firmware/efi/libstub/efi-stub-helper.c:324	Failed to measure data for event %d: 0x%lx
+efistub	drivers/firmware/efi/libstub/efi-stub-helper.c:396	Command line is too long: truncated to %d bytes
+efistub	drivers/firmware/efi/libstub/efi-stub-helper.c:626	Loaded initrd from LINUX_EFI_INITRD_MEDIA_GUID device path
+efistub	drivers/firmware/efi/libstub/efi-stub-helper.c:634	Loaded initrd from command line option
+efistub	drivers/firmware/efi/libstub/efi-stub-helper.c:642	Measured initrd data into PCR 9
+efistub	drivers/firmware/efi/libstub/efi-stub-helper.c:663	Failed to load initrd: 0x%lx
+efistub	drivers/firmware/efi/libstub/efi-stub-helper.c:746	Failed to retrieve memory attributes for image region: 0x%lx
+efistub	drivers/firmware/efi/libstub/efi-stub-helper.c:755	Failed to remap code region read-only
+efistub	drivers/firmware/efi/libstub/efi-stub-helper.c:767	Failed to remap code region executable
+efistub	drivers/firmware/efi/libstub/efi-stub-helper.c:774	Failed to remap data region non-executable
+efistub	drivers/firmware/efi/libstub/efi-stub.c:89	Failed to allocate memreserve entry!
+efistub	drivers/firmware/efi/libstub/efi-stub.c:100	Failed to install memreserve config table!
+efistub	drivers/firmware/efi/libstub/efi-stub.c:127	getting command line via LOADED_IMAGE_PROTOCOL
+efistub	drivers/firmware/efi/libstub/efi-stub.c:134	Failed to parse EFI load options
+efistub	drivers/firmware/efi/libstub/efi-stub.c:144	Failed to parse built-in command line
+efistub	drivers/firmware/efi/libstub/efistub.h:77	WARNING:
+efistub	drivers/firmware/efi/libstub/efistub.h:79	ERROR:
+efistub	drivers/firmware/efi/libstub/efistub.h:81	DEBUG:
+efistub	drivers/firmware/efi/libstub/fdt.c:41	Device Tree header not valid!
+efistub	drivers/firmware/efi/libstub/fdt.c:49	Truncated device tree! foo!
+efistub	drivers/firmware/efi/libstub/fdt.c:239	Unable to retrieve UEFI memory map.
+efistub	drivers/firmware/efi/libstub/fdt.c:252	Ignoring DTB from command line.
+efistub	drivers/firmware/efi/libstub/fdt.c:257	Failed to load device tree!
+efistub	drivers/firmware/efi/libstub/fdt.c:263	Using DTB from command line
+efistub	drivers/firmware/efi/libstub/fdt.c:268	Using DTB from configuration table
+efistub	drivers/firmware/efi/libstub/fdt.c:272	Generating empty DTB
+efistub	drivers/firmware/efi/libstub/fdt.c:274	Exiting boot services...
+efistub	drivers/firmware/efi/libstub/fdt.c:278	Unable to allocate memory for new device tree.
+efistub	drivers/firmware/efi/libstub/fdt.c:286	Unable to construct new device tree.
+efistub	drivers/firmware/efi/libstub/fdt.c:331	Exit boot services failed.
+efistub	drivers/firmware/efi/libstub/fdt.c:353	Failed to update FDT and exit boot services
+efistub	drivers/firmware/efi/libstub/fdt.c:374	Invalid header detected on UEFI supplied FDT, ignoring ...
+efistub	drivers/firmware/efi/libstub/file.c:57	Failed to open file: %ls
+efistub	drivers/firmware/efi/libstub/file.c:64	Failed to get file info
+efistub	drivers/firmware/efi/libstub/file.c:84	Failed to handle fs_proto
+efistub	drivers/firmware/efi/libstub/file.c:90	Failed to open volume
+efistub	drivers/firmware/efi/libstub/file.c:160	Unexpected device path node type: (%x, %x)
+efistub	drivers/firmware/efi/libstub/file.c:173	Failed to open volume
+efistub	drivers/firmware/efi/libstub/file.c:278	Failed to allocate memory for files
+efistub	drivers/firmware/efi/libstub/file.c:302	Failed to read file
+efistub	drivers/firmware/efi/libstub/gop.c:152	Requested mode is invalid
+efistub	drivers/firmware/efi/libstub/gop.c:158	Couldn't get mode information
+efistub	drivers/firmware/efi/libstub/gop.c:164	Invalid PixelFormat
+efistub	drivers/firmware/efi/libstub/gop.c:292	Mode %3u %c%c: Resolution %ux%u-%s%.0hhu
+efistub	drivers/firmware/efi/libstub/gop.c:311	Available graphics modes are 0-%u
+efistub	drivers/firmware/efi/libstub/gop.c:312	* = current mode - = unusable mode
+efistub	drivers/firmware/efi/libstub/gop.c:317	Press any key to continue (or wait 10 seconds)
+efistub	drivers/firmware/efi/libstub/gop.c:320	Unable to read key, continuing in 10 seconds
+efistub	drivers/firmware/efi/libstub/gop.c:356	Failed to set requested mode
+efistub	drivers/firmware/efi/libstub/kaslr.c:28	KASLR disabled on kernel command line
+efistub	drivers/firmware/efi/libstub/kaslr.c:31	Image placement fixed by loader
+efistub	drivers/firmware/efi/libstub/kaslr.c:42	EFI_RNG_PROTOCOL unavailable
+efistub	drivers/firmware/efi/libstub/kaslr.c:44	efi_get_random_bytes() failed (0x%lx)
+efistub	drivers/firmware/efi/libstub/kaslr.c:122	efi_random_alloc() failed: 0x%lx
+efistub	drivers/firmware/efi/libstub/kaslr.c:129	FIRMWARE BUG: Image BSS overlaps adjacent EFI memory region
+efistub	drivers/firmware/efi/libstub/kaslr.c:145	Failed to relocate kernel
+efistub	drivers/firmware/efi/libstub/loongarch-stub.c:80	Failed to allocate usable memory for kernel.
+efistub	drivers/firmware/efi/libstub/loongarch.c:89	Unable to retrieve UEFI memory map.
+efistub	drivers/firmware/efi/libstub/loongarch.c:93	Exiting boot services
+efistub	drivers/firmware/efi/libstub/pci.c:28	Failed to locate PCI I/O handles
+efistub	drivers/firmware/efi/libstub/pci.c:92	Failed to disable PCI busmastering
+efistub	drivers/firmware/efi/libstub/printk.c:139	EFI stub:
+efistub	drivers/firmware/efi/libstub/printk.c:149	[Message truncated]
+efistub	drivers/firmware/efi/libstub/random.c:109	Failed to allocate memory for RNG seed.
+efistub	drivers/firmware/efi/libstub/random.c:174	Failed to obtain seed from EFI_RNG_PROTOCOL or EFI variable
+efistub	drivers/firmware/efi/libstub/random.c:177	Retaining bootloader-supplied seed only
+efistub	drivers/firmware/efi/libstub/riscv-stub.c:48	Failed to relocate kernel
+efistub	drivers/firmware/efi/libstub/riscv.c:68	Failed to get boot hartid!
+efistub	drivers/firmware/efi/libstub/secureboot.c:38	Could not determine UEFI Secure Boot status.
+efistub	drivers/firmware/efi/libstub/secureboot.c:60	UEFI Secure Boot is enabled.
+efistub	drivers/firmware/efi/libstub/tpm.c:103	Unable to allocate memory for event log
+efistub	drivers/firmware/efi/libstub/unaccepted_memory.c:21	Unknown version of unaccepted memory table
+efistub	drivers/firmware/efi/libstub/unaccepted_memory.c:69	Failed to allocate unaccepted memory config table
+efistub	drivers/firmware/efi/libstub/unaccepted_memory.c:83	Failed to install unaccepted memory config table!
+efistub	drivers/firmware/efi/libstub/x86-stub.c:68	Failed to allocate memory for 'rom'
+efistub	drivers/firmware/efi/libstub/x86-stub.c:83	Failed to read rom->vendor
+efistub	drivers/firmware/efi/libstub/x86-stub.c:91	Failed to read rom->devid
+efistub	drivers/firmware/efi/libstub/x86-stub.c:169	Unsupported properties proto version
+efistub	drivers/firmware/efi/libstub/x86-stub.c:182	Failed to allocate memory for 'properties'
+efistub	drivers/firmware/efi/libstub/x86-stub.c:356	Failed to set OS vendor via apple_set_os
+efistub	drivers/firmware/efi/libstub/x86-stub.c:363	Failed to set OS version via apple_set_os
+efistub	drivers/firmware/efi/libstub/x86-stub.c:385	Failed to set EFI_MEMORY_RO attribute
+efistub	drivers/firmware/efi/libstub/x86-stub.c:394	Failed to clear EFI_MEMORY_XP attribute
+efistub	drivers/firmware/efi/libstub/x86-stub.c:435	Unable to unprotect memory range [%08lx,%08lx]: %lx
+efistub	drivers/firmware/efi/libstub/x86-stub.c:465	Memory acceptance protocol failed
+efistub	drivers/firmware/efi/libstub/x86-stub.c:519	Failed to get handle for LOADED_IMAGE_PROTOCOL
+efistub	drivers/firmware/efi/libstub/x86-stub.c:792	Unsupported SEV-SNP features detected: 0x%llx
+efistub	drivers/firmware/efi/libstub/x86-stub.c:812	Decompression failed: %s
+efistub	drivers/firmware/efi/libstub/x86-stub.c:870	%s detected on the kernel command line - disabling physical KASLR
+efistub	drivers/firmware/efi/libstub/x86-stub.c:943	Ignoring DXE services table: invalid signature
+efistub	drivers/firmware/efi/libstub/x86-stub.c:953	efi_setup_5level_paging() failed!
+efistub	drivers/firmware/efi/libstub/x86-stub.c:960	Failed to parse options
+efistub	drivers/firmware/efi/libstub/x86-stub.c:969	Failed to parse options
+efistub	drivers/firmware/efi/libstub/x86-stub.c:979	Failed to decompress kernel
+efistub	drivers/firmware/efi/libstub/x86-stub.c:1028	exit_boot() failed!
+efistub	drivers/firmware/efi/libstub/x86-stub.c:1042	efi_stub_entry() failed!
+efistub	drivers/firmware/efi/libstub/zboot-decompress-gzip.c:36	failed to initialize GZIP decompressor: %d
+efistub	drivers/firmware/efi/libstub/zboot-decompress-gzip.c:61	GZIP decompression failed with status %d
+efistub	drivers/firmware/efi/libstub/zboot-decompress-zstd.c:42	ZSTD-decompression failed with status %d
+efistub	drivers/firmware/efi/libstub/zboot.c:47	Failed to locate parent's loaded image protocol
+efistub	drivers/firmware/efi/libstub/zboot.c:55	Decompressing Linux Kernel...
+efistub	drivers/firmware/efi/libstub/zboot.c:73	KASLR disabled on kernel command line
+efistub	drivers/firmware/efi/libstub/zboot.c:77	EFI_RNG_PROTOCOL unavailable
+efistub	drivers/firmware/efi/libstub/zboot.c:80	efi_get_random_bytes() failed (0x%lx)
+efistub	drivers/firmware/efi/libstub/zboot.c:89	Failed to allocate memory
+start_kernel	init/main.c:219	Parameter %s is obsolete, ignored
+start_kernel	init/main.c:302	bootconfig size %d is greater than initrd size %ld
+start_kernel	init/main.c:308	bootconfig checksum failed
+start_kernel	init/main.c:391	Failed to allocate memory for extra kernel cmdline.
+start_kernel	init/main.c:397	Failed to print extra kernel cmdline.
+start_kernel	init/main.c:448	'bootconfig' found on command line, but no bootconfig found
+start_kernel	init/main.c:450	No bootconfig data provided, so skipping bootconfig
+start_kernel	init/main.c:455	bootconfig size %ld greater than max size %d
+start_kernel	init/main.c:463	Failed to init bootconfig: %s.
+start_kernel	init/main.c:465	Failed to parse bootconfig: %s at %d.
+start_kernel	init/main.c:469	Load bootconfig: %ld bytes %d nodes
+start_kernel	init/main.c:493	WARNING: 'bootconfig' found on the kernel command line but CONFIG_BOOT_CONFIG is not set.
+start_kernel	init/main.c:770	Malformed early option '%s'
+start_kernel	init/main.c:887	%s: Failed to allocate %zu bytes
+start_kernel	init/main.c:899	Unknown kernel command line parameters "%s", will be passed to user space.
+start_kernel	init/main.c:1002	%s%.*s%s
+start_kernel	init/main.c:1090	Interrupts were enabled *very* early, fixing it
+start_kernel	init/main.c:1141	Interrupts were enabled early
+start_kernel	init/main.c:1155	Too many boot %s vars at `%s'
+start_kernel	init/main.c:1170	initrd overwritten (0x%08lx < 0x%08lx) - disabling it.
+start_kernel	init/main.c:1261	blacklisting initcall %s
+start_kernel	init/main.c:1294	initcall %s blacklisted
+start_kernel	init/main.c:1304	initcall_blacklist requires CONFIG_KALLSYMS
+start_kernel	init/main.c:1320	calling %pS @ %i
+start_kernel	init/main.c:1330	initcall %pS returned %d after %lld usecs
+start_kernel	init/main.c:1337	entering initcall level: %s
+start_kernel	init/main.c:1352	Failed to register initcall tracepoints
+start_kernel	init/main.c:1401	initcall %pS returned with %s
+start_kernel	init/main.c:1461	%s: Failed to allocate %zu bytes
+start_kernel	init/main.c:1503	Run %s as init process
+start_kernel	init/main.c:1504	with arguments:
+start_kernel	init/main.c:1507	with environment:
+start_kernel	init/main.c:1520	Starting init: %s exists but couldn't execute it (error %d)
+start_kernel	init/main.c:1546	Invalid option string for rodata: '%s'
+start_kernel	init/main.c:1567	Kernel memory protection disabled.
+start_kernel	init/main.c:1569	Kernel memory protection not selected by kernel config.
+start_kernel	init/main.c:1571	This architecture does not have kernel memory protection.
+start_kernel	init/main.c:1618	Failed to execute %s (error %d)
+start_kernel	init/main.c:1632	Requested init %s failed (error %d).
+start_kernel	init/main.c:1639	Default init %s failed (error %d)
+start_kernel	init/main.c:1651	No working init found. Try passing init= option to kernel. See Linux Documentation/admin-guide/init.rst for guidance.
+start_kernel	init/main.c:1661	Warning: unable to open an initial console.
+start_kernel	init/main.c:1714	check access for rdinit=%s failed: %i, ignoring
+early-kernel	kernel/panic.c:319	panic_force_cpu: invalid value '%s'
+early-kernel	kernel/panic.c:393	panic: target CPU %d is offline, continuing on CPU %d
+early-kernel	kernel/panic.c:423	panic: Redirecting from CPU %d to CPU %d for crash kernel.
+early-kernel	kernel/panic.c:435	panic: failed to redirect to CPU %d, continuing on CPU %d
+early-kernel	kernel/panic.c:524	%s: panic_on_warn set ...
+early-kernel	kernel/panic.c:528	%s: system warned too often (kernel.warn_limit is %d)
+early-kernel	kernel/panic.c:639	Kernel panic - not syncing: %s
+early-kernel	kernel/panic.c:645	panic: Redirected from CPU %d, skipping stack dump.
+early-kernel	kernel/panic.c:723	Rebooting in %d seconds..
+early-kernel	kernel/panic.c:749	Press Stop-A (L1-A) from sun keyboard or send break twice on console to return to the boot prom
+early-kernel	kernel/panic.c:756	---[ end Kernel panic - not syncing: %s ]---
+early-kernel	kernel/panic.c:890	Failed to allocate taint string buffer
+early-kernel	kernel/panic.c:956	Disabling lock debugging due to kernel taint
+early-kernel	kernel/panic.c:962	panic_on_taint set ...
+early-kernel	kernel/panic.c:1053	---[ end trace %016llx ]---
+early-kernel	kernel/panic.c:1081	WARNING: %s:%d at %pS, CPU#%d: %s/%d
+early-kernel	kernel/panic.c:1085	WARNING: at %pS, CPU#%d: %s/%d
+early-kernel	kernel/panic.c:1195	stack-protector: Kernel stack is corrupted in: %pB
+early-kernel	kernel/panic.c:1258	panic_on_taint: bitmask=0x%lx nousertaint_mode=%s
+early-kernel	lib/dump_stack.c:57	%sCPU: %d UID: %u PID: %d Comm: %.20s %s%s %s %.*s %s Kdump: loaded
+early-kernel	lib/dump_stack.c:71	%sHardware name: %s
+early-mm	mm/memblock.c:444	memblock: cannot resize %s array
+early-mm	mm/memblock.c:489	memblock: Failed to double %s array from %ld to %ld entries !
+early-mm	mm/memblock.c:787	NUMA: no nodes coverage for %luMB of %luMB RAM
+early-mm	mm/memblock.c:904	Cannot free reserved memory because of deferred initialization of the memory map
+early-mm	mm/memblock.c:960	Freeing %s memory: %ldK
+early-mm	mm/memblock.c:1844	%s: Failed to allocate %pap bytes
+early-mm	mm/memblock.c:1965	%s: No memory registered yet
+early-mm	mm/memblock.c:2136	%s.cnt = 0x%lx
+early-mm	mm/memblock.c:2150	%s[%#x] [%pa-%pa], %pa bytes%s flags: %#x
+early-mm	mm/memblock.c:2157	MEMBLOCK configuration:
+early-mm	mm/memblock.c:2158	memory size = %pa reserved size = %pa
+early-mm	mm/memblock.c:2623	failed to prepare memblock FDT for KHO: %d
+early-mm	mm/memblock.c:2654	failed to retrieve FDT '%s' from KHO: %d
+early-mm	mm/memblock.c:2663	FDT '%s' is incompatible with '%s': %d
+early-mm	mm/memblock.c:2684	FDT '%s' has no child '%s': %d
+early-mm	mm/memblock.c:2690	Node '%s' is incompatible with '%s': %d
+early-mm	mm/memblock.c:2703	KHO reserve-mem '%s' has wrong alignment (0x%lx, 0x%lx)
+early-mm	mm/memblock.c:2709	KHO reserve-mem '%s' has wrong size (0x%lx != 0x%lx)
+early-mm	mm/memblock.c:2715	Revived memory reservation '%s' from KHO
+early-mm	mm/memblock.c:2742	reserve_mem: no more room for reserved memory
+early-mm	mm/memblock.c:2782	reserve_mem: name "%s" was already used
+early-mm	mm/memblock.c:2793	reserve_mem: memblock allocation failed
+early-mm	mm/memblock.c:2801	reserve_mem: empty or malformed parameter
+early-mm	mm/mm_init.c:109	mminit::zonelist %s %d:%s = thisnodegeneral
+early-mm	mm/mm_init.c:422	The system has no mirror memory, ignore kernelcore=mirror.
+early-mm	mm/mm_init.c:427	The system is under kdump, ignore kernelcore=mirror.
+early-mm	mm/mm_init.c:450	This configuration results in unmirrored kernel memory.
+early-mm	mm/mm_init.c:858	On node %d, zone %s: %lld pages in unavailable ranges
+early-mm	mm/mm_init.c:1145	%s initialised %lu pages in %ums
+early-mm	mm/mm_init.c:1308	On node %d totalpages: 0
+early-mm	mm/mm_init.c:1375	On node %d totalpages: %lu
+early-mm	mm/mm_init.c:1498	Failed to allocate %ld bytes for zone %s pageblock flags on node %d
+early-mm	mm/mm_init.c:1664	Failed to allocate %ld bytes for node %d memory map
+early-mm	mm/mm_init.c:1668	%s: node %d, pgdat %08lx, node_mem_map %08lx
+early-mm	mm/mm_init.c:1729	Initmem setup node %d [mem %#018Lx-%#018Lx]
+early-mm	mm/mm_init.c:1735	Initmem setup node %d as memoryless
+early-mm	mm/mm_init.c:1853	Zone ranges:
+early-mm	mm/mm_init.c:1860	empty
+early-mm	mm/mm_init.c:1862	[mem %#018Lx-%#018Lx]
+early-mm	mm/mm_init.c:1870	Movable zone start for each node
+early-mm	mm/mm_init.c:1873	Node %d: %#018Lx
+early-mm	mm/mm_init.c:1882	Early memory node ranges
+early-mm	mm/mm_init.c:1884	node %3d: [mem %#018Lx-%#018Lx]
+early-mm	mm/mm_init.c:2164	node %d deferred pages initialised in %ums
+early-mm	mm/mm_init.c:2466	Failed to allocate %s hash table
+early-mm	mm/mm_init.c:2468	%s hash table entries: %ld (order: %d, %lu bytes, %s) vmalloc hugepagevmalloclinear
+early-mm	mm/mm_init.c:2561	mem auto-init: CONFIG_PAGE_POISONING is on, will take precedence over init_on_alloc and init_on_free
+early-mm	mm/mm_init.c:2583	mem auto-init: please make sure init_on_alloc and init_on_free are disabled when running KMSAN
+early-mm	mm/mm_init.c:2616	mem auto-init: stack:%s, heap alloc:%s, heap free:%s
+early-mm	mm/mm_init.c:2620	mem auto-init: clearing system memory may take some time...
+early-mm	mm/mm_init.c:2658	Memory: %luK/%luK available (%luK kernel code, %luK rwdata, %luK rodata, %luK init, %luK bss, %luK reserved, %luK cma-reserved, %luK highmem)
+early-mm	mm/mm_init.c:2690	Failed to allocate zero page
