@@ -9,7 +9,10 @@ mkdir -p "$STAGE"
 for N in 0 6 4; do
   D=/home/nyc/src/pgcl/kernel-rpm-build/pgcl$N
   echo "############ binrpm-pkg pgcl$N  $(date +%H:%M:%S) ############"
-  ( cd "$D" && make -j20 binrpm-pkg ) > /home/nyc/src/pgcl/pgcl$N-rpm.log 2>&1
+  # -j10 (not 20): the laptop config is heavy (all-drivers + PAGE_OWNER +
+  # DEBUG_VM); some TUs spike to multiple GB, and -j20 OOM-killed gcc on a
+  # loaded box. One config builds at a time, so peak = one -jMJ kernel build.
+  ( cd "$D" && make -j"${MJ:-10}" binrpm-pkg ) > /home/nyc/src/pgcl/pgcl$N-rpm.log 2>&1
   rc=$?
   echo "pgcl$N binrpm-pkg rc=$rc"
   if [ $rc -ne 0 ]; then
