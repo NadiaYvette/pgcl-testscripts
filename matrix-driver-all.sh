@@ -49,8 +49,35 @@ case "$ARCH" in
   arm-lpae)    LA=arm;        CC=arm-linux-gnu-;           DC=vexpress_defconfig;     QEMU="qemu-system-arm -M virt -cpu cortex-a15 -m 2G -nographic -no-reboot";              KIMG=arch/arm/boot/zImage;             CONSOLE=ttyAMA0 ;;
   hppa64)      LA=parisc64;   CC=hppa64-linux-gnu-;        DC=generic-64bit_defconfig;QEMU="qemu-system-hppa -M C3700 -m 8G -nographic -no-reboot";                            KIMG=vmlinux;                          CONSOLE=ttyS0 ;;
   microblaze)  LA=microblaze; CC=microblaze-linux-gnu-;    DC=defconfig;              QEMU="qemu-system-microblaze -M petalogix-s3adsp1800 -nographic -no-reboot";              KIMG=arch/microblaze/boot/linux.bin;   CONSOLE=ttyUL0 ;;
+  # --- new arches (bring-up). or1k/xtensa build+boot here; sh4 needs the
+  #     sh4-linux- toolchain reinstalled; csky needs a toolchain + an
+  #     out-of-tree qemu-system-csky. The SKIP guard below no-ops the ones
+  #     whose toolchain/emulator is absent so they log SKIP, not BUILD FAIL.
+  sh4)         LA=sh;         CC=sh4-linux-;               DC=rts7751r2dplus_defconfig;QEMU="qemu-system-sh4 -M r2d -no-reboot -serial null -serial stdio -display none -monitor none"; KIMG=arch/sh/boot/zImage; CONSOLE="ttySC1,115200 noiotrap" ;;
+  or1k)        LA=openrisc;   CC=openrisc-linux-gnu-;      DC=virt_defconfig;         QEMU="qemu-system-or1k -M virt -m 256 -no-reboot -nographic -serial mon:stdio -display none"; KIMG=vmlinux;            CONSOLE="ttyS0,115200 earlycon" ;;
+  xtensa)      LA=xtensa;     CC=xtensa-linux-gnu-;        DC=virt_defconfig;         QEMU="qemu-system-xtensa -M virt -m 1G -nographic -no-reboot";                            KIMG=vmlinux;                          CONSOLE=ttyS0,115200 ;;
+  csky)        LA=csky;       CC=csky-linux-gnuabiv2-;     DC=defconfig;              QEMU="qemu-system-csky -M virt -m 1G -nographic -no-reboot";                              KIMG=arch/csky/boot/zImage;            CONSOLE=ttyS0 ;;
   *) echo "ERROR: unknown arch $ARCH"; exit 2 ;;
 esac
+
+# sh4's kernel cross-gcc is a kernel.org nolibc crosstool that lives outside the
+# default PATH (extracted from ~/x86_64-gcc-*-nolibc-sh4-linux.tar.xz). Add it so
+# the cell builds instead of SKIPping. NOTE: nolibc => kernel-only; the sh4 musl
+# userspace for the full autotest is still TODO (#105), so this boot-verifies sh4
+# but won't run pgcl-test/LTP until a musl/glibc sh4 toolchain + initramfs exist.
+if [ "$ARCH" = sh4 ]; then
+  for d in "$HOME"/x-tools/*/sh4-linux/bin; do [ -d "$d" ] && export PATH="$d:$PATH"; done
+fi
+
+# Skip cleanly on hosts lacking the cross toolchain or the emulator, so the cell
+# logs SKIP rather than a spurious BUILD FAIL (e.g. sh4/csky on a box without
+# those installed). Activates automatically once the tools are present.
+if [ -n "$CC" ] && ! command -v "${CC}gcc" >/dev/null 2>&1; then
+  echo "SKIP: no ${CC}gcc toolchain on this host"; exit 0
+fi
+if ! command -v "${QEMU%% *}" >/dev/null 2>&1; then
+  echo "SKIP: no ${QEMU%% *} on this host"; exit 0
+fi
 
 KBUILD="$D/kernel-build-matrix/$CONFIG/$ARCH"
 rm -rf "$KBUILD"; mkdir -p "$KBUILD"
@@ -156,6 +183,8 @@ case "$ARCH" in
   aarch64)               TIMEOUT=1800 ;; # PGCL=6 LTP end-to-end
   loongarch64)           TIMEOUT=1800 ;; # PGCL=6 LTP end-to-end
   riscv32|riscv64)       TIMEOUT=1800 ;; # PGCL=6 LTP end-to-end
+  sh4|or1k|xtensa)       TIMEOUT=600 ;;
+  csky)                  TIMEOUT=600 ;;
   *)                     TIMEOUT=300 ;;
 esac
 

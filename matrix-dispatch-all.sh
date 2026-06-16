@@ -22,8 +22,10 @@ PAR=${PAR:-2}
 mkdir -p "$OUTDIR"
 echo "matrix-dispatch-all: OUTDIR=$OUTDIR PAR=$PAR" >&2
 
-# All 16 arches.
-ARCHES_ALL="x86_64 aarch64 riscv64 ppc64 s390x sparc64 loongarch64 alpha riscv32 m68k hppa mips64 arm arm-lpae hppa64 microblaze"
+# 16 established arches + new bring-up arches. or1k/xtensa build+boot here;
+# sh4/csky auto-SKIP in the driver until their toolchain (+ qemu-system-csky)
+# is installed on the host.
+ARCHES_ALL="x86_64 aarch64 riscv64 ppc64 s390x sparc64 loongarch64 alpha riscv32 m68k hppa mips64 arm arm-lpae hppa64 microblaze or1k xtensa sh4 csky"
 CONFIGS_ALL="mainline 0 2 4 6"
 
 # Build cell list: schedule mainline first (warms cache, then PGCL configs reuse
