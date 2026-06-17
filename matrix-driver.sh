@@ -3,7 +3,7 @@
 # Builds kernel and runs QEMU.  Writes one log per cell.
 
 set -u
-export PATH="/usr/bin:$HOME/x-tools/gcc-16.1.0-nolibc/sh4-linux/bin:$HOME/x-tools/gcc-16.1.0-nolibc/csky-linux/bin:$HOME/src/csky-qemu-build/bin:$PATH"
+export PATH="/usr/bin:$HOME/x-tools/gcc-16.1.0-nolibc/sh4-linux/bin:$HOME/x-tools/gcc-16.1.0-nolibc/csky-linux/bin:$HOME/x-tools/2020.07/xtensa-dc233c-linux-uclibc/bin:$HOME/src/csky-qemu-build/bin:$PATH"
 
 D=/home/nyc/src/pgcl
 INITRAMFS="$D/userspace/initramfs"
@@ -29,7 +29,7 @@ case "$ARCH" in
   sparc64)     LA=sparc;      CC=sparc64-linux-gnu-;       DC=sparc64_defconfig;      QEMU="qemu-system-sparc64 -M sun4u -cpu TI-UltraSparc-IIi -m 4G -nographic -no-reboot";   KIMG=arch/sparc/boot/image;            CONSOLE=ttyS0 ;;
   loongarch64) LA=loongarch;  CC=loongarch64-linux-gnu-;   DC=defconfig;              QEMU="qemu-system-loongarch64 -M virt -cpu la464 -m 8G -smp 4 -nographic -no-reboot";     KIMG=arch/loongarch/boot/vmlinuz.efi;  CONSOLE=ttyS0,115200 ;;
   sh4)         LA=sh;         CC=sh4-linux-;               DC=rts7751r2dplus_defconfig; QEMU="qemu-system-sh4 -M r2d -serial null -serial stdio -no-reboot";                       KIMG=arch/sh/boot/zImage;              CONSOLE=ttySC1,115200; XAPP=noiotrap ;;
-  xtensa)      LA=xtensa;     CC=xtensa-linux-gnu-;        DC=defconfig;              QEMU="qemu-system-xtensa -M sim -m 128 -display none -serial stdio -no-reboot";            KIMG=vmlinux;                          CONSOLE=ttyS0,38400 ;;
+  xtensa)      LA=xtensa;     CC=xtensa-dc233c-linux-uclibc-; DC=virt_defconfig;       QEMU="qemu-system-xtensa -M virt -cpu dc233c -m 2G -semihosting -display none -serial stdio -monitor none -no-reboot"; KIMG=arch/xtensa/boot/Image.elf; CONSOLE=ttyS0,115200 ;;
   csky)        LA=csky;       CC=csky-linux-;              DC=defconfig;              QEMU="qemu-system-cskyv2 -M virt -cpu c807 -nographic -no-reboot";                        KIMG=vmlinux;                          CONSOLE=ttyS0,115200 ;;
   *) echo "ERROR: unknown arch $ARCH"; exit 2 ;;
 esac
@@ -59,11 +59,12 @@ case "$ARCH" in
         --enable CMDLINE_OVERWRITE \
         --set-str CMDLINE "console=ttySC1,115200 noiotrap panic=1 autotest=1" ;;
   xtensa)
-    # sim/ISS: built-in cmdline + embedded initramfs (boot bring-up still in progress)
+    # virt/ISS (dc233c): boots via Image.elf (reset-vector wrapper at 0xfe000000) with
+    # -semihosting (ISS simcall console) + -m 2G (builtin virt DTB hardcodes 2GB RAM).
+    # qemu ignores -append: cmdline comes from the builtin virt DTB; embedded init runs
+    # unconditionally. PGCL=0 ONLY for now — arch not yet MMUPAGE-enabled (PGCL>0 = arch-port TODO).
     scripts/config --file "$KBUILD/.config" --enable BLK_DEV_INITRD \
-        --set-str INITRAMFS_SOURCE "$INITRAMFS/initramfs-xtensa.cpio.gz" \
-        --enable CMDLINE_BOOL --enable CMDLINE_FORCE \
-        --set-str CMDLINE "console=ttyS0,38400 panic=1 autotest=1" ;;
+        --set-str INITRAMFS_SOURCE "$INITRAMFS/initramfs-xtensa.cpio.gz" ;;
   csky)
     # virt: embed initramfs; csky qemu hardcodes DTB bootargs rdinit=/sbin/init (cpio has it)
     scripts/config --file "$KBUILD/.config" --enable BLK_DEV_INITRD \
