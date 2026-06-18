@@ -26,6 +26,7 @@ declare -A CROSS_TABLE=(
     [hppa]="hppa-linux-gnu-"
     [hppa64]="hppa64-linux-gnu-"
     [riscv32]="riscv32-linux-gnu-"
+    [sh4]="sh4-linux-"
 )
 
 # Architecture → musl sysroot name mapping
@@ -45,6 +46,7 @@ declare -A SYSROOT_TABLE=(
     [hppa]="hppa"
     [hppa64]="hppa64"
     [riscv32]="riscv32"
+    [sh4]="sh"
 )
 
 # MM-relevant test directories
@@ -90,8 +92,19 @@ build_arch() {
     if [ "$arch" = "riscv32" ]; then
         cflags="$cflags -march=rv32imac -mabi=ilp32"
     fi
-    cflags="$cflags -isystem $sysroot/include"
-    cflags="$cflags --sysroot=$sysroot"
+    # sh4 uses the Bootlin sh4-linux- musl toolchain, which carries its own
+    # built-in musl sysroot; the flattened sysroot/--sysroot hack the glibc
+    # cross-compilers need would point -isystem at a nonexistent dir.
+    if [ "$arch" != sh4 ]; then
+        cflags="$cflags -isystem $sysroot/include"
+        cflags="$cflags --sysroot=$sysroot"
+    else
+        # The Bootlin musl sysroot lacks <sys/{capability,pidfd}.h> (glibc-only)
+        # and ships kernel UAPI too old for LTP (no __kernel_old_timespec).
+        # Supply header stubs + overlay fresh sh UAPI headers from the 7.1 tree
+        # (-isystem so they win over the sysroot's stale linux/* headers).
+        cflags="$cflags -I$SCRIPT_DIR/ltp-cap-shim -isystem $SCRIPT_DIR/sh-uapi-headers/include"
+    fi
     cflags="$cflags -I$LTP_SRC/include -I$LTP_SRC/include/old"
 
     echo "=== Building LTP for $arch ==="
@@ -197,7 +210,11 @@ reconfigure_ltp() {
     local cflags="-static -O2 -w -D_GNU_SOURCE -DLTPLIB -Wno-error -fpermissive -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-implicit-function-declaration"
     [ "$arch" = "powerpc64" ] && cflags="$cflags -mabi=elfv2"
     [ "$arch" = "riscv32" ] && cflags="$cflags -march=rv32imac -mabi=ilp32"
-    cflags="$cflags -isystem $sysroot/include --sysroot=$sysroot"
+    if [ "$arch" != sh4 ]; then
+        cflags="$cflags -isystem $sysroot/include --sysroot=$sysroot"
+    else
+        cflags="$cflags -I$SCRIPT_DIR/ltp-cap-shim -isystem $SCRIPT_DIR/sh-uapi-headers/include"
+    fi
     cflags="$cflags -I$LTP_SRC/include -I$LTP_SRC/include/old"
 
     local tmpdir="/tmp/ltp-lib-$arch"

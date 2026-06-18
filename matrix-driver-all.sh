@@ -49,24 +49,26 @@ case "$ARCH" in
   arm-lpae)    LA=arm;        CC=arm-linux-gnu-;           DC=vexpress_defconfig;     QEMU="qemu-system-arm -M virt -cpu cortex-a15 -m 2G -nographic -no-reboot";              KIMG=arch/arm/boot/zImage;             CONSOLE=ttyAMA0 ;;
   hppa64)      LA=parisc64;   CC=hppa64-linux-gnu-;        DC=generic-64bit_defconfig;QEMU="qemu-system-hppa -M C3700 -m 8G -nographic -no-reboot";                            KIMG=vmlinux;                          CONSOLE=ttyS0 ;;
   microblaze)  LA=microblaze; CC=microblaze-linux-gnu-;    DC=defconfig;              QEMU="qemu-system-microblaze -M petalogix-s3adsp1800 -nographic -no-reboot";              KIMG=arch/microblaze/boot/linux.bin;   CONSOLE=ttyUL0 ;;
-  # --- new arches (bring-up). or1k/xtensa build+boot here; sh4 needs the
-  #     sh4-linux- toolchain reinstalled; csky needs a toolchain + an
-  #     out-of-tree qemu-system-csky. The SKIP guard below no-ops the ones
-  #     whose toolchain/emulator is absent so they log SKIP, not BUILD FAIL.
-  sh4)         LA=sh;         CC=sh4-linux-;               DC=rts7751r2dplus_defconfig;QEMU="qemu-system-sh4 -M r2d -no-reboot -serial null -serial stdio -display none -monitor none"; KIMG=arch/sh/boot/zImage; CONSOLE="ttySC1,115200 noiotrap" ;;
+  # --- new arches (bring-up). sh4 is a full LTP cell (musl userspace +
+  #     embedded initramfs); or1k/xtensa build+boot here; csky needs a
+  #     toolchain + an out-of-tree qemu-system-csky. The SKIP guard below
+  #     no-ops the ones whose toolchain/emulator is absent so they log SKIP.
+  sh4)         LA=sh;         CC=sh4-linux-;               DC=rts7751r2dplus_defconfig;QEMU="qemu-system-sh4 -M r2d -m 256M -no-reboot -serial null -serial stdio -display none -monitor none"; KIMG=arch/sh/boot/zImage; CONSOLE="ttySC1,115200 noiotrap" ;;
   or1k)        LA=openrisc;   CC=openrisc-linux-gnu-;      DC=virt_defconfig;         QEMU="qemu-system-or1k -M virt -m 256 -no-reboot -nographic -serial mon:stdio -display none"; KIMG=vmlinux;            CONSOLE="ttyS0,115200 earlycon" ;;
   xtensa)      LA=xtensa;     CC=xtensa-linux-gnu-;        DC=virt_defconfig;         QEMU="qemu-system-xtensa -M virt -m 1G -nographic -no-reboot";                            KIMG=vmlinux;                          CONSOLE=ttyS0,115200 ;;
   csky)        LA=csky;       CC=csky-linux-gnuabiv2-;     DC=defconfig;              QEMU="qemu-system-csky -M virt -m 1G -nographic -no-reboot";                              KIMG=arch/csky/boot/zImage;            CONSOLE=ttyS0 ;;
   *) echo "ERROR: unknown arch $ARCH"; exit 2 ;;
 esac
 
-# sh4's kernel cross-gcc is a kernel.org nolibc crosstool that lives outside the
-# default PATH (extracted from ~/x86_64-gcc-*-nolibc-sh4-linux.tar.xz). Add it so
-# the cell builds instead of SKIPping. NOTE: nolibc => kernel-only; the sh4 musl
-# userspace for the full autotest is still TODO (#105), so this boot-verifies sh4
-# but won't run pgcl-test/LTP until a musl/glibc sh4 toolchain + initramfs exist.
+# sh4's cross-gcc lives outside the default PATH.  Either toolchain builds the
+# kernel (nolibc kernel.org crosstool, or the Bootlin sh4-linux- musl toolchain
+# used to build the userspace).  Add whichever is present.  The full LTP
+# userspace ships as a prebuilt initramfs-sh4.cpio.gz, so no libc toolchain is
+# needed at matrix-run time — only a kernel cross-gcc.
 if [ "$ARCH" = sh4 ]; then
-  for d in "$HOME"/x-tools/*/sh4-linux/bin; do [ -d "$d" ] && export PATH="$d:$PATH"; done
+  for d in "$HOME"/x-tools/*/sh4-linux/bin "$HOME"/x-tools/sh-sh4--*/bin; do
+    [ -x "$d/sh4-linux-gcc" ] && export PATH="$d:$PATH"
+  done
 fi
 
 # Skip cleanly on hosts lacking the cross toolchain or the emulator, so the cell
@@ -138,6 +140,21 @@ case "$ARCH" in
         --enable RTC_DRV_GOLDFISH \
         --enable GOLDFISH --enable GOLDFISH_TTY \
         --disable NE2000 ;;
+  sh4)
+    # r2d board has no -initrd path: embed the initramfs via INITRAMFS_SOURCE.
+    # Hard r2d constraints (see build-sh4-initramfs.sh): the sh zImage self-
+    # decompressor overwrites the compressed image once the decompressed
+    # vmlinux exceeds ~8M, so kernel + initramfs must stay small.  The ONLY
+    # combination that both fits and boots is a *directory* source (dir +
+    # nodelist) with kernel-side XZ compression — a pre-compressed .cpio.{gz,xz}
+    # SOURCE does not boot, and gzip of the dir is too bulky.  The busybox-free
+    # C-init (sh4-ltp-root/init) runs pgcl-test + a core LTP MM subset + then
+    # pgcl-stress, and powers off itself (no autotest= needed).
+    scripts/config --file "$KBUILD/.config" --enable BLK_DEV_INITRD \
+        --set-str INITRAMFS_SOURCE "$INITRAMFS/sh4-ltp-root $INITRAMFS/sh4-nodes.txt" \
+        --disable INITRAMFS_COMPRESSION_GZIP --enable INITRAMFS_COMPRESSION_XZ \
+        --enable CMDLINE_OVERWRITE \
+        --set-str CMDLINE "console=ttySC1,115200 noiotrap panic=1" ;;
 esac
 
 make ARCH="$LA" ${CC:+CROSS_COMPILE=$CC} O="$KBUILD" olddefconfig >/dev/null 2>&1
@@ -158,6 +175,7 @@ date
 INITRD_ARG=""
 case "$ARCH" in
   microblaze) ;;  # initrd is embedded
+  sh4) ;;         # r2d: initramfs embedded via CONFIG_INITRAMFS_SOURCE
   loongarch64) ;; # disk-based ESP boot (handled below)
   ppc64) INITRD_ARG="-initrd $INITRAMFS/initramfs-powerpc64.cpio.gz" ;;
   arm-lpae) INITRD_ARG="-initrd $INITRAMFS/initramfs-arm.cpio.gz" ;;  # shares with arm
@@ -183,7 +201,8 @@ case "$ARCH" in
   aarch64)               TIMEOUT=1800 ;; # PGCL=6 LTP end-to-end
   loongarch64)           TIMEOUT=1800 ;; # PGCL=6 LTP end-to-end
   riscv32|riscv64)       TIMEOUT=1800 ;; # PGCL=6 LTP end-to-end
-  sh4|or1k|xtensa)       TIMEOUT=600 ;;
+  sh4)                   TIMEOUT=1800 ;; # full LTP run (musl userspace)
+  or1k|xtensa)           TIMEOUT=600 ;;
   csky)                  TIMEOUT=600 ;;
   *)                     TIMEOUT=300 ;;
 esac

@@ -54,3 +54,12 @@ userspace/initramfs/minit
 userspace/hole-debug
 userspace/fork09-probe
 userspace/mremap06-repro
+
+# sh4 LTP cell generated bits (reproducible: build-ltp-cross.sh sh4 +
+# build-sh4-initramfs.sh; sources are sh4-ltp-init.c / build-*.sh / sh4-nodes.txt)
+userspace/initramfs/*.cpio.xz
+userspace/sh-uapi-headers/
+userspace/initramfs/sh4-ltp-root/
+userspace/initramfs/sh4-full-root/
+userspace/initramfs/sh4-test-root/
+userspace/initramfs/sh4-root/
