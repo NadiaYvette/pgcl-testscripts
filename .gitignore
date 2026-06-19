@@ -61,6 +61,12 @@ pgcl4-testbed/
 pgcl4-testbed-kernels/
 pgcl4-video/
 
+# A/B validation scratch (built kernels/images/logs/binaries; all reproducible)
+rmap-ab/
+# Phone boot-video captures (superseded by pstore/journal)
+laptop-boot-video/
+pgcl-boot-vids/
+
 # sh4 LTP cell generated bits (reproducible: build-ltp-cross.sh sh4 +
 # build-sh4-initramfs.sh; sources are sh4-ltp-init.c / build-*.sh / sh4-nodes.txt)
 userspace/initramfs/*.cpio.xz
