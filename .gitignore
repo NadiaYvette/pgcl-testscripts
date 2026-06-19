@@ -55,6 +55,12 @@ userspace/hole-debug
 userspace/fork09-probe
 userspace/mremap06-repro
 
+# Fedora+SELinux+swap QEMU testbed generated bits (reproducible:
+# build-fedora-selinux-swap-testbed.sh; the script is the only source)
+pgcl4-testbed/
+pgcl4-testbed-kernels/
+pgcl4-video/
+
 # sh4 LTP cell generated bits (reproducible: build-ltp-cross.sh sh4 +
 # build-sh4-initramfs.sh; sources are sh4-ltp-init.c / build-*.sh / sh4-nodes.txt)
 userspace/initramfs/*.cpio.xz
