@@ -54,6 +54,9 @@ userspace/initramfs/minit
 userspace/hole-debug
 userspace/fork09-probe
 userspace/mremap06-repro
+userspace/init-anon-stress
+userspace/init-leak-probe
+userspace/init-mmap-boundary
 
 # Fedora+SELinux+swap QEMU testbed generated bits (reproducible:
 # build-fedora-selinux-swap-testbed.sh; the script is the only source)
@@ -61,11 +64,43 @@ pgcl4-testbed/
 pgcl4-testbed-kernels/
 pgcl4-video/
 
-# A/B validation scratch (built kernels/images/logs/binaries; all reproducible)
-rmap-ab/
+# A/B validation: KEEP the scripts (run-*.sh, iso, setup-cpu-partitions.*,
+# tree-backup/*.diff) as part of the rmap debug toolkit; ignore the heavy
+# regenerable scratch (kernels, the disk image, compiled test binaries).
+# (*.img / *.log / *.out are already ignored globally above.)
+rmap-ab/bzImage*
+rmap-ab/rmap_repro
+rmap-ab/rmap_repro_256k
+rmap-ab/hugetlb_test
+rmap-ab/mm_stress
+rmap-ab/file_collapse_repro
+rmap-ab/file_dlopen_repro
+rmap-ab/file_fork_repro
+rmap-ab/file_largefolio_repro
+rmap-ab/file_reclaim_race_repro
+rmap-ab/file_rmap_repro
+rmap-ab/file_reclaim_race_repro
+rmap-ab/setup-cpu-partitions-wrap
 # Phone boot-video captures (superseded by pstore/journal)
 laptop-boot-video/
 pgcl-boot-vids/
+
+# Additional artifact types (built kernels, objects, images, dumps, scratch)
+bzImage*
+vmlinux*
+*.o
+*.ko
+*.png
+*.tsv
+*.err
+*.stderr
+*-msg.txt
+pstore-*
+/pstore-cat
+/look/
+/newarch-verify/
+/csky-drambase-out/
+/sh4-cell-out/
 
 # sh4 LTP cell generated bits (reproducible: build-ltp-cross.sh sh4 +
 # build-sh4-initramfs.sh; sources are sh4-ltp-init.c / build-*.sh / sh4-nodes.txt)

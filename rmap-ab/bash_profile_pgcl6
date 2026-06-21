@@ -1,0 +1,12 @@
+echo "===== PGCL6 VALIDATE: login ====="
+echo "kernel=$(uname -r) syspage=$(getconf PAGESIZE)"
+mkdir -p /mnt/btrfs /root/sd
+if mount -t btrfs /dev/vdc /mnt/btrfs 2>/dev/null; then echo "btrfs MOUNTED at pgcl6"; BT=/mnt/btrfs; else echo "btrfs mount FAILED at pgcl6 (pagesize ceiling expected)"; BT=; fi
+echo "--- #140 rmap reproducer (256K cluster) ---"
+timeout 30 /usr/local/bin/rmap_repro /root/rr.dat; echo "rmap_repro rc=$?"
+echo "--- mm-stress 60s (ext4 + tmpfs ${BT:++ btrfs}) ---"
+timeout 120 /usr/local/bin/mm_stress 60 /root/sd /tmp $BT; echo "mm_stress rc=$?"
+echo "--- dmesg BUG/WARN ---"
+dmesg | grep -iaE 'kernel BUG|WARNING:|invalid opcode|bad page|rmap.c:|hugetlb|Oops' | grep -vi 'pti\.c' | tail -20
+echo "BUGWARN=$(dmesg | grep -caiE 'kernel BUG|invalid opcode|bad page|rmap.c:3307')"
+sync; echo "===== PGCL6 VALIDATE: poweroff ====="; systemctl poweroff -i

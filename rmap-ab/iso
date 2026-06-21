@@ -1,0 +1,19 @@
+#!/bin/bash
+# iso CMD... — run CMD confined to pgcl's CPUs via STATELESS per-process affinity.
+#
+# Layout: Telix=0-9, 10-11=interaction/Claude shells, 12-19=pgcl (mine).
+#
+# Telix's own qemu-rt cgroup is a PARTITION ROOT holding 0-9, which carves 0-9
+# OUT of the root cgroup (root cpuset.cpus.effective = 10-19).  Every process of
+# mine lives in the root cgroup, so it is KERNEL-BARRED from 0-9 no matter what.
+# taskset then pins QEMU to E-cluster-1 (16-19) for the -smp 8 2x-oversubscription
+# that reproduces #143.
+#
+# Deliberately NO pgcl cpuset partition:
+#  (1) a hard 12-19 partition (alongside Telix's 0-9) would leave the whole OS on
+#      cores 10-11 -> starvation; and
+#  (2) a partition created from within the agent session is LOST on API errors /
+#      service interruptions (its lifetime is coupled to that session).
+# taskset is STATELESS: re-applied at every spawn, nothing an interruption can
+# lose.  That statelessness IS the bulletproofing.
+exec taskset -c 16-19 "$@"

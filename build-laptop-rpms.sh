@@ -6,7 +6,7 @@ set -u
 SRC=/home/nyc/src/linux
 STAGE=/home/nyc/src/pgcl/pgcl-laptop-rpms
 mkdir -p "$STAGE"
-for N in 0 6 4; do
+for N in ${PGCL_NS:-0 6 4}; do
   D=/home/nyc/src/pgcl/kernel-rpm-build/pgcl$N
   echo "############ binrpm-pkg pgcl$N  $(date +%H:%M:%S) ############"
   # -j10 (not 20): the laptop config is heavy (all-drivers + PAGE_OWNER +

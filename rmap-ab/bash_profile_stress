@@ -1,0 +1,13 @@
+echo "===== MM-STRESS: login reached ====="
+echo "kernel=$(uname -r) page=$(getconf PAGESIZE)"
+mkdir -p /mnt/btrfs /root/stressdir
+if mount -t btrfs /dev/vdc /mnt/btrfs; then echo "btrfs mounted ($(findmnt -no FSTYPE /mnt/btrfs))"; else echo "btrfs mount FAILED"; fi
+echo "===== MM-STRESS RUN (90s: btrfs + ext4-root + tmpfs) ====="
+timeout 160 /usr/local/bin/mm_stress 90 /mnt/btrfs /root/stressdir /tmp
+echo "===== MM-STRESS rc=$? ====="
+echo "--- kernel BUG/WARN during stress ---"
+dmesg | grep -iaE 'BUG|WARNING|rmap|hugetlb|oops|invalid opcode|corrupt|bad page|list_del' | tail -25
+echo "BUGWARN-COUNT=$(dmesg | grep -caiE 'kernel BUG|WARNING:|invalid opcode|bad page|list_del corruption')"
+sync
+echo "===== MM-STRESS: powering off ====="
+systemctl poweroff -i

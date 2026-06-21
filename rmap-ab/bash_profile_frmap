@@ -1,0 +1,12 @@
+echo "===== FRMAP A/B: login ====="
+echo "kernel=$(uname -r) syspage=$(getconf PAGESIZE)"
+mkdir -p /root/fr /mnt/btrfs
+mount -t btrfs /dev/vdc /mnt/btrfs 2>/dev/null && BT=/mnt/btrfs || BT=/root/fr
+echo "===== FRMAP RUN (ext4 /root/fr) ====="
+timeout 130 /usr/local/bin/file_rmap_repro /root/fr 75 8; echo "FRMAP-ext4 rc=$?"
+echo "===== FRMAP RUN (btrfs $BT) ====="
+timeout 60 /usr/local/bin/file_rmap_repro "$BT" 30 6; echo "FRMAP-btrfs rc=$?"
+echo "--- kernel bad-page/underflow (excl pti) ---"
+dmesg | grep -aiE 'Bad page (state|map)|bad pte|page dumped because|refcount:|mapcount:|folio_remove_rmap|print_bad' | grep -vi 'pti' | tail -30
+echo "BADPAGE=$(dmesg | grep -caiE 'Bad page (state|map)|bad pte in process')"
+sync; echo "===== FRMAP: powering off ====="; systemctl poweroff -i

@@ -1,0 +1,10 @@
+echo "===== FCOLL A/B: login ====="; echo "kernel=$(uname -r)"
+mkdir -p /mnt/btrfs; mount -t btrfs /dev/vdc /mnt/btrfs 2>/dev/null && BT=/mnt/btrfs || BT=/root
+cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
+echo "===== FCOLL RUN (btrfs=$BT) ====="
+timeout 130 /usr/local/bin/file_collapse_repro "$BT" 75 6; echo "FCOLL-btrfs rc=$?"
+timeout 60 /usr/local/bin/file_collapse_repro /root 30 6; echo "FCOLL-ext4 rc=$?"
+echo "--- bad-page / khugepaged BUG (excl pti) ---"
+dmesg | grep -aiE 'Bad page (state|map)|page dumped because|refcount:-|mapcount:-|khugepaged|collapse|VM_BUG|folio_remove_rmap|__split|Call Trace' | grep -vi 'pti' | tail -30
+echo "BADPAGE=$(dmesg | grep -caiE 'Bad page (state|map)|bad pte in process|kernel BUG')"
+sync; echo "===== FCOLL: powering off ====="; systemctl poweroff -i

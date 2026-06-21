@@ -1,0 +1,8 @@
+echo "===== RMAP A/B: login reached ====="
+echo "kernel=$(uname -r) page=$(getconf PAGESIZE) selinux=$(getenforce 2>/dev/null)"
+echo "===== RMAP REPRO RUN ====="
+cd /root
+timeout 30 /usr/local/bin/rmap_repro /root/rmap_repro.dat; echo "===== RMAP REPRO rc=$? ====="
+sync
+echo "===== RMAP A/B: powering off ====="
+systemctl poweroff -i

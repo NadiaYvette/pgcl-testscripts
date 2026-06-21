@@ -1,0 +1,8 @@
+echo "===== DLREPRO A/B: login ====="
+echo "kernel=$(uname -r)"
+echo "===== DLREPRO RUN ====="
+timeout 150 /usr/local/bin/file_dlopen_repro 95 12; echo "DLREPRO rc=$?"
+echo "--- bad-page/underflow (excl pti) ---"
+dmesg | grep -aiE 'Bad page (state|map)|bad pte|page dumped because|refcount:-|mapcount:-|folio_remove_rmap|print_bad_page|Call Trace' | grep -vi 'pti' | tail -30
+echo "BADPAGE=$(dmesg | grep -caiE 'Bad page (state|map)|bad pte in process')"
+sync; echo "===== DLREPRO: powering off ====="; systemctl poweroff -i

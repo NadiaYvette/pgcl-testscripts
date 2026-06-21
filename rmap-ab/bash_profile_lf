@@ -1,0 +1,10 @@
+echo "===== LF ext4 CAPPED-folio repro: kernel=$(uname -r) ====="
+echo always > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
+echo "THP=$(cat /sys/kernel/mm/transparent_hugepage/enabled)"
+echo "===== LF RUN (ext4 /var/tmp, 8 workers, 16MB; folio order capped sub-PMD in-kernel) ====="
+timeout 150 /usr/local/bin/file_largefolio_repro /var/tmp 110 8 16; echo "LF rc=$?"
+echo "thp_file: $(grep -E 'thp_file_alloc|thp_file_mapped' /proc/vmstat | tr '\n' ' ')"
+for d in /sys/kernel/mm/transparent_hugepage/hugepages-*kB; do v=$(cat $d/stats/file_alloc 2>/dev/null); [ "${v:-0}" != 0 ] && echo "file_alloc $(basename $d)=$v"; done
+dmesg | grep -aiE 'PGCLDIAG143|Bad page (state|map)|aops:ext4|mapcount:-[0-9]|refcount:-[0-9]|page dumped because' | grep -vi pti | tail -34
+echo "PGCLDIAG143=$(dmesg | grep -ac 'PGCLDIAG143')  BADPAGE=$(dmesg | grep -caiE 'Bad page (state|map)')  FILE_UF=$(dmesg | grep -ac 'aops:ext4')"
+sync; echo "===== powering off ====="; systemctl poweroff -i

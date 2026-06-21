@@ -1,0 +1,12 @@
+echo "===== FFORK A/B: login ====="
+echo "kernel=$(uname -r)"
+mkdir -p /mnt/btrfs
+mount -t btrfs /dev/vdc /mnt/btrfs || { echo "btrfs mount FAILED"; sync; systemctl poweroff -i; }
+echo "===== FFORK RUN (btrfs) ====="
+timeout 130 /usr/local/bin/file_fork_repro /mnt/btrfs 75 6; echo "FFORK-btrfs rc=$?"
+echo "===== FFORK RUN (ext4 /root) ====="
+timeout 55 /usr/local/bin/file_fork_repro /root 30 6; echo "FFORK-ext4 rc=$?"
+echo "--- bad-page (excl pti) ---"
+dmesg | grep -aiE 'Bad page (state|map)|page dumped because|refcount:-|mapcount:-|folio_remove_rmap|folio_dup|copy_present|print_bad_page|Call Trace' | grep -vi 'pti' | tail -30
+echo "BADPAGE=$(dmesg | grep -caiE 'Bad page (state|map)|bad pte in process')"
+sync; echo "===== FFORK: powering off ====="; systemctl poweroff -i

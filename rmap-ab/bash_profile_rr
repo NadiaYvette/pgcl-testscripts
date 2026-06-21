@@ -1,0 +1,9 @@
+echo "===== RR reclaim-race repro: kernel=$(uname -r) ====="
+mkdir -p /mnt/btrfs; mount -t btrfs /dev/vdc /mnt/btrfs || { echo "btrfs FAIL"; sync; systemctl poweroff -i; }
+echo "MemTotal=$(awk '/MemTotal/{print $2}' /proc/meminfo)kB"
+echo "===== RR RUN (btrfs, 10 workers, hog=2048MB, file=4MB, 150s) ====="
+timeout 200 /usr/local/bin/file_reclaim_race_repro /mnt/btrfs 150 10 2048 4; echo "RR rc=$?"
+echo "--- corruption / race signatures ---"
+dmesg | grep -aiE 'Bad page (state|map)|refcount:-[0-9]|mapcount:-[0-9]|aops:btrfs|include/linux/mm.h:2116|nr_unmap_fail|VM_BUG_ON_FOLIO' | grep -vi pti | tail -34
+echo "BADPAGE=$(dmesg|grep -caiE 'Bad page (state|map)')  UNDERFLOW=$(dmesg|grep -caiE 'refcount:-[0-9]|mapcount:-[0-9]')  MMBUG=$(dmesg|grep -ac 'mm.h:2116')"
+sync; echo "===== powering off ====="; systemctl poweroff -i

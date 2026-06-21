@@ -1,0 +1,604 @@
+diff --git a/mm/filemap.c b/mm/filemap.c
+index f9e6604ffa05..a56e9e742c0c 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -152,6 +152,13 @@ static void filemap_unaccount_folio(struct address_space *mapping,
+ {
+ 	long nr;
+ 
++#if PAGE_MMUSHIFT
++	/* PGCL #143: a folio mapped while being deleted from the page cache is
++	 * the fatal manifestation; dump its count-history before the BUG. */
++	if (unlikely(folio_mapped(folio)))
++		pgcl143_report(folio, &folio->page, NULL,
++			       "filemap_unaccount mapped@truncate");
++#endif
+ 	VM_BUG_ON_FOLIO(folio_mapped(folio), folio);
+ 	if (!IS_ENABLED(CONFIG_DEBUG_VM) && unlikely(folio_mapped(folio))) {
+ 		pr_alert("BUG: Bad page cache in process %s  pfn:%05lx\n",
+diff --git a/mm/internal.h b/mm/internal.h
+index e120f307998e..079f461493b8 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -564,6 +564,19 @@ static inline bool pgcl_rmap_fire_kpage_event(pte_t *ptep, unsigned long address
+ 	}
+ 	return true;
+ }
++
++/* PGCL #143 diagnostic (DEBUG) — count-history ring + anomaly reporter. */
++enum pgcl_ev_path {
++	PEV_ADD_RMAP = 1, PEV_REM_RMAP, PEV_ADD_SUB, PEV_REM_SUB,
++	PEV_NEW_ANON, PEV_COW_EXTRA, PEV_ANON_EAGER,
++};
++void pgcl_ring_record(const struct folio *folio, const struct page *page,
++		      int delta, long vaddr, unsigned int path);
++void pgcl143_report(struct folio *folio, struct page *page,
++		    struct vm_area_struct *vma, const char *site);
++void pgcl143_dump_ring(unsigned long pfn);
++void pgcl_ring_free(unsigned long pfn);
++void pgcl_ring_rm_va(unsigned long va);
+ #endif /* PAGE_MMUSHIFT */
+ 
+ /**
+diff --git a/mm/memory.c b/mm/memory.c
+index c41e852d2de8..7ca7e6b20567 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1176,8 +1176,20 @@ copy_present_ptes(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
+ 	 * sure that the common "small folio" case is as fast as possible
+ 	 * by keeping the batching logic separate.
+ 	 */
++	/*
++	 * PGCL: large FILE folios must also skip this upstream batch path.
++	 * folio_dup_file_rmap_ptes() below increments _mapcount across @nr
++	 * DISTINCT struct pages (the one-page-per-PTE assumption), but a PGCL
++	 * sub-PTE batch shares ONE cluster page -- so it would scatter +1 onto
++	 * neighbouring clusters while the (MMUPAGE-converted) zap subtracts @nr
++	 * from this one cluster page, underflowing its mapcount (and, downstream,
++	 * its refcount).  Excluding all large folios under PGCL sends file ones to
++	 * the per-PTE file dup below (folio_dup_file_rmap_pte, +1 on the cluster
++	 * page per sub-PTE -- the exact inverse of folio_remove_rmap_subptes) and
++	 * anon ones to the PGCL anon batch block.  Identity at PAGE_MMUSHIFT==0.
++	 */
+ 	if (unlikely(!*prealloc && folio_test_large(folio) && max_nr != 1) &&
+-	    !(PAGE_MMUSHIFT && folio_test_anon(folio))) {
++	    !(PAGE_MMUSHIFT && folio_test_large(folio))) {
+ 		if (!(src_vma->vm_flags & VM_SHARED))
+ 			flags |= FPB_RESPECT_DIRTY;
+ 		if (vma_soft_dirty_enabled(src_vma))
+@@ -1294,11 +1306,14 @@ copy_present_ptes(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
+ 				 */
+ 				folio_ref_add(folio, nr);
+ 				if (!folio_try_dup_anon_rmap_ptes(folio, page, 1,
+-								  dst_vma, src_vma))
++								  dst_vma, src_vma)) {
+ 					do_share = true;
+-				else
++					pgcl_ring_record(folio, page, 1, addr,
++							 PEV_ADD_RMAP);
++				} else {
+ 					/* pinned+exclusive: undo ref, copy below */
+ 					folio_ref_sub(folio, nr);
++				}
+ 			} else if (!PageAnonExclusive(page)) {
+ 				/*
+ 				 * Later fragment of a kernel page an earlier
+@@ -1386,9 +1401,11 @@ copy_present_ptes(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
+ 		}
+ 		rss[MM_ANONPAGES]++;
+ 		VM_WARN_ON_FOLIO(PageAnonExclusive(page), folio);
++		pgcl_ring_record(folio, page, 1, addr, PEV_ADD_RMAP);
+ 	} else {
+ 		folio_dup_file_rmap_pte(folio, page, dst_vma);
+ 		rss[mm_counter_file(folio)]++;
++		pgcl_ring_record(folio, page, 1, addr, PEV_ADD_RMAP);
+ 	}
+ 
+ copy_pte:
+@@ -1843,12 +1860,22 @@ static __always_inline void zap_present_folio_ptes(struct mmu_gather *tlb,
+ 	struct mm_struct *mm = tlb->mm;
+ 	bool delay_rmap = false;
+ 
++	pgcl_ring_rm_va(addr);	/* #143 probe: stash remove-side vaddr */
+ 	if (!folio_test_anon(folio)) {
+ 		ptent = get_and_clear_full_ptes(mm, addr, pte, nr, tlb->fullmm);
+ 		if (pte_dirty(ptent)) {
+ 			folio_mark_dirty(folio);
+ 			if (tlb_delay_rmap(tlb)) {
+-				delay_rmap = true;
++				/*
++				 * PGCL #143 A/B fix: do NOT defer the rmap removal.
++				 * Deferring it past the PTL (delay_rmap) leaves a
++				 * window where the sub-PTE is cleared but its rmap
++				 * count is not yet removed; a concurrent truncate
++				 * (unmap_mapping_folio, no TTU_SYNC) then sees the
++				 * cleared PTE + stale-high mapcount -> folio_mapped
++				 * BUG at delete.  Keep the TLB flush; remove rmap
++				 * synchronously under the PTL below.
++				 */
+ 				*force_flush = true;
+ 			}
+ 		}
+@@ -1954,6 +1981,32 @@ static inline int zap_present_ptes(struct mmu_gather *tlb,
+ 		if (nr > 1 || folio_test_large(folio)) {
+ 			int i;
+ 
++#if PAGE_MMUSHIFT
++			/*
++			 * PGCL #143: before debiting @folio's counter by @nr,
++			 * verify every sub-PTE in this batch actually points
++			 * into @folio.  A sub-PTE whose pfn is outside the folio
++			 * means the count is about to land on the WRONG folio
++			 * (mis-attribution in a fragmented/raced run) -> report.
++			 */
++			{
++				unsigned long fp = folio_pfn(folio);
++				unsigned long fn = folio_nr_pages(folio);
++				unsigned int k;
++
++				for (k = 0; k < (unsigned int)nr; k++) {
++					pte_t e = ptep_get(pte + k);
++
++					if (pte_present(e) &&
++					    (pte_pfn(e) < fp ||
++					     pte_pfn(e) >= fp + fn)) {
++						pgcl143_report(folio, page, vma,
++						    "zap batch: sub-PTE pfn outside folio");
++						break;
++					}
++				}
++			}
++#endif
+ 			clear_full_ptes(mm, addr, pte, nr, tlb->fullmm);
+ 			rss[mm_counter(folio)] -= nr;
+ 			arch_check_zapped_pte(vma, ptent);
+@@ -4505,6 +4558,9 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 				 */
+ 				folio_ref_add(new_folio, extra);
+ 				atomic_add(extra, &new_folio->_mapcount);
++				pgcl_ring_record(new_folio, &new_folio->page,
++						 extra, vmf->address,
++						 PEV_COW_EXTRA);
+ 				/*
+ 				 * Drop old folio refs for the remapped
+ 				 * neighbor PTEs.  The faulting PTE's ref
+@@ -4699,7 +4755,14 @@ static bool __wp_can_reuse_large_anon_folio(struct folio *folio,
+ 	if (folio_large_mapcount(folio) != folio_ref_count(folio))
+ 		goto unlock;
+ 
+-	VM_WARN_ON_ONCE_FOLIO(folio_large_mapcount(folio) > folio_nr_pages(folio), folio);
++	/*
++	 * PGCL: mapcount is MMUPAGE-granular (one count per hardware sub-PTE),
++	 * so a fully-mapped exclusive folio reaches nr_pages << PAGE_MMUSHIFT,
++	 * not nr_pages.  Compare against the MMUPAGE bound.  Identity at
++	 * PAGE_MMUSHIFT == 0.
++	 */
++	VM_WARN_ON_ONCE_FOLIO(folio_large_mapcount(folio) >
++			      (folio_nr_pages(folio) << PAGE_MMUSHIFT), folio);
+ 	VM_WARN_ON_ONCE_FOLIO(folio_entire_mapcount(folio), folio);
+ 	VM_WARN_ON_ONCE(folio_mm_id(folio, 0) != vma->vm_mm->mm_id &&
+ 			folio_mm_id(folio, 1) != vma->vm_mm->mm_id);
+@@ -6248,6 +6311,8 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 			folio_ref_add(folio, rss - 1);
+ 			atomic_add(rss - 1, &folio->_mapcount);
+ 			lruvec_stat_mod_folio(folio, NR_ANON_MAPPED, rss - 1);
++			pgcl_ring_record(folio, &folio->page, rss - 1,
++					 vmf->address, PEV_ANON_EAGER);
+ 		}
+ 		/* Fix RSS: we added 1 above (nr_pages), need rss total */
+ 		add_mm_counter(vma->vm_mm, MM_ANONPAGES, rss - 1);
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index d49c254174da..244f41d06979 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -627,6 +627,12 @@ static void bad_page(struct page *page, const char *reason)
+ 	pr_alert("BUG: Bad page state in process %s  pfn:%05lx\n",
+ 		current->comm, page_to_pfn(page));
+ 	dump_page(page, reason);
++#if PAGE_MMUSHIFT
++	/* PGCL #143: replay this pfn's rmap count-history (catches the
++	 * freed-while-mapped / refcount-underflow class the rmap/filemap hooks
++	 * miss). */
++	pgcl143_dump_ring(page_to_pfn(page));
++#endif
+ 
+ 	print_modules();
+ 	dump_stack();
+@@ -1312,6 +1318,10 @@ __always_inline bool __free_pages_prepare(struct page *page,
+ 	bool compound = PageCompound(page);
+ 	struct folio *folio = page_folio(page);
+ 
++#if PAGE_MMUSHIFT
++	pgcl_ring_free(page_to_pfn(page));	/* PGCL #143: bump ring gen for this pfn */
++#endif
++
+ 	VM_BUG_ON_PAGE(PageTail(page), page);
+ 
+ 	trace_mm_page_free(page, order);
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 7f797beeca91..8139eebd6653 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -53,6 +53,8 @@
+  */
+ 
+ #include <linux/mm.h>
++#include <linux/nmi.h>
++#include <linux/sched/clock.h>
+ #include <linux/sched/mm.h>
+ #include <linux/sched/task.h>
+ #include <linux/pagemap.h>
+@@ -1433,6 +1435,9 @@ static __always_inline void __folio_add_rmap(struct folio *folio,
+ 	case PGTABLE_LEVEL_PTE:
+ 		if (!folio_test_large(folio)) {
+ 			nr = atomic_inc_and_test(&folio->_mapcount);
++#if PAGE_MMUSHIFT
++			pgcl_ring_record(folio, page, 1, -1, PEV_ADD_RMAP);
++#endif
+ 			break;
+ 		}
+ 
+@@ -1731,6 +1736,7 @@ void folio_add_new_anon_rmap(struct folio *folio, struct vm_area_struct *vma,
+ 		atomic_set(&folio->_mapcount, 0);
+ 		if (exclusive)
+ 			SetPageAnonExclusive(&folio->page);
++		pgcl_ring_record(folio, &folio->page, 1, address, PEV_NEW_ANON);
+ 	} else if (!folio_test_pmd_mappable(folio)) {
+ 		int i;
+ 
+@@ -1805,6 +1811,273 @@ void folio_add_file_rmap_ptes(struct folio *folio, struct page *page,
+ }
+ 
+ #if PAGE_MMUSHIFT
++/*
++ * PGCL #143 diagnostic (DEBUG).  Two cooperating parts:
++ *  (1) a per-CPU, lockless count-history ring (pgcl_ring_record) recording every
++ *      rmap count event WITH the folio identity + post-counters, so on an anomaly
++ *      we replay which CPUs/paths touched the buggy folio (and can spot a count
++ *      landing on the wrong folio).  Per-CPU + local_clock => no shared cacheline,
++ *      so it perturbs the cross-CPU race far less than a global counter would.
++ *  (2) pgcl143_report(): on an order-0 OR large mapcount / _nr_pages_mapped
++ *      anomaly, or a folio_mapped()-at-truncate fatal (called from
++ *      filemap_unaccount_folio), dump the folio, the ring slice for its pfn
++ *      across all CPUs, the live mapper sub-PTE map, an all-CPU NMI snapshot, and
++ *      a stack trace.  Strip before any non-debug build.
++ */
++#define PGCL_NBUCKET	8192		/* power of 2: pfn-hash buckets */
++#define PGCL_KADD	32		/* adds retained per pfn-bucket */
++#define PGCL_KREM	32		/* removes retained per pfn-bucket */
++
++struct pgcl_ev {
++	u64 ts;
++	const void *folio;
++	unsigned long pfn;
++	long vaddr;
++	int delta;
++	int mc;			/* _mapcount (small) or _large_mapcount (large), after */
++	int npm;		/* _nr_pages_mapped after (large), else INT_MIN */
++	short poff;		/* page - &folio->page */
++	u8 path;
++	u8 large;
++	u8 cpu;
++	u32 gen;		/* bucket generation at record time (pfn-reuse filter) */
++};
++/*
++ * Per-pfn bucket, with adds and removes in SEPARATE rings (Nadia's idea): a
++ * flood of removes cannot evict the adds, so the under-add / over-remove balance
++ * for a pfn stays legible across the whole repro.  Sequence the two by ts in
++ * post-processing.  Per-bucket atomic heads => contention only when two CPUs
++ * touch the SAME pfn (exactly the racing folio we want), ~NBUCKET x less than a
++ * global counter, so it perturbs the race far less.
++ */
++struct pgcl_bucket {
++	struct pgcl_ev add[PGCL_KADD];
++	struct pgcl_ev rem[PGCL_KREM];
++	atomic_t add_head;
++	atomic_t rem_head;
++	atomic_t gen;		/* bumped on folio free; SUM filters to current gen */
++};
++static struct pgcl_bucket pgcl_buckets[PGCL_NBUCKET];	/* ~33MB BSS, DEBUG only */
++static const char pgcl_ev_ch[] = " arARnce";	/* indexed by enum pgcl_ev_path */
++/*
++ * Per-CPU stash: remove callers set the vaddr here (the rmap helpers don't get
++ * it), so REMOVE events can record their address too — to tell a concurrent
++ * double-remove of ONE sub-PTE (same vaddr, multiple CPUs) from legitimate
++ * removes of several distinct mappings.
++ */
++static DEFINE_PER_CPU(unsigned long, pgcl_rm_va);
++void pgcl_ring_rm_va(unsigned long va) { this_cpu_write(pgcl_rm_va, va); }
++
++/* Called under the page-table lock (preemption off) at every rmap count site. */
++void pgcl_ring_record(const struct folio *folio, const struct page *page,
++		      int delta, long vaddr, unsigned int path)
++{
++	unsigned long pfn = folio_pfn(folio);
++	struct pgcl_bucket *b = &pgcl_buckets[pfn & (PGCL_NBUCKET - 1)];
++	bool large = folio_test_large(folio);
++	struct pgcl_ev *e;
++
++	if (delta >= 0)
++		e = &b->add[(unsigned int)(atomic_inc_return(&b->add_head) - 1)
++			    % PGCL_KADD];
++	else
++		e = &b->rem[(unsigned int)(atomic_inc_return(&b->rem_head) - 1)
++			    % PGCL_KREM];
++
++	e->ts = local_clock();
++	e->folio = folio;
++	e->pfn = pfn;
++	/* Removes don't carry a vaddr through the rmap helpers; use the caller's
++	 * per-CPU stash so we can see if concurrent removes hit the same sub-PTE. */
++	e->vaddr = (delta < 0) ? (long)this_cpu_read(pgcl_rm_va) : vaddr;
++	e->delta = delta;
++	e->large = large;
++	e->mc = large ? atomic_read(&folio->_large_mapcount)
++		      : atomic_read(&folio->_mapcount);
++	e->npm = large ? atomic_read(&folio->_nr_pages_mapped) : INT_MIN;
++	e->poff = (short)(page - &folio->page);
++	e->path = path;
++	e->cpu = raw_smp_processor_id();
++	e->gen = (u32)atomic_read(&b->gen);
++}
++
++/*
++ * Called from the page-free path: bump this pfn's bucket generation so the dump
++ * (and SUM) ignore the just-freed incarnation's events — defeats pfn-reuse
++ * pollution and makes a post-free stale remove show as remove-without-add.
++ */
++void pgcl_ring_free(unsigned long pfn)
++{
++	atomic_inc(&pgcl_buckets[pfn & (PGCL_NBUCKET - 1)].gen);
++}
++
++static void pgcl143_dump_evs(const char *tag, struct pgcl_ev *arr, unsigned int k,
++			     unsigned long pfn, u32 gen, long *sum, long *sum_old)
++{
++	unsigned int i;
++
++	for (i = 0; i < k; i++) {
++		struct pgcl_ev *e = &arr[i];
++		char p = (e->path < sizeof(pgcl_ev_ch)) ? pgcl_ev_ch[e->path] : '?';
++
++		if (e->pfn != pfn || !e->folio)
++			continue;
++		if (e->gen != gen) {		/* a prior incarnation at this pfn */
++			*sum_old += e->delta;
++			continue;
++		}
++		*sum += e->delta;
++		pr_emerg("PGCL#143:   %s %llu c%u %c d%+d mc=%d npm=%d poff=%d va=%lx f=%px%s\n",
++			 tag, e->ts, e->cpu, p, e->delta, e->mc, e->npm, e->poff,
++			 e->vaddr, e->folio, e->large ? " L" : "");
++	}
++}
++
++/* Dump this pfn's bucket (adds then removes; sort by ts in post-processing). */
++void pgcl143_dump_ring(unsigned long pfn)
++{
++	struct pgcl_bucket *b = &pgcl_buckets[pfn & (PGCL_NBUCKET - 1)];
++	u32 gen = (u32)atomic_read(&b->gen);
++	long add_sum = 0, rem_sum = 0, add_old = 0, rem_old = 0;
++
++	pr_emerg("PGCL#143: count-history pfn %lx gen=%u [tag ts cpu path d<delta> mc npm poff va folio] (a=add_rmap r=rem_rmap A=add_sub R=rem_sub n=new_anon c=cow_extra e=anon_eager; L=large; only THIS gen shown):\n",
++		 pfn, gen);
++	pgcl143_dump_evs("ADD", b->add, PGCL_KADD, pfn, gen, &add_sum, &add_old);
++	pgcl143_dump_evs("REM", b->rem, PGCL_KREM, pfn, gen, &rem_sum, &rem_old);
++	pr_emerg("PGCL#143:   SUM(gen %u) adds=%+ld removes=%+ld net=%+ld (net should == current mapcount) | prior-gen filtered: adds=%+ld removes=%+ld\n",
++		 gen, add_sum, rem_sum, add_sum + rem_sum, add_old, rem_old);
++}
++
++static bool pgcl143_rmap_one(struct folio *folio, struct vm_area_struct *vma,
++			     unsigned long address, void *arg)
++{
++	unsigned long cbase = address & PAGE_MASK;
++	unsigned long fpfn = folio_pfn(folio);
++	struct mm_struct *mm = vma->vm_mm;
++	char map[PAGE_MMUCOUNT + 1];
++	char soff[PAGE_MMUCOUNT + 1];
++	unsigned int i, idx, n = 0;
++	unsigned int vsub = (address & (PAGE_SIZE - 1)) >> MMUPAGE_SHIFT;
++	int *count = arg;
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++	pte_t *pte;
++	unsigned long pmdv = 0;
++	char pbuf[PAGE_MMUCOUNT * 20];	/* raw pte_val of every window slot */
++	unsigned int pl = 0;
++
++	pbuf[0] = '\0';
++	for (i = 0; i < PAGE_MMUCOUNT; i++)
++		map[i] = soff[i] = '?';
++	map[PAGE_MMUCOUNT] = soff[PAGE_MMUCOUNT] = '\0';
++
++	pgd = pgd_offset(mm, cbase);
++	if (pgd_none(*pgd) || pgd_bad(*pgd))
++		goto out;
++	p4d = p4d_offset(pgd, cbase);
++	if (p4d_none(*p4d) || p4d_bad(*p4d))
++		goto out;
++	pud = pud_offset(p4d, cbase);
++	if (pud_none(*pud) || pud_bad(*pud))
++		goto out;
++	pmd = pmd_offset(pud, cbase);
++	pmdv = pmd_val(*pmd);
++	if (pmd_none(*pmd) || pmd_bad(*pmd) || pmd_trans_huge(*pmd))
++		goto out;
++	pte = pte_offset_map(pmd, cbase);
++	if (!pte)
++		goto out;
++	idx = pte_index(cbase);
++	n = min_t(unsigned int, PAGE_MMUCOUNT, PTRS_PER_PTE - idx);
++	for (i = 0; i < n; i++) {
++		pte_t e = ptep_get(pte + i);
++
++		pl += scnprintf(pbuf + pl, sizeof(pbuf) - pl, "%lx ",
++				(unsigned long)pte_val(e));
++		if (pte_none(e)) {
++			map[i] = '.'; soff[i] = '.';		/* empty slot */
++		} else if (!pte_present(e)) {
++			map[i] = 's'; soff[i] = 's';		/* swap / migration */
++		} else if (pte_pfn(e) == fpfn) {
++			unsigned int so = pte_suboffset(e);
++
++			map[i] = pte_write(e) ? 'W' : 'r';	/* live, this folio */
++			soff[i] = "0123456789abcdef"[so & 0xf];	/* its sub-offset */
++		} else {
++			map[i] = 'X'; soff[i] = 'X';		/* present, OTHER pfn */
++		}
++	}
++	pte_unmap(pte);
++out:
++	pr_emerg("PGCL#143:  mapper mm=%px vma=[%lx-%lx] pgoff=%lx flags=%lx anon_vma=%px addr=%lx vsub=%u file=%pD\n",
++		 mm, vma->vm_start, vma->vm_end, vma->vm_pgoff, vma->vm_flags,
++		 vma->anon_vma, address, vsub, vma->vm_file);
++	pr_emerg("PGCL#143:    pmd=%lx kind[%s] suboff[%s] (kind W=wr r=ro .=none s=swap X=otherpfn; suboff=hex sub-page this PTE targets)\n",
++		 pmdv, map, soff);
++	pr_emerg("PGCL#143:    raw pte_val[%u of %u slots]: %s\n",
++		 n, (unsigned int)PAGE_MMUCOUNT, pbuf);
++	if (count && ++*count >= 64)
++		return false;			/* cap volume */
++	return true;
++}
++
++void pgcl143_report(struct folio *folio, struct page *page,
++		    struct vm_area_struct *vma, const char *site)
++{
++	static atomic_t dumps = ATOMIC_INIT(0);
++	int seq = atomic_inc_return(&dumps);
++	struct rmap_walk_control rwc = {};
++	int count = 0;
++
++	if (seq > 5)
++		return;				/* bound volume: first 5 anomalies */
++
++	pr_emerg("PGCL#143: ===== anomaly #%d at %s =====\n", seq, site);
++	if (folio_test_large(folio))
++		pr_emerg("PGCL#143: folio=%px pfn=%lx order=%u LARGE _large_mapcount=%d _nr_pages_mapped=%d folio_mapcount=%d refcount=%d anon=%d swapcache=%d\n",
++			 folio, folio_pfn(folio), folio_order(folio),
++			 atomic_read(&folio->_large_mapcount),
++			 atomic_read(&folio->_nr_pages_mapped),
++			 folio_mapcount(folio), folio_ref_count(folio),
++			 folio_test_anon(folio), folio_test_swapcache(folio));
++	else
++		pr_emerg("PGCL#143: folio=%px pfn=%lx order=0 _mapcount=%d folio_mapcount=%d refcount=%d anon=%d swapcache=%d\n",
++			 folio, folio_pfn(folio),
++			 atomic_read(&folio->_mapcount), folio_mapcount(folio),
++			 folio_ref_count(folio), folio_test_anon(folio),
++			 folio_test_swapcache(folio));
++	dump_page(&folio->page, site);
++	pr_emerg("PGCL#143: by pid=%d comm=%s\n", current->pid, current->comm);
++	if (vma)
++		pr_emerg("PGCL#143: site vma=[%lx-%lx] flags=%lx file=%pD mm=%px\n",
++			 vma->vm_start, vma->vm_end, vma->vm_flags, vma->vm_file,
++			 vma->vm_mm);
++	pgcl143_dump_ring(folio_pfn(folio));
++	/*
++	 * Heavy capture only on the FIRST anomaly: an all-CPU NMI stack snapshot
++	 * (atomic-safe under our PTL where stop_machine() is not) plus the live
++	 * mapper sub-PTE map.  rmap_walk uses try_lock so it cannot deadlock on
++	 * the PTL we hold; the per-mapper page-table read is lockless.  This stalls
++	 * ~1s so it perturbs survival — fine for capturing the (already-occurred)
++	 * triggering event, but kept off the 2nd/3rd reports.
++	 */
++	if (seq == 1 || !vma) {
++		pr_emerg("PGCL#143: all-CPU NMI backtrace:\n");
++		trigger_all_cpu_backtrace();
++		pr_emerg("PGCL#143: mappers (W=wr r=ro .=none s=swap X=otherpfn ?=nowalk):\n");
++		rwc.arg = &count;
++		rwc.rmap_one = pgcl143_rmap_one;
++		rwc.try_lock = true;
++		rmap_walk(folio, &rwc);
++		if (rwc.contended)
++			pr_emerg("PGCL#143:  (rmap walk skipped: contended)\n");
++	}
++	dump_stack();
++	pr_emerg("PGCL#143: ===== end anomaly #%d =====\n", seq);
++}
++
+ /**
+  * folio_add_rmap_subptes - add @count MMUPAGE sub-PTE mappings of one kernel
+  *			    page (cluster) of @folio  [PGCL]
+@@ -1836,6 +2109,7 @@ void folio_add_rmap_subptes(struct folio *folio, struct page *page,
+ 		folio_add_large_mapcount(folio, count, vma);
+ 	}
+ 	__folio_mod_stat(folio, count, 0);
++	pgcl_ring_record(folio, page, count, -1, PEV_ADD_SUB);
+ }
+ 
+ /**
+@@ -1858,6 +2132,14 @@ void folio_remove_rmap_subptes(struct folio *folio, struct page *page,
+ 			atomic_dec(&folio->_nr_pages_mapped);
+ 	}
+ 	__folio_mod_stat(folio, -count, 0);
++	pgcl_ring_record(folio, page, -count, -1, PEV_REM_SUB);
++	if (unlikely((!folio_test_large(folio) ?
++		      atomic_read(&folio->_mapcount) < -1 :
++		      (folio_large_mapcount(folio) < 0 ||
++		       atomic_read(&page->_mapcount) < -1 ||
++		       atomic_read(&folio->_nr_pages_mapped) < 0)) ||
++		     folio_ref_count(folio) == 0))	/* remove on a FREED folio */
++		pgcl143_report(folio, page, vma, "remove_rmap_subptes");
+ }
+ #endif /* PAGE_MMUSHIFT */
+ 
+@@ -1916,6 +2198,13 @@ static __always_inline void __folio_remove_rmap(struct folio *folio,
+ 	case PGTABLE_LEVEL_PTE:
+ 		if (!folio_test_large(folio)) {
+ 			nr = atomic_add_negative(-1, &folio->_mapcount);
++#if PAGE_MMUSHIFT
++			pgcl_ring_record(folio, page, -1, -1, PEV_REM_RMAP);
++			if (unlikely(atomic_read(&folio->_mapcount) < -1 ||
++				     folio_ref_count(folio) == 0))
++				pgcl143_report(folio, page, vma,
++					       "remove_rmap_pte");
++#endif
+ 			break;
+ 		}
+ 
+@@ -2240,6 +2529,7 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
+ 
+ 		subpage = folio_page(folio, pfn - folio_pfn(folio));
+ 		address = pvmw.address;
++		pgcl_ring_rm_va(address);	/* #143 probe: stash remove-side vaddr */
+ 		anon_exclusive = folio_test_anon(folio) &&
+ 				 PageAnonExclusive(subpage);
+ 
+@@ -2704,6 +2994,7 @@ static bool try_to_migrate_one(struct folio *folio, struct vm_area_struct *vma,
+ 
+ 		subpage = folio_page(folio, pfn - folio_pfn(folio));
+ 		address = pvmw.address;
++		pgcl_ring_rm_va(address);	/* #143 probe: stash remove-side vaddr */
+ 		anon_exclusive = folio_test_anon(folio) &&
+ 				 PageAnonExclusive(subpage);
+ 
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 212a8f20ae65..8da0a98332d1 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1346,6 +1346,24 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
+ 			 */
+ 			if (folio_test_large(folio))
+ 				flags |= TTU_SYNC;
++#if PAGE_MMUSHIFT
++			/*
++			 * PGCL: an order-0 folio is still mapped by
++			 * PAGE_MMUCOUNT hardware sub-PTEs, so it is
++			 * multiply-mapped exactly like a large folio and is
++			 * subject to the same lazy-PTL race described above: a
++			 * concurrent COW/zap can clear a sub-PTE before writing
++			 * its new value, so the unsynchronized
++			 * page_vma_mapped_walk skips it and the folio_mapped()
++			 * re-check below reads a transient count -- letting the
++			 * folio be freed while sub-PTEs are still mapped, which
++			 * drives its refcount and mapcount negative.  Force PTL
++			 * from the first sub-PTE for every folio under
++			 * clustering.  Identity at PAGE_MMUSHIFT == 0.
++			 */
++			else
++				flags |= TTU_SYNC;
++#endif
+ 
+ 			try_to_unmap(folio, flags);
+ 			if (folio_mapped(folio)) {

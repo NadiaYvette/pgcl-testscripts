@@ -1,0 +1,17 @@
+echo "===== DLREPRO-BTRFS A/B: login ====="
+echo "kernel=$(uname -r)"
+mkdir -p /mnt/btrfs
+mount -t btrfs /dev/vdc /mnt/btrfs || { echo "btrfs mount FAILED"; sync; systemctl poweroff -i; }
+mkdir -p /mnt/btrfs/lib
+for L in libcrypto libssl libsystemd libzstd liblzma libpcre2-8 libm libz libgcrypt libblkid libmount libselinux libuuid libffi libdw libelf libbz2 libgmp libacl libcap; do
+  cp -Lf /usr/lib64/$L.so.* /mnt/btrfs/lib/ 2>/dev/null
+done
+echo "btrfs libs: $(ls /mnt/btrfs/lib 2>/dev/null | wc -l)"
+cat /mnt/btrfs/lib/* > /dev/null 2>&1
+sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+echo "===== DLREPRO RUN (dlopen from btrfs, 16 workers) ====="
+timeout 170 /usr/local/bin/file_dlopen_repro 120 16 /mnt/btrfs/lib; echo "DLREPRO rc=$?"
+echo "--- bad-page/underflow (excl pti) ---"
+dmesg | grep -aiE 'Bad page (state|map)|bad pte|page dumped because|refcount:-|mapcount:-|folio_remove_rmap|print_bad_page|Call Trace' | grep -vi 'pti' | tail -30
+echo "BADPAGE=$(dmesg | grep -caiE 'Bad page (state|map)|bad pte in process')"
+sync; echo "===== DLREPRO: powering off ====="; systemctl poweroff -i

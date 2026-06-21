@@ -1,0 +1,10 @@
+echo "===== HUGETLB A/B: login reached ====="
+echo "kernel=$(uname -r) page=$(getconf PAGESIZE)"
+mkdir -p /mnt/huge
+mount -t hugetlbfs none /mnt/huge && echo "hugetlbfs mounted"
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+echo "===== HUGETLB TEST ====="
+timeout 40 /usr/local/bin/hugetlb_test /mnt/huge; echo "===== HUGETLB rc=$? ====="
+sync
+echo "===== HUGETLB A/B: powering off ====="
+systemctl poweroff -i
