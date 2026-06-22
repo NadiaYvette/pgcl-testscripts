@@ -1,0 +1,62 @@
+pgcl-testscripts — licensing
+============================
+
+Copyright (c) 2026 Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+and contributors.
+
+This project (test scripts, QEMU/boot harnesses, reproducers, the rmap
+debug toolkit, nolibc bring-up inits, and supporting C/asm/Python/shell)
+is the original work of the copyright holder, assembled to develop and
+validate the Linux page-clustering (PGCL / "larpage") forward-port.
+
+Multi-license: your choice
+--------------------------
+
+Except where a particular file says otherwise in its own header, you may
+use, copy, modify, and redistribute any file in this repository under the
+terms of ANY ONE of the following licenses, at your option:
+
+    SPDX-License-Identifier: MIT OR BSD-3-Clause OR GPL-2.0-or-later
+
+  * the MIT License            (see LICENSES/MIT.txt),
+  * the BSD 3-Clause License   (see LICENSES/BSD-3-Clause.txt), or
+  * the GNU General Public License, version 2 or (at your option) any
+    later version (see LICENSES/GPL-2.0.txt).
+
+This disjunctive ("OR") choice is deliberate: it lets the material be
+reused in MIT-, BSD-, and GPL-style projects alike, including merging
+pieces upstream into the Linux kernel and the Linux Test Project (both
+GPL-2.0), without anyone having to ask.
+
+Per-file overrides
+------------------
+
+If an individual file carries its own SPDX-License-Identifier or license
+notice in its header, that notice governs THAT file and takes precedence
+over the blanket grant above.  (At the time of writing, no tracked file
+does; the whole repository is offered under the choice above.)
+
+Build-time third-party dependencies (not redistributed here)
+------------------------------------------------------------
+
+Some sources are *built against* external code that is fetched or
+generated at compile time and is NOT included in this repository, e.g.:
+
+  * the kernel nolibc headers (Linux tree, tools/include/nolibc/),
+  * a musl/Bootlin cross sysroot and copied kernel UAPI headers
+    (kept under userspace/sysroot/, which is .gitignored), and
+  * the Linux Test Project (LTP), which the matrix scripts *invoke*.
+
+Those carry their own upstream licenses (typically GPL-2.0,
+"GPL-2.0 WITH Linux-syscall-note", LGPL-2.1, or BSD).  Using this
+repository's original sources with them at build time does not change
+the license of the sources here, but the resulting binaries are of
+course subject to the terms of everything linked into them.
+
+Warranty
+--------
+
+The MIT, BSD-3-Clause, and GPL-2.0 texts each disclaim warranty and
+liability.  Those disclaimers apply only to the extent permitted by
+applicable law; nothing here is intended to exclude liability that
+cannot lawfully be excluded in your jurisdiction.
