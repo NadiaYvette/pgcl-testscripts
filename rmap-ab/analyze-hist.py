@@ -21,7 +21,8 @@ print the offending clusters' full histories with resolved call sites.
 import sys, struct, bisect, subprocess
 
 EREC = struct.Struct("<QQIiiBBBB")
-KIND = {0: "rc", 1: "mc", 2: "FREE", 3: "alloc", 4: "nonatomic"}
+KIND = {0: "rc", 1: "mc", 2: "FREE", 3: "alloc", 4: "nonatomic", 5: "map",
+        8: "swapout"}
 MMUSHIFT = 4
 
 def load(path, want=None):
@@ -37,7 +38,7 @@ def load(path, want=None):
         if seq == 0 or seq < lo or seq >= head:
             continue
         if want is not None:        # filter on read (memory-safe for huge dumps)
-            if kind in (0, 1, 5):
+            if kind in (0, 1, 5, 8):
                 if frame != want:
                     continue
             elif kind in (2, 3):
@@ -93,7 +94,7 @@ def main():
     bycpfn = {}
     for e in evs:
         seq, rip, frame, a, b, kind, cpu, off = e
-        if kind in (0, 1, 5):
+        if kind in (0, 1, 5, 8):
             bycpfn.setdefault(frame, []).append(e)
         elif kind in (2, 3):       # free/alloc may span clusters
             ncl = max(1, a >> MMUSHIFT)
@@ -110,6 +111,10 @@ def main():
             elif kind == 5:
                 print(f"  seq={seq:<10} map       cr3=0x{a:x}000 va=0x{rip:x} "
                       f"sub={off} gen={b} cpu{cpu}")
+            elif kind == 8:
+                print(f"  seq={seq:<10} swapout   pgd=0x{a:x}000 "
+                      f"nr={b & 0xff} sub_off={(b >> 8) & 0xff} "
+                      f"cpu{cpu} @{rip:016x} {sym(addrs,names,rip)}")
             else:
                 print(f"  seq={seq:<10} {KIND[kind]:9} count={a}")
 
@@ -130,8 +135,23 @@ def main():
                     break
         return out
 
+    PMC = 1 << MMUSHIFT     # PAGE_MMUCOUNT (pgcl4 = 16)
     if want_cpfn is not None:
         lst = bycpfn.get(want_cpfn, [])
+        # swap-out conversion coverage: which sub-offsets were ever converted?
+        conv = {}                       # pgd -> set of converted sub-offsets
+        for e in lst:
+            if e[5] == 8:                       # (seq,rip,frame,a=pgd,b=nr|sub<<8,...)
+                pgd, nr, soff = e[3], e[4] & 0xff, (e[4] >> 8) & 0xff
+                conv.setdefault(pgd, set()).update(range(soff, soff + nr))
+        if conv:
+            print(f"\n*** SWAP-OUT CONVERSION COVERAGE for cpfn=0x{want_cpfn:x} "
+                  f"(sub-PTEs 0..{PMC-1}) ***")
+            for pgd, subs in sorted(conv.items()):
+                miss = sorted(set(range(PMC)) - subs)
+                print(f"  pgd=0x{pgd:x}000: converted {sorted(subs)}"
+                      f"  NEVER-CONVERTED={miss}"
+                      f"{'  <- candidate orphan sub-PTEs' if miss else ''}")
         orph = orphans_for(want_cpfn, lst)
         print(f"\n*** ORPHAN/DANGLING PTEs on cpfn=0x{want_cpfn:x}: {len(orph)} "
               f"(mapping survives a FREE of the cpfn) ***")

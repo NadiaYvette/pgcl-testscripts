@@ -455,10 +455,10 @@ index b063a57..bfa80bc 100644
  
   stop_the_world:
 diff --git a/target/i386/cpu.c b/target/i386/cpu.c
-index 25bbbf7..57e159d 100644
+index 25bbbf7..7d2c331 100644
 --- a/target/i386/cpu.c
 +++ b/target/i386/cpu.c
-@@ -7856,6 +7856,72 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
+@@ -7856,6 +7856,85 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
  
      threads_per_pkg = x86_threads_per_pkg(topo_info);
  
@@ -468,6 +468,19 @@ index 25bbbf7..57e159d 100644
 +    if (index == 0x51430004u) {
 +        extern void pgcl_postmortem_walk(CPUX86State *env, uint64_t base);
 +        pgcl_postmortem_walk(env, env->regs[R_EBX]);
++        *eax = *ebx = *ecx = *edx = 0;
++        return;
++    }
++    /* PGCL #143 swap-out conversion log (leaf 0x51430005): ebx=cluster 4K base,
++     * ecx=mm pgd 4K frame, edx=nr_pages|sub_off<<8.  Ring it as kind 8 so the
++     * orphan cluster's conversion coverage can be checked offline. */
++    if (index == 0x51430005u) {
++        extern void pgcl_hist_put(uint8_t, uint32_t, int32_t, int32_t,
++                                  uint64_t, uint8_t, uint8_t);
++        pgcl_hist_put(8, (uint32_t)(env->regs[R_EBX] >> 4),
++                      (int32_t)env->regs[R_ECX], (int32_t)env->regs[R_EDX],
++                      env->eip + env->segs[R_CS].base,
++                      (uint8_t)env_cpu(env)->cpu_index, 0);
 +        *eax = *ebx = *ecx = *edx = 0;
 +        return;
 +    }
@@ -545,7 +558,7 @@ index 693a955..04a0988 100644
                          "CR3 update: CR3=" TARGET_FMT_lx "\n", new_cr3);
          tlb_flush(env_cpu(env));
 diff --git a/target/i386/tcg/system/excp_helper.c b/target/i386/tcg/system/excp_helper.c
-index f622b5d..c724e95 100644
+index f622b5d..7c2b21b 100644
 --- a/target/i386/tcg/system/excp_helper.c
 +++ b/target/i386/tcg/system/excp_helper.c
 @@ -22,6 +22,9 @@
@@ -558,7 +571,7 @@ index f622b5d..c724e95 100644
  #include "exec/page-protection.h"
  #include "exec/target_page.h"
  #include "exec/tlb-flags.h"
-@@ -139,6 +142,844 @@ static inline bool ptw_setl(const PTETranslate *in, uint32_t old, uint32_t set)
+@@ -139,6 +142,850 @@ static inline bool ptw_setl(const PTETranslate *in, uint32_t old, uint32_t set)
      return true;
  }
  
@@ -1015,10 +1028,16 @@ index f622b5d..c724e95 100644
 +            {
 +                extern void pgcl_hist_put(uint8_t, uint32_t, int32_t, int32_t,
 +                                          uint64_t, uint8_t, uint8_t);
-+                pgcl_hist_put(5, (uint32_t)(f >> PGCL_MMUSHIFT),
-+                              (int32_t)(root >> 12), (int32_t)pgcl_scan_gen, cva,
-+                              (uint8_t)env_cpu(env)->cpu_index,
-+                              (uint8_t)(f & ((1u << PGCL_MMUSHIFT) - 1)));
++                static int pgcl_mapsnap = -1;   /* off by default (too sparse + huge) */
++                if (pgcl_mapsnap < 0) {
++                    pgcl_mapsnap = getenv("PGCL_MAPSNAP") ? 1 : 0;
++                }
++                if (pgcl_mapsnap) {
++                    pgcl_hist_put(5, (uint32_t)(f >> PGCL_MMUSHIFT),
++                                  (int32_t)(root >> 12), (int32_t)pgcl_scan_gen,
++                                  cva, (uint8_t)env_cpu(env)->cpu_index,
++                                  (uint8_t)(f & ((1u << PGCL_MMUSHIFT) - 1)));
++                }
 +            }
 +            continue;
 +        }
@@ -1403,7 +1422,7 @@ index f622b5d..c724e95 100644
  static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
                            TranslateResult *out, TranslateFault *err,
                            uint64_t ra)
-@@ -306,6 +1147,12 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
+@@ -306,6 +1153,12 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
          /* combine pde and pte nx, user and rw protections */
          ptep &= pte ^ PG_NX_MASK;
          page_size = 4096;

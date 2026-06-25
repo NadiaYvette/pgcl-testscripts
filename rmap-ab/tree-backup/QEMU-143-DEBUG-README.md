@@ -161,3 +161,27 @@ patch to the host QEMU.  No-op without the QEMU side.
 These probes are general-purpose: any Linux VM/MM refcount/rmap/PTE-lifetime bug
 (use-after-free, dangling PTE, premature free, mapcount/refcount skew) can be
 chased the same way from outside the guest without perturbing the race.
+
+## Update: swap-out conversion capture (leaf 0x51430005)
+A cpuid in the guest's try_to_unmap_one anon swap-write logs each swap-out
+conversion (cluster 4K base, mm->pgd 4K frame, nr_pages|sub_off<<8) into the ring
+as kind 8.  `analyze-hist.py --cpfn 0xNN` then prints per-pgd SWAP-OUT CONVERSION
+COVERAGE (which of the 16 sub-PTEs each address space converted).  Guest hunk
+(apply to mm/rmap.c right after the PGCL swap-entry write loop):
+```c
+#if defined(CONFIG_X86_64)
+    { unsigned long _b = page_to_phys(subpage) >> MMUPAGE_SHIFT;
+      unsigned long _g = __pa(mm->pgd) >> MMUPAGE_SHIFT;
+      unsigned int _s = (address & (PAGE_SIZE-1)) >> MMUPAGE_SHIFT;
+      unsigned int _a=0x51430005u,_bb=_b,_c=_g,_d=(nr_pages&0xff)|(_s<<8);
+      asm volatile("cpuid":"=a"(_a),"=b"(_bb),"=c"(_c),"=d"(_d)
+                          :"0"(_a),"1"(_bb),"2"(_c),"3"(_d)); }
+#endif
+```
+FINDING: for a crashing victim cluster the swap-out converted ALL 16 sub-PTEs of
+the reclaimed sharer (coverage [0..15], no gap) -> swap-out is correct.  The
+orphan is a SECOND address space's mapping that has NO conversion event and whose
+16 present PTEs contributed ZERO to the folio mapcount/refcount (mapcount never
+exceeded one sharer's worth) and lack the fork tag -> a present anon PTE installed
+with no folio_get + no rmap.  NEXT probe: set_ptes install logging to catch that
+un-accounted install + RIP.
