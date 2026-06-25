@@ -1,0 +1,76 @@
+diff --git a/mm/debug.c b/mm/debug.c
+index 77fa8fe1d641..bea9e8c21551 100644
+--- a/mm/debug.c
++++ b/mm/debug.c
+@@ -136,6 +136,20 @@ static void __dump_page(const struct page *page)
+ 		pr_warn("page does not match folio\n");
+ 
+ 	__dump_folio(&ps.folio_snapshot, &ps.page_snapshot, ps.pfn, ps.idx);
++#if defined(CONFIG_X86_64)
++	/* #143 post-mortem: when the kernel dumps a bad/victim page, signal QEMU
++	 * (magic cpuid leaf 0x51430004, ebx = 4K-frame base) to walk EVERY pgd and
++	 * print every (cr3,va) still mapping this cluster = the dangling/stale PTE
++	 * that escaped the refcount/mapcount accounting.  Fires at the crash, so it
++	 * does not perturb the race timing. */
++	{
++		unsigned long base = page_to_phys((struct page *)page) >> MMUPAGE_SHIFT;
++		unsigned int a = 0x51430004u, b, c, d;
++
++		asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
++				     : "0"(a), "1"(base), "2"(0UL));
++	}
++#endif
+ }
+ 
+ void dump_page(const struct page *page, const char *reason)
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index d49c254174da..e03130eeb6a7 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -1303,6 +1303,29 @@ static inline void pgalloc_tag_sub_pages(struct alloc_tag *tag, unsigned int nr)
+ 
+ #endif /* CONFIG_MEM_ALLOC_PROFILING */
+ 
++#if defined(CONFIG_X86_64)  /* #143: enabled at PGCL=0 too, for the control */
++/*
++ * #143 DIAGNOSTIC (revert before real builds): signal page free(1)/alloc(0) to
++ * the host QEMU dangling-PTE probe via magic cpuid leaf 0x5143000{1,0}
++ * (ebx=guest 4K-frame base, ecx=#frames).  QEMU validates that no present USER
++ * PTE still maps a frame being freed = a dangling PTE, at the instant of free,
++ * from OUTSIDE the kernel (no latency in the rmap race path).
++ */
++static __always_inline void pgcl143_qsig(struct page *page, unsigned int order,
++					 int freed)
++{
++	unsigned long base = page_to_phys(page) >> MMUPAGE_SHIFT;
++	unsigned long cnt = (unsigned long)PAGE_MMUCOUNT << order;
++	unsigned int a = 0x51430000u | (freed & 1), b, c, d;
++
++	asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
++			     : "0"(a), "1"(base), "2"(cnt));
++}
++#else
++static __always_inline void pgcl143_qsig(struct page *page, unsigned int order,
++					 int freed) { }
++#endif
++
+ __always_inline bool __free_pages_prepare(struct page *page,
+ 					  unsigned int order, fpi_t fpi_flags)
+ {
+@@ -1434,6 +1457,7 @@ __always_inline bool __free_pages_prepare(struct page *page,
+ 
+ 	debug_pagealloc_unmap_pages(page, 1 << order);
+ 
++	pgcl143_qsig(page, order, 1);		/* #143 diag: freed (all paths) */
+ 	return true;
+ }
+ 
+@@ -1853,6 +1877,8 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
+ 	set_page_owner(page, order, gfp_flags);
+ 	page_table_check_alloc(page, order);
+ 	pgalloc_tag_add(page, current, 1 << order);
++
++	pgcl143_qsig(page, order, 0);		/* #143 diag: alloc (clear freed) */
+ }
+ 
+ static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,

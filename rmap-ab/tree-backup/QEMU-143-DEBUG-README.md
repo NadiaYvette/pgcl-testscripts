@@ -123,3 +123,41 @@ write-watchpoint so every write (atomic+non-atomic) is logged.  (b) a large
 RAM-ring history of every struct-page field write (seq,cpfn,off,oldval,rip,cpu)
 so the symptom can be rewound to the causal operation OFFLINE (no perturbing
 online checks).
+
+## Update: deep-history ring + post-mortem dangling-PTE walk (root-cause finders)
+Two additions that together localized #143 to the swap path:
+
+### Deep-history ring (accel/tcg/cputlb.c, env PGCL_HISTGB=<GiB>)
+A big RAM ring logging EVERY struct-page refcount/mapcount write (both counts
+before the op + exact guest RIP + cpu) plus every free/alloc event, dumped to
+PGCL_HISTFILE (default rmap-ab/pgcl-hist.bin) once at exit (no per-event disk
+I/O => low perturbation; a whole run is only ~4M events / ~138MB).  Offline
+analyzer `rmap-ab/analyze-hist.py <dump> <vmlinux> [--cpfn 0xNNN]` reconstructs
+each cluster's full trajectory, flags FREED-WHILE-MAPPED / USE-AFTER-FREE /
+ORPHAN (mapping surviving a free), and resolves RIPs via `nm -n`.  Finding: the
+victim's accounting is BALANCED yet it's the crash pfn => a dangling PTE outside
+the accounting, not a miscount.
+
+### Post-mortem dangling-PTE walk (kernel dump_page -> QEMU pgd walk)
+Kernel side (qemu-143-kernel-channel.patch, mm/debug.c __dump_page): emits magic
+cpuid leaf 0x51430004 (ebx = 4K-frame base) whenever the kernel dumps a
+bad/victim page.  QEMU side (target/i386/cpu.c + excp_helper.c
+`pgcl_postmortem_walk`): walks the faulting cr3 + every tracked live pgd for any
+present USER PTE still mapping that cluster and prints (cr3,va,sub,pte).  Fires
+at the crash => ZERO race perturbation (unlike a per-free walk, which suppresses
+the race).  Finding: the orphan is a COMPLETE single-process 64K cluster mapping
+(all 16 sub-PTEs) dangling while the cluster is freed+recycled -> the crashing
+process reads reused memory -> ip=0.  Cross-referenced with the crash WARNs
+(do_swap_page check_swap_exclusive __swap_count!=1 + folio_add_anon_rmap_ptes
+AnonExclusive&&_mapcount>0) this localizes #143 to the PGCL swap-out path
+(try_to_unmap_one writing one shared swap slot across the cluster's 16 sub-PTEs
+without matching swap-count batching).
+
+### Kernel channel patch
+`qemu-143-kernel-channel.patch` (mm/page_alloc.c qsig + mm/debug.c dump_page
+cpuid) is the REQUIRED guest-kernel side; apply to the guest kernel, the QEMU
+patch to the host QEMU.  No-op without the QEMU side.
+
+These probes are general-purpose: any Linux VM/MM refcount/rmap/PTE-lifetime bug
+(use-after-free, dangling PTE, premature free, mapcount/refcount skew) can be
+chased the same way from outside the guest without perturbing the race.

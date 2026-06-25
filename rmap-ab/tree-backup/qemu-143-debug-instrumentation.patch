@@ -1,5 +1,5 @@
 diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
-index b063a57..3b238c9 100644
+index b063a57..bfa80bc 100644
 --- a/accel/tcg/cputlb.c
 +++ b/accel/tcg/cputlb.c
 @@ -408,6 +408,185 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
@@ -233,7 +233,7 @@ index b063a57..3b238c9 100644
      /* Now calculate the new entry */
      tn.addend = addend - addr_page;
  
-@@ -1810,6 +1999,122 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
+@@ -1810,6 +1999,212 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
   * Probe for an atomic operation.  Do not allow unaligned operations,
   * or io operations to proceed.  Return the host address.
   */
@@ -260,6 +260,74 @@ index b063a57..3b238c9 100644
 +static struct pgcl_rcc *pgcl_rc;
 +static int pgcl_rc_armed = -1;
 +
++/* #143 DEEP HISTORY: a big global ring of EVERY refcount/mapcount write plus
++ * every free/alloc event, so the symptom (a premature free / corruption) can be
++ * rewound OFFLINE to the causal operation -- no perturbing online walk.  One
++ * qatomic fetch-inc yields a unique seq AND ring slot; the ring overwrites the
++ * oldest.  Sized by PGCL_HISTGB (GiB, off if unset); dumped to PGCL_HISTFILE
++ * (default rmap-ab/pgcl-hist.bin) once at exit (no per-event disk I/O). */
++struct pgcl_hev {
++    uint64_t seq;
++    uint64_t rip;
++    uint32_t frame;     /* cpfn (rc/mc write) or base cpfn (free/alloc) */
++    int32_t  a;         /* writes: refcount-before; free/alloc: 4K-frame count */
++    int32_t  b;         /* writes: mapcount-before; free/alloc: 0 */
++    uint8_t  kind;      /* 0=rc write 1=mc write 2=free 3=alloc 4=nonatomic */
++    uint8_t  cpu;
++    uint8_t  off;       /* 48 (mc) or 52 (rc) */
++    uint8_t  pad;
++};
++static struct pgcl_hev *pgcl_hist;
++static unsigned long pgcl_hist_n;          /* ring capacity (entries) */
++static unsigned long pgcl_hist_head;       /* atomic global counter == seq */
++
++void pgcl_hist_put(uint8_t kind, uint32_t frame, int32_t a, int32_t b,
++                   uint64_t rip, uint8_t cpu, uint8_t off);
++void pgcl_hist_put(uint8_t kind, uint32_t frame, int32_t a, int32_t b,
++                   uint64_t rip, uint8_t cpu, uint8_t off)
++{
++    unsigned long i;
++    struct pgcl_hev *e;
++    if (!pgcl_hist) {
++        return;
++    }
++    i = qatomic_fetch_inc(&pgcl_hist_head);
++    e = &pgcl_hist[i % pgcl_hist_n];
++    e->seq = i; e->rip = rip; e->frame = frame; e->a = a; e->b = b;
++    e->kind = kind; e->cpu = cpu; e->off = off; e->pad = 0;
++}
++
++static void pgcl_hist_dump(void)
++{
++    const char *path = getenv("PGCL_HISTFILE");
++    uint64_t hdr[4];
++    FILE *f;
++    if (!pgcl_hist) {
++        return;
++    }
++    if (!path) {
++        path = "/home/nyc/src/pgcl/rmap-ab/pgcl-hist.bin";
++    }
++    f = fopen(path, "wb");
++    if (!f) {
++        fprintf(stderr, "PGCL143hist: dump open FAIL %s\n", path);
++        return;
++    }
++    /* slots 0..min(head,n)-1 cover all valid entries (not-wrapped: prefix;
++     * wrapped: all n) -- avoids writing GiB of unused zeros for short runs. */
++    unsigned long ndump = pgcl_hist_head < pgcl_hist_n
++                        ? pgcl_hist_head : pgcl_hist_n;
++    hdr[0] = 0x504743484953544cULL;   /* magic "PGCHISTL" */
++    hdr[1] = pgcl_hist_head;          /* total events (>= valid in ring) */
++    hdr[2] = ndump;                   /* entries actually written */
++    hdr[3] = sizeof(struct pgcl_hev);
++    fwrite(hdr, sizeof hdr, 1, f);
++    fwrite(pgcl_hist, sizeof(struct pgcl_hev), ndump, f);
++    fclose(f);
++    fprintf(stderr, "PGCL143hist: dumped %lu/%lu events (ring cap %lu) -> %s\n",
++            ndump, pgcl_hist_head, pgcl_hist_n, path);
++}
++
 +static inline void pgcl_rc_record(CPUState *cpu, vaddr addr, void *host,
 +                                  uintptr_t retaddr)
 +{
@@ -268,10 +336,27 @@ index b063a57..3b238c9 100644
 +    int32_t v, sib;
 +
 +    if (pgcl_rc_armed < 0) {
++        const char *gb = getenv("PGCL_HISTGB");
 +        pgcl_rc_armed = getenv("PGCL_RCHIST") ? 1 : 0;
 +        if (pgcl_rc_armed) {
 +            pgcl_rc = g_malloc0((size_t)PGCL_RC_NCLUSTER * sizeof(*pgcl_rc));
 +            fprintf(stderr, "PGCL143: refcount/mapcount write-history ACTIVE\n");
++        }
++        if (gb) {
++            size_t bytes = (size_t)strtoul(gb, NULL, 10) << 30;
++            pgcl_hist_n = bytes / sizeof(struct pgcl_hev);
++            pgcl_hist = mmap(NULL, pgcl_hist_n * sizeof(struct pgcl_hev),
++                             PROT_READ | PROT_WRITE,
++                             MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
++            if (pgcl_hist == MAP_FAILED) {
++                pgcl_hist = NULL;
++                fprintf(stderr, "PGCL143hist: mmap FAIL\n");
++            } else {
++                pgcl_hist_head = 1;     /* seq 0 == unused slot (mmap-zeroed) */
++                atexit(pgcl_hist_dump);
++                fprintf(stderr, "PGCL143hist: deep-history ring %lu entries"
++                        " (%s GiB) ACTIVE\n", pgcl_hist_n, gb);
++            }
 +        }
 +    }
 +    if (pgcl_rc_armed != 1 || addr < PGCL_RC_VMEMMAP) {
@@ -303,6 +388,11 @@ index b063a57..3b238c9 100644
 +            rip = pcbase;
 +        }
 +    }
++    /* deep-history ring: every rc/mc write, BOTH counts before the op + RIP.
++     * (off52 -> v is refcount, sib is mapcount; off48 -> reversed.) */
++    pgcl_hist_put(off == 52 ? 0 : 1, (uint32_t)cl,
++                  off == 52 ? v : sib, off == 52 ? sib : v, rip,
++                  (uint8_t)cpu->cpu_index, (uint8_t)off);
 +    c = &pgcl_rc[cl];
 +    c->e[c->head].rip = rip;
 +    c->e[c->head].val = v;
@@ -356,7 +446,7 @@ index b063a57..3b238c9 100644
  static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
                                 int size, uintptr_t retaddr)
  {
-@@ -1910,6 +2215,7 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
+@@ -1910,6 +2305,7 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
                               full->attrs, wp_flags, retaddr);
      }
  
@@ -365,13 +455,22 @@ index b063a57..3b238c9 100644
  
   stop_the_world:
 diff --git a/target/i386/cpu.c b/target/i386/cpu.c
-index 25bbbf7..3a73e5e 100644
+index 25bbbf7..57e159d 100644
 --- a/target/i386/cpu.c
 +++ b/target/i386/cpu.c
-@@ -7856,6 +7856,63 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
+@@ -7856,6 +7856,72 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
  
      threads_per_pkg = x86_threads_per_pkg(topo_info);
  
++    /* PGCL #143 post-mortem: dump_page() signals (leaf 0x51430004, ebx=4K base)
++     * -> walk every pgd for any present USER PTE still mapping this cluster =
++     * the dangling/stale PTE (the bug), printed with (cr3,va).  Fires at crash. */
++    if (index == 0x51430004u) {
++        extern void pgcl_postmortem_walk(CPUX86State *env, uint64_t base);
++        pgcl_postmortem_walk(env, env->regs[R_EBX]);
++        *eax = *ebx = *ecx = *edx = 0;
++        return;
++    }
 +    /* PGCL #143: magic dangling-PTE free/alloc signal from the guest kernel. */
 +    if ((index & 0xfffffffeu) == 0x51430000u) {
 +        extern void pgcl_dangle_signal(CPUX86State *env, uint64_t base,
@@ -446,7 +545,7 @@ index 693a955..04a0988 100644
                          "CR3 update: CR3=" TARGET_FMT_lx "\n", new_cr3);
          tlb_flush(env_cpu(env));
 diff --git a/target/i386/tcg/system/excp_helper.c b/target/i386/tcg/system/excp_helper.c
-index f622b5d..b0cd526 100644
+index f622b5d..c724e95 100644
 --- a/target/i386/tcg/system/excp_helper.c
 +++ b/target/i386/tcg/system/excp_helper.c
 @@ -22,6 +22,9 @@
@@ -459,7 +558,7 @@ index f622b5d..b0cd526 100644
  #include "exec/page-protection.h"
  #include "exec/target_page.h"
  #include "exec/tlb-flags.h"
-@@ -139,6 +142,752 @@ static inline bool ptw_setl(const PTETranslate *in, uint32_t old, uint32_t set)
+@@ -139,6 +142,844 @@ static inline bool ptw_setl(const PTETranslate *in, uint32_t old, uint32_t set)
      return true;
  }
  
@@ -909,6 +1008,18 @@ index f622b5d..b0cd526 100644
 +                pgcl_rmap[f].cr3 = root;
 +                pgcl_rmap[f].va = cva;
 +            }
++            /* deep-history: a mapping snapshot (kind 5) per present USER leaf.
++             * A (cr3,va)->cpfn mapping that PERSISTS across a FREE of cpfn = the
++             * orphaned/dangling PTE (unmap decremented counts but left the PTE).
++             * a=cr3 frame, b=scan_gen, rip=va, off=sub-index. */
++            {
++                extern void pgcl_hist_put(uint8_t, uint32_t, int32_t, int32_t,
++                                          uint64_t, uint8_t, uint8_t);
++                pgcl_hist_put(5, (uint32_t)(f >> PGCL_MMUSHIFT),
++                              (int32_t)(root >> 12), (int32_t)pgcl_scan_gen, cva,
++                              (uint8_t)env_cpu(env)->cpu_index,
++                              (uint8_t)(f & ((1u << PGCL_MMUSHIFT) - 1)));
++            }
 +            continue;
 +        }
 +        if (e & 0x80) {
@@ -1106,6 +1217,78 @@ index f622b5d..b0cd526 100644
 +    return hits;
 +}
 +
++/* #143 post-mortem: print EVERY present USER leaf into cluster `cl` in one pgd. */
++static void pgcl_pm_print(CPUX86State *env, uint64_t tbl, int lvl, uint64_t va,
++                          uint64_t cl, uint64_t cr3, int *n)
++{
++    static const int sh[4] = { 39, 30, 21, 12 };
++    int i, hi = (lvl == 0) ? 256 : 512;
++
++    for (i = 0; i < hi; i++) {
++        uint64_t pa = tbl + (uint64_t)i * 8, e, cva;
++
++        if (pa >= PGCL_RAMLIMIT) {
++            continue;
++        }
++        e = cpu_ldq_mmuidx_ra(env, pa, MMU_PHYS_IDX, 0);
++        if (!(e & 1) || !(e & 4)) {
++            continue;
++        }
++        cva = va | ((uint64_t)i << sh[lvl]);
++        if (lvl == 3) {
++            uint64_t f = (e & 0x000ffffffffff000ULL) >> 12;
++            if ((f >> PGCL_MMUSHIFT) == cl) {
++                if (*n < 256) {
++                    fprintf(stderr, "PGCL143PM   cl=0x%" PRIx64 " frame=0x%"
++                            PRIx64 " sub=%u cr3=0x%" PRIx64 " va=0x%" PRIx64
++                            " pte=0x%" PRIx64 "\n", cl, f,
++                            (unsigned)(f & ((1u << PGCL_MMUSHIFT) - 1)),
++                            cr3, cva, e);
++                }
++                (*n)++;
++            }
++            continue;
++        }
++        if (e & 0x80) {
++            continue;
++        }
++        pgcl_pm_print(env, e & 0x000ffffffffff000ULL, lvl + 1, cva, cl, cr3, n);
++    }
++}
++
++/* Post-mortem (called from dump_page via magic cpuid 0x51430004, ebx=4K base):
++ * walk the FAULTING pgd + every tracked live pgd for any present USER PTE still
++ * mapping the just-dumped cluster.  Any hit = the dangling/stale PTE that the
++ * refcount/mapcount accounting never tracked -- the #143 root cause -- shown
++ * with (cr3,va,sub).  One-time at the crash => zero race perturbation. */
++void pgcl_postmortem_walk(CPUX86State *env, uint64_t base);
++void pgcl_postmortem_walk(CPUX86State *env, uint64_t base)
++{
++    uint64_t cl = base >> PGCL_MMUSHIFT;
++    uint64_t cur = env->cr[3] & 0x000ffffffffff000ULL;
++    int i, n = 0;
++
++    if (!pgcl_dangle_on()) {
++        return;
++    }
++    fprintf(stderr, "PGCL143PM-walk base=0x%" PRIx64 " cl=0x%" PRIx64
++            " faulting_cr3=0x%" PRIx64 " npgd=%d\n", base, cl, cur, pgcl_npgd);
++    /* the faulting process first (its context ran dump_page) */
++    if (cur && cur < PGCL_RAMLIMIT) {
++        pgcl_pm_print(env, cur, 0, 0, cl, cur, &n);
++    }
++    /* then every other tracked live pgd (fork-sharers, other processes) */
++    for (i = 0; i < pgcl_npgd; i++) {
++        if (pgcl_pgds[i] == cur || !pgcl_pgd_live(env, pgcl_pgds[i])) {
++            continue;
++        }
++        pgcl_pm_print(env, pgcl_pgds[i], 0, 0, cl, pgcl_pgds[i], &n);
++    }
++    fprintf(stderr, "PGCL143PM-walk cl=0x%" PRIx64 " total_present_USER_PTEs=%d"
++            " (cluster is being dumped/freed: any PTE here is DANGLING)\n",
++            cl, n);
++}
++
 +void pgcl_dangle_signal(CPUX86State *env, uint64_t base, uint64_t count,
 +                        int freed);
 +void pgcl_dangle_signal(CPUX86State *env, uint64_t base, uint64_t count,
@@ -1164,6 +1347,14 @@ index f622b5d..b0cd526 100644
 +    } else {
 +        pgcl_n_alloc++;
 +    }
++    /* deep-history ring: one free(2)/alloc(3) event per qsig (base cpfn, count) */
++    {
++        extern void pgcl_hist_put(uint8_t, uint32_t, int32_t, int32_t,
++                                  uint64_t, uint8_t, uint8_t);
++        pgcl_hist_put(freed ? 2 : 3, (uint32_t)(base >> PGCL_MMUSHIFT),
++                      (int32_t)count, 0, 0,
++                      (uint8_t)env_cpu(env)->cpu_index, 0);
++    }
 +    for (i = 0; i < count; i++) {
 +        uint64_t f = base + i;
 +        if (f >= pgcl_nframes) {
@@ -1212,7 +1403,7 @@ index f622b5d..b0cd526 100644
  static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
                            TranslateResult *out, TranslateFault *err,
                            uint64_t ra)
-@@ -306,6 +1055,12 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
+@@ -306,6 +1147,12 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
          /* combine pde and pte nx, user and rw protections */
          ptep &= pte ^ PG_NX_MASK;
          page_size = 4096;
