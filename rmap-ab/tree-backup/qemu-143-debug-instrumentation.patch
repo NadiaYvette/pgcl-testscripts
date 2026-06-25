@@ -1,0 +1,618 @@
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+index b063a57..5ce5062 100644
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -408,6 +408,185 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
+     }
+ }
+ 
++/*
++ * PGCL #143 over-flush probe: when env PGCL_OVERFLUSH is set, escalate every
++ * guest page/range TLB flush to a FULL flush.  If the bug is the kernel failing
++ * to invalidate a cluster's sibling sub-PTEs (leaving stale softmmu-TLB
++ * entries), this papers over exactly that gap and the repro goes clean ->
++ * confirms a TLB-flush gap.  Toggle without rebuilding via the env var.
++ */
++static bool pgcl_overflush_on(void)
++{
++    static int v = -1;
++    if (v < 0) {
++        v = !!getenv("PGCL_OVERFLUSH");
++        if (v)
++            fprintf(stderr, "PGCL143: over-flush ACTIVE\n");
++    }
++    return v;
++}
++
++/*
++ * PGCL #143 TLB-scan catcher: record per-frame the last USER (cpu,vaddr) that
++ * filled a softmmu-TLB entry for it; when the guest kernel signals a page FREE
++ * (magic cpuid), verify that USER TLB entry is still live and still maps the
++ * frame being freed.  A live USER mapping (present-dangler OR stale TLB) to a
++ * frame the kernel is freeing == the #143 use-after-free, caught at the instant
++ * of free with cpu+vaddr.  Records actually-accessed mappings, so it sidesteps
++ * the page-table-walk "churn" problem.  Armed by env PGCL_TLBSCAN.  x86 USER
++ * mmu indices = 2 (USER64) / 3 (USER32).
++ */
++#define PGCL_TS_NFRAMES (2ULL << 20)        /* 8G / 4K */
++static uint64_t *pgcl_ts_own;               /* vaddr_page | cpu<<1 | valid */
++static unsigned long pgcl_ts_hits;
++static unsigned long pgcl_ts_alloc_hits;
++static int pgcl_ts_armed = -1;
++
++static int pgcl_ts_on(void)
++{
++    if (pgcl_ts_armed < 0) {
++        pgcl_ts_armed = getenv("PGCL_TLBSCAN") ? 1 : 0;
++        if (pgcl_ts_armed) {
++            pgcl_ts_own = g_malloc0(PGCL_TS_NFRAMES * sizeof(uint64_t));
++            fprintf(stderr, "PGCL143: TLB-scan catcher ACTIVE\n");
++        }
++    }
++    return pgcl_ts_armed;
++}
++
++static void pgcl_ts_record(CPUState *cpu, vaddr addr, hwaddr phys)
++{
++    uint64_t frame = phys >> TARGET_PAGE_BITS;
++    if (!pgcl_ts_on() || !pgcl_ts_own || frame >= PGCL_TS_NFRAMES) {
++        return;
++    }
++    pgcl_ts_own[frame] = (addr & TARGET_PAGE_MASK) |
++                         ((uint64_t)cpu->cpu_index << 1) | 1;
++}
++
++int pgcl_ts_on_free(uint64_t base, uint64_t count);
++int pgcl_ts_on_free(uint64_t base, uint64_t count)
++{
++    uint64_t f;
++    int caught = 0;
++    if (!pgcl_ts_on() || !pgcl_ts_own) {
++        return 0;
++    }
++    for (f = base; f < base + count && f < PGCL_TS_NFRAMES; f++) {
++        uint64_t own = pgcl_ts_own[f];
++        CPUState *cpu;
++        CPUTLBEntry *te;
++        CPUTLBEntryFull *full;
++        uintptr_t idx;
++        vaddr va;
++        int ci;
++
++        if (!(own & 1)) {
++            continue;
++        }
++        va = own & TARGET_PAGE_MASK;
++        ci = (own >> 1) & 0x7ff;
++        cpu = qemu_get_cpu(ci);
++        if (!cpu || !cpu->neg.tlb.f[2].table) {
++            continue;
++        }
++        idx = (va >> TARGET_PAGE_BITS) &
++              (cpu->neg.tlb.f[2].mask >> CPU_TLB_ENTRY_BITS);
++        te = &cpu->neg.tlb.f[2].table[idx];
++        if ((te->addr_read & TLB_INVALID_MASK) ||
++            (te->addr_read & TARGET_PAGE_MASK) != (va & TARGET_PAGE_MASK)) {
++            continue;                       /* evicted/replaced: not live */
++        }
++        full = &cpu->neg.tlb.d[2].fulltlb[idx];
++        if ((full->phys_addr >> TARGET_PAGE_BITS) != f) {
++            continue;
++        }
++        caught++;
++        if (pgcl_ts_hits < 64) {
++            /* Distinguish present-dangler (PTE still maps f) from stale-TLB
++             * (PTE cleared, TLB not flushed): walk cpu ci's CURRENT page table. */
++            hwaddr pp = cpu_get_phys_page_debug(cpu, va);
++            int ptemap = (pp != (hwaddr)-1) &&
++                         ((pp >> TARGET_PAGE_BITS) == f);
++            pgcl_ts_hits++;
++            fprintf(stderr,
++                "PGCL143tlbscan #%lu: FREE-WHILE-USER-MAPPED frame=0x%" PRIx64
++                " live USER tlb cpu=%d va=0x%" PRIx64 " writable=%d"
++                " pte_maps_frame=%d\n",
++                pgcl_ts_hits, f, ci, (uint64_t)va,
++                !(te->addr_write & TLB_INVALID_MASK), ptemap);
++        }
++    }
++    return caught;
++}
++
++int pgcl_ts_on_alloc(uint64_t base, uint64_t count);
++int pgcl_ts_on_alloc(uint64_t base, uint64_t count)
++{
++    uint64_t f;
++    int caught = 0;
++    if (!pgcl_ts_own) {
++        return 0;
++    }
++    /*
++     * #143 SMOKING GUN: a frame handed to a NEW owner (alloc) while a USER TLB
++     * entry from the PREVIOUS owner is STILL LIVE mapping it.  Unlike the free
++     * catch (benign if a flush lands before reuse), this is the corruption
++     * window itself: the stale entry survived free->realloc with no flush, so
++     * the old VA now reads/writes the new owner's page.  Verify against the
++     * actual current TLB (same liveness test as pgcl_ts_on_free), then clear.
++     */
++    for (f = base; f < base + count && f < PGCL_TS_NFRAMES; f++) {
++        uint64_t own = pgcl_ts_own[f];
++        CPUState *cpu;
++        CPUTLBEntry *te;
++        CPUTLBEntryFull *full;
++        uintptr_t idx;
++        vaddr va;
++        int ci;
++
++        if (!(own & 1)) {
++            continue;
++        }
++        va = own & TARGET_PAGE_MASK;
++        ci = (own >> 1) & 0x7ff;
++        cpu = qemu_get_cpu(ci);
++        if (!cpu || !cpu->neg.tlb.f[2].table) {
++            pgcl_ts_own[f] = 0;
++            continue;
++        }
++        idx = (va >> TARGET_PAGE_BITS) &
++              (cpu->neg.tlb.f[2].mask >> CPU_TLB_ENTRY_BITS);
++        te = &cpu->neg.tlb.f[2].table[idx];
++        if ((te->addr_read & TLB_INVALID_MASK) ||
++            (te->addr_read & TARGET_PAGE_MASK) != (va & TARGET_PAGE_MASK)) {
++            pgcl_ts_own[f] = 0;             /* evicted/replaced: not live */
++            continue;
++        }
++        full = &cpu->neg.tlb.d[2].fulltlb[idx];
++        if ((full->phys_addr >> TARGET_PAGE_BITS) != f) {
++            pgcl_ts_own[f] = 0;
++            continue;
++        }
++        /* Live USER TLB entry into a frame being re-allocated == corruption. */
++        caught++;
++        if (pgcl_ts_alloc_hits < 64) {
++            hwaddr pp = cpu_get_phys_page_debug(cpu, va);
++            int ptemap = (pp != (hwaddr)-1) &&
++                         ((pp >> TARGET_PAGE_BITS) == f);
++            pgcl_ts_alloc_hits++;
++            fprintf(stderr,
++                "PGCL143tlbscan ALLOC #%lu: ALLOC-INTO-STALE-MAPPED frame=0x%"
++                PRIx64 " live USER tlb cpu=%d va=0x%" PRIx64 " writable=%d"
++                " pte_maps_frame=%d\n",
++                pgcl_ts_alloc_hits, f, ci, (uint64_t)va,
++                !(te->addr_write & TLB_INVALID_MASK), ptemap);
++        }
++        pgcl_ts_own[f] = 0;
++    }
++    return caught;
++}
++
+ void tlb_flush_by_mmuidx(CPUState *cpu, uint16_t idxmap)
+ {
+     tlb_debug("mmu_idx: 0x%" PRIx16 "\n", idxmap);
+@@ -601,6 +780,7 @@ static void tlb_flush_page_by_mmuidx_async_2(CPUState *cpu,
+ 
+ void tlb_flush_page_by_mmuidx(CPUState *cpu, vaddr addr, uint16_t idxmap)
+ {
++    if (pgcl_overflush_on()) { tlb_flush(cpu); return; }
+     tlb_debug("addr: %016" VADDR_PRIx " mmu_idx:%" PRIx16 "\n", addr, idxmap);
+ 
+     assert_cpu_is_self(cpu);
+@@ -620,6 +800,7 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
+                                               vaddr addr,
+                                               uint16_t idxmap)
+ {
++    if (pgcl_overflush_on()) { tlb_flush_all_cpus_synced(src_cpu); return; }
+     tlb_debug("addr: %016" VADDR_PRIx " mmu_idx:%"PRIx16"\n", addr, idxmap);
+ 
+     /* This should already be page aligned */
+@@ -771,6 +952,7 @@ void tlb_flush_range_by_mmuidx(CPUState *cpu, vaddr addr,
+ {
+     TLBFlushRangeData d;
+ 
++    if (pgcl_overflush_on()) { tlb_flush(cpu); return; }
+     assert_cpu_is_self(cpu);
+ 
+     /* If no page bits are significant, this devolves to tlb_flush. */
+@@ -811,6 +993,8 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
+     TLBFlushRangeData d, *p;
+     CPUState *dst_cpu;
+ 
++    if (pgcl_overflush_on()) { tlb_flush_all_cpus_synced(src_cpu); return; }
++
+     /* If no page bits are significant, this devolves to tlb_flush. */
+     if (bits < TARGET_PAGE_BITS) {
+         tlb_flush_by_mmuidx_all_cpus_synced(src_cpu, idxmap);
+@@ -1158,6 +1342,11 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
+     full->xlat_section = iotlb - addr_page;
+     full->phys_addr = paddr_page;
+ 
++    /* #143 TLB-scan: record USER (x86 idx 2=USER64 / 3=USER32) fills. */
++    if (mmu_idx == 2 || mmu_idx == 3) {
++        pgcl_ts_record(cpu, addr, paddr_page);
++    }
++
+     /* Now calculate the new entry */
+     tn.addend = addend - addr_page;
+ 
+diff --git a/target/i386/cpu.c b/target/i386/cpu.c
+index 25bbbf7..3a73e5e 100644
+--- a/target/i386/cpu.c
++++ b/target/i386/cpu.c
+@@ -7856,6 +7856,63 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
+ 
+     threads_per_pkg = x86_threads_per_pkg(topo_info);
+ 
++    /* PGCL #143: magic dangling-PTE free/alloc signal from the guest kernel. */
++    if ((index & 0xfffffffeu) == 0x51430000u) {
++        extern void pgcl_dangle_signal(CPUX86State *env, uint64_t base,
++                                       uint64_t count, int freed);
++        extern int pgcl_ts_on_free(uint64_t base, uint64_t count);
++        extern int pgcl_ts_on_alloc(uint64_t base, uint64_t count);
++        pgcl_dangle_signal(env, env->regs[R_EBX], count, index & 1);
++        if (index & 1) {
++            if (pgcl_ts_on_free(env->regs[R_EBX], count) > 0) {
++                /* #143: a catch -> dump the guest kernel stack = the free path */
++                static int sdcap;
++                if (sdcap < 6) {
++                    uint64_t stk[64];
++                    int i;
++                    sdcap++;
++                    if (cpu_memory_rw_debug(env_cpu(env), env->regs[R_ESP],
++                                            stk, sizeof(stk), false) == 0) {
++                        fprintf(stderr, "PGCL143freepath rsp=0x%llx:\n",
++                                (unsigned long long)env->regs[R_ESP]);
++                        for (i = 0; i < 64; i++) {
++                            if (stk[i] >= 0xffffffff81000000ULL &&
++                                stk[i] <  0xffffffff82a00000ULL) {
++                                fprintf(stderr, "  %016llx\n",
++                                        (unsigned long long)stk[i]);
++                            }
++                        }
++                    }
++                }
++            }
++        } else {
++            if (pgcl_ts_on_alloc(env->regs[R_EBX], count) > 0) {
++                /* #143 SMOKING GUN: stale-mapped frame reused -> dump the
++                 * allocating guest kernel stack = who gets the corrupted page */
++                static int sacap;
++                if (sacap < 6) {
++                    uint64_t stk[64];
++                    int i;
++                    sacap++;
++                    if (cpu_memory_rw_debug(env_cpu(env), env->regs[R_ESP],
++                                            stk, sizeof(stk), false) == 0) {
++                        fprintf(stderr, "PGCL143allocpath rsp=0x%llx:\n",
++                                (unsigned long long)env->regs[R_ESP]);
++                        for (i = 0; i < 64; i++) {
++                            if (stk[i] >= 0xffffffff81000000ULL &&
++                                stk[i] <  0xffffffff82a00000ULL) {
++                                fprintf(stderr, "  %016llx\n",
++                                        (unsigned long long)stk[i]);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        *eax = *ebx = *ecx = *edx = 0;
++        return;
++    }
++
+     /* Calculate & apply limits for different index ranges */
+     if (index >= 0xC0000000) {
+         limit = env->cpuid_xlevel2;
+diff --git a/target/i386/helper.c b/target/i386/helper.c
+index 693a955..04a0988 100644
+--- a/target/i386/helper.c
++++ b/target/i386/helper.c
+@@ -176,6 +176,8 @@ void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
+ {
+     env->cr[3] = new_cr3;
+     if (env->cr[0] & CR0_PG_MASK) {
++        extern void pgcl_pgd_add(uint64_t cr3);  /* #143 dangle-probe pgd set */
++        pgcl_pgd_add(new_cr3);
+         qemu_log_mask(CPU_LOG_MMU,
+                         "CR3 update: CR3=" TARGET_FMT_lx "\n", new_cr3);
+         tlb_flush(env_cpu(env));
+diff --git a/target/i386/tcg/system/excp_helper.c b/target/i386/tcg/system/excp_helper.c
+index f622b5d..6775475 100644
+--- a/target/i386/tcg/system/excp_helper.c
++++ b/target/i386/tcg/system/excp_helper.c
+@@ -22,6 +22,9 @@
+ #include "accel/tcg/cpu-ldst.h"
+ #include "accel/tcg/probe.h"
+ #include "exec/cputlb.h"
++#include "exec/cpu-common.h"
++#include "system/memory.h"
++#include "system/address-spaces.h"
+ #include "exec/page-protection.h"
+ #include "exec/target_page.h"
+ #include "exec/tlb-flags.h"
+@@ -139,6 +142,274 @@ static inline bool ptw_setl(const PTETranslate *in, uint32_t old, uint32_t set)
+     return true;
+ }
+ 
++/*
++ * PGCL #143 dangling-PTE probe v2 (diagnostic): catch FREE-WHILE-MAPPED at the
++ * instant of the free.  v1 (freed-frame shadow + 4K-leaf walk-check) caught
++ * nothing because QEMU's softmmu TLB caches the dangling translation -- the
++ * kernel never tears the dangling PTE down (that IS the bug) so it is never
++ * flushed/re-walked after the free, and the frame is usually reused before any
++ * re-walk.  v2 keeps a per-frame REVERSE MAP of the last USER (cr3,va) that
++ * walked each frame (recorded at TLB-miss-walk time, so it survives TLB
++ * caching).  When the guest kernel signals a page FREE (magic cpuid leaf
++ * 0x51430001, ebx=4K-frame base, ecx=#frames, via cpu_x86_cpuid), we VALIDATE
++ * by walking that (cr3,va) in guest memory: if a present USER PTE STILL maps the
++ * frame being freed, that is the dangling PTE -- the count-clean free-while-
++ * mapped the in-kernel mapcount/bad_page checks structurally cannot see -- named
++ * (cr3,va,frame) from OUTSIDE the kernel, no latency in the rmap race path.
++ * Alloc (leaf 0x51430000) clears the reverse map.  Armed by env PGCL_DANGLE.
++ */
++struct pgcl_rme { uint64_t cr3; uint64_t va; };
++static struct pgcl_rme *pgcl_rmap;
++static uint64_t pgcl_nframes;
++/*
++ * Page-table reads must stay within backed RAM: a stale/garbage table entry
++ * (churn) or a wrong-level walk can point into the MMIO hole, and a
++ * cpu_ldq_mmuidx_ra() to MMIO from this context core-dumps QEMU.  Bound to the
++ * -m size used by the rmap-ab runs (2G, well below the i440fx PCI hole).  Run
++ * the guest with -cpu max,la57=off so this 4-level walk matches the guest.
++ */
++#define PGCL_RAMLIMIT (2ULL << 30)
++static unsigned long pgcl_dangle_hits;
++static int pgcl_dangle_armed = -1;
++static unsigned long pgcl_n_rec, pgcl_n_free, pgcl_n_alloc;
++
++static int pgcl_dangle_on(void)
++{
++    if (pgcl_dangle_armed < 0) {
++        pgcl_dangle_armed = getenv("PGCL_DANGLE") ? 1 : 0;
++        if (pgcl_dangle_armed) {
++            pgcl_nframes = (uint64_t)8 << (30 - 12);    /* up to 8G RAM */
++            pgcl_rmap = g_malloc0(pgcl_nframes * sizeof(*pgcl_rmap));
++            fprintf(stderr, "PGCL143: dangling-PTE probe v2 ACTIVE\n");
++        }
++    }
++    return pgcl_dangle_armed;
++}
++
++/*
++ * Minimal 4-level x86_64 walk of an arbitrary cr3, reading guest physical
++ * memory directly.  Returns the mapped 4K frame for a present USER 4K leaf,
++ * else 0.
++ */
++static int pgcl_walk_dbg;
++static uint64_t pgcl_walk(CPUX86State *env, uint64_t cr3, uint64_t va)
++{
++    uint64_t base = cr3 & 0x000ffffffffff000ULL;
++    const int sh[4] = { 39, 30, 21, 12 };
++    int lvl;
++
++    for (lvl = 0; lvl < 4; lvl++) {
++        uint64_t e, pa = base + ((va >> sh[lvl]) & 0x1ff) * 8;
++
++        if (pa >= PGCL_RAMLIMIT) {
++            return 0;                       /* out of backed RAM (MMIO safe) */
++        }
++        /*
++         * Coherent read through the CPU's physical MMU index -- the same
++         * primitive ptw_ldq() falls back to.  address_space_read() returned
++         * stale page-table data from this helper context.
++         */
++        e = cpu_ldq_mmuidx_ra(env, pa, MMU_PHYS_IDX, 0);
++        if (pgcl_walk_dbg) {
++            fprintf(stderr, "  walk lvl%d pa=0x%" PRIx64 " e=0x%" PRIx64 "\n",
++                    lvl, pa, e);
++        }
++        if (!(e & 1)) {
++            return 0;                       /* not present */
++        }
++        if (!(e & 4)) {
++            return 0;                       /* not USER (PG_USER) */
++        }
++        if (lvl < 3 && (e & 0x80)) {
++            return 0;                       /* huge leaf: not our 4K case */
++        }
++        base = e & 0x000ffffffffff000ULL;
++    }
++    return base >> 12;
++}
++
++/*
++ * #143 v3: set of all guest USER pgds (CR3 phys), recorded on every CR3 load
++ * (pgcl_pgd_add from cpu_x86_update_cr3).  Lets us find COLD mappings (a victim
++ * sitting in waitpid is not the last accessor, so access-time recording misses
++ * it) by a full page-table scan, and check ALL fork-sharers of a freed frame.
++ */
++#define PGCL_MAXPGD 4096
++static uint64_t pgcl_pgds[PGCL_MAXPGD];
++static int pgcl_npgd;
++static unsigned long pgcl_scan_gen;
++
++void pgcl_pgd_add(uint64_t cr3);
++void pgcl_pgd_add(uint64_t cr3)
++{
++    uint64_t p = cr3 & 0x000ffffffffff000ULL;
++    int i;
++
++    if (pgcl_dangle_armed != 1 || !p) {
++        return;
++    }
++    for (i = 0; i < pgcl_npgd; i++) {
++        if (pgcl_pgds[i] == p) {
++            return;
++        }
++    }
++    if (pgcl_npgd < PGCL_MAXPGD) {
++        pgcl_pgds[pgcl_npgd++] = p;
++    }
++}
++
++/* Recursively record every present USER 4K leaf of one pgd into pgcl_rmap. */
++static void pgcl_scan_level(CPUX86State *env, uint64_t root, uint64_t tbl,
++                            int lvl, uint64_t va)
++{
++    static const int sh[4] = { 39, 30, 21, 12 };
++    int i, hi = (lvl == 0) ? 256 : 512;     /* lvl0: user half only */
++
++    for (i = 0; i < hi; i++) {
++        uint64_t pa = tbl + (uint64_t)i * 8, e, cva;
++
++        if (pa >= PGCL_RAMLIMIT) {
++            continue;
++        }
++        e = cpu_ldq_mmuidx_ra(env, pa, MMU_PHYS_IDX, 0);
++        if (!(e & 1) || !(e & 4)) {
++            continue;                       /* present + USER only */
++        }
++        cva = va | ((uint64_t)i << sh[lvl]);
++        if (lvl == 3) {                     /* 4K leaf */
++            uint64_t f = (e & 0x000ffffffffff000ULL) >> 12;
++            if (f < pgcl_nframes) {
++                pgcl_rmap[f].cr3 = root;
++                pgcl_rmap[f].va = cva;
++            }
++            continue;
++        }
++        if (e & 0x80) {
++            continue;                       /* huge leaf: not our 4K case */
++        }
++        pgcl_scan_level(env, root, e & 0x000ffffffffff000ULL, lvl + 1, cva);
++    }
++}
++
++/* Full scan of all known pgds -> repopulate the reverse map (incl. cold maps). */
++static void pgcl_scan_all(CPUX86State *env)
++{
++    int i;
++    pgcl_scan_gen++;
++    for (i = 0; i < pgcl_npgd; i++) {
++        pgcl_scan_level(env, pgcl_pgds[i], pgcl_pgds[i], 0, 0);
++    }
++}
++
++/* At a free, check EVERY known pgd at the recorded va for a dangling map of f. */
++static int pgcl_check_all_pgds(CPUX86State *env, uint64_t f, uint64_t va)
++{
++    int i, hits = 0;
++    for (i = 0; i < pgcl_npgd; i++) {
++        if (pgcl_walk(env, pgcl_pgds[i], va) == f) {
++            if (pgcl_dangle_hits < 256) {
++                pgcl_dangle_hits++;
++                fprintf(stderr,
++                    "PGCL143dangle #%lu: FREE-WHILE-MAPPED frame=0x%" PRIx64
++                    " still mapped by USER pte cr3=0x%" PRIx64 " va=0x%" PRIx64
++                    " (scan_gen=%lu npgd=%d)\n",
++                    pgcl_dangle_hits, f, pgcl_pgds[i], va,
++                    pgcl_scan_gen, pgcl_npgd);
++                /*
++                 * Dump the freeing context's guest kernel stack = the path that
++                 * is freeing a still-mapped page (the buggy under-removal/free).
++                 */
++                if (pgcl_dangle_hits <= 8) {
++                    uint64_t stk[64];
++                    int j;
++                    if (cpu_memory_rw_debug(env_cpu(env), env->regs[R_ESP],
++                                            (uint8_t *)stk, sizeof stk,
++                                            false) == 0) {
++                        fprintf(stderr, "PGCL143danglepath rsp=0x%llx:\n",
++                                (unsigned long long)env->regs[R_ESP]);
++                        for (j = 0; j < 64; j++) {
++                            if (stk[j] >= 0xffffffff81000000ULL &&
++                                stk[j] <  0xffffffff82a00000ULL) {
++                                fprintf(stderr, "  %016llx\n",
++                                        (unsigned long long)stk[j]);
++                            }
++                        }
++                    }
++                }
++            }
++            hits++;
++        }
++    }
++    return hits;
++}
++
++void pgcl_dangle_signal(CPUX86State *env, uint64_t base, uint64_t count,
++                        int freed);
++void pgcl_dangle_signal(CPUX86State *env, uint64_t base, uint64_t count,
++                        int freed)
++{
++    uint64_t i;
++
++    if (!pgcl_dangle_on() || !pgcl_rmap) {
++        return;
++    }
++    /* Refresh the reverse map periodically so cold mappings are covered. */
++    if (freed && (pgcl_n_free % 128) == 0) {
++        pgcl_scan_all(env);
++    }
++    if (freed) {
++        if (pgcl_n_free < 8) {
++            fprintf(stderr, "PGCL143free: base=0x%" PRIx64 " count=0x%" PRIx64
++                    " (recs so far=%lu)\n", base, count, pgcl_n_rec);
++        }
++        pgcl_n_free++;
++    } else {
++        pgcl_n_alloc++;
++    }
++    for (i = 0; i < count; i++) {
++        uint64_t f = base + i;
++        if (f >= pgcl_nframes) {
++            break;
++        }
++        if (freed) {
++            struct pgcl_rme r = pgcl_rmap[f];
++            /*
++             * The periodic full scan populates (cr3,va) even for COLD frames
++             * (the victim's long-lived mapping).  Check EVERY known pgd at the
++             * recorded va so all fork-sharers of f are tested -- a present USER
++             * PTE still mapping f while it is being freed is the dangling-PTE
++             * premature-free that the in-kernel mapcount checks cannot see.
++             */
++            if (r.va) {
++                pgcl_check_all_pgds(env, f, r.va);
++            }
++        } else {
++            pgcl_rmap[f].cr3 = 0;           /* (re)alloc: forget old mapper */
++            pgcl_rmap[f].va = 0;
++        }
++    }
++}
++
++static inline void pgcl_rmap_record(CPUX86State *env, uint64_t frame,
++                                    uint64_t cr3, uint64_t va)
++{
++    if (pgcl_rmap && frame < pgcl_nframes) {
++        if (pgcl_n_rec < 4) {
++            uint64_t w;
++            pgcl_walk_dbg = 1;
++            w = pgcl_walk(env, cr3, va);        /* PTE is present right now */
++            pgcl_walk_dbg = 0;
++            fprintf(stderr, "PGCL143rec: frame=0x%" PRIx64 " cr3=0x%" PRIx64
++                    " va=0x%" PRIx64 " selftest=0x%" PRIx64 " %s\n",
++                    frame, cr3 & 0x000ffffffffff000ULL, va, w,
++                    w == frame ? "WALK-OK" : "WALK-BROKEN");
++        }
++        pgcl_n_rec++;
++        pgcl_rmap[frame].cr3 = cr3;
++        pgcl_rmap[frame].va = va;
++    }
++}
++
+ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
+                           TranslateResult *out, TranslateFault *err,
+                           uint64_t ra)
+@@ -306,6 +577,12 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
+         /* combine pde and pte nx, user and rw protections */
+         ptep &= pte ^ PG_NX_MASK;
+         page_size = 4096;
++        /* #143 v2: remember the last USER mapper of this frame (survives the
++         * QEMU TLB cache); validated against the page tables at free time. */
++        if (unlikely(pgcl_dangle_on() && (pte & PG_USER_MASK))) {
++            pgcl_rmap_record(env, (pte & PG_ADDRESS_MASK) >> 12,
++                             (uint64_t)in->cr3, (uint64_t)addr);
++        }
+     } else if (pg_mode & PG_MODE_PG) {
+         /*
+          * Page table level 2
