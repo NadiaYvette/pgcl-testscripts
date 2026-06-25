@@ -315,7 +315,7 @@ index 693a955..04a0988 100644
                          "CR3 update: CR3=" TARGET_FMT_lx "\n", new_cr3);
          tlb_flush(env_cpu(env));
 diff --git a/target/i386/tcg/system/excp_helper.c b/target/i386/tcg/system/excp_helper.c
-index f622b5d..6775475 100644
+index f622b5d..57283c9 100644
 --- a/target/i386/tcg/system/excp_helper.c
 +++ b/target/i386/tcg/system/excp_helper.c
 @@ -22,6 +22,9 @@
@@ -328,7 +328,7 @@ index f622b5d..6775475 100644
  #include "exec/page-protection.h"
  #include "exec/target_page.h"
  #include "exec/tlb-flags.h"
-@@ -139,6 +142,274 @@ static inline bool ptw_setl(const PTETranslate *in, uint32_t old, uint32_t set)
+@@ -139,6 +142,418 @@ static inline bool ptw_setl(const PTETranslate *in, uint32_t old, uint32_t set)
      return true;
  }
  
@@ -359,6 +359,119 @@ index f622b5d..6775475 100644
 + * the guest with -cpu max,la57=off so this 4-level walk matches the guest.
 + */
 +#define PGCL_RAMLIMIT (2ULL << 30)
++
++/*
++ * #143 struct-page reader ("layer inversion"): read the guest kernel's OWN
++ * authoritative _refcount/_mapcount from the vmemmap (struct page array), so we
++ * catch refcount underflow / premature free directly instead of inferring it
++ * from page-table walks.  Layout from pahole on the pgcl4 vmlinux:
++ *   sizeof(struct page)=64, offsetof(_mapcount)=48, offsetof(_refcount)=52.
++ * vmemmap_base = nokaslr 4-level default (run guest -cpu max,la57=off).
++ * vmemmap is indexed by CLUSTER pfn; qsig base is in MMUPAGE frames, so
++ * cluster_pfn = base >> PAGE_MMUSHIFT (PGCL_MMUSHIFT below; 4 for pgcl4, 0 pgcl0).
++ */
++#define PGCL_VMEMMAP_BASE   0xffffea0000000000ULL
++#define PGCL_PAGE_SIZE      64
++#define PGCL_OFF_MAPCOUNT   48
++#define PGCL_OFF_REFCOUNT   52
++#define PGCL_MMUSHIFT       4
++
++/* Walk a KERNEL va (no U-bit) to its guest physical address; handle huge pages. */
++static uint64_t pgcl_kwalk(CPUX86State *env, uint64_t cr3, uint64_t va)
++{
++    uint64_t base = cr3 & 0x000ffffffffff000ULL;
++    static const int sh[4] = { 39, 30, 21, 12 };
++    int lvl;
++
++    for (lvl = 0; lvl < 4; lvl++) {
++        uint64_t e, pa = base + ((va >> sh[lvl]) & 0x1ff) * 8;
++
++        if (pa >= PGCL_RAMLIMIT) {
++            return 0;
++        }
++        e = cpu_ldq_mmuidx_ra(env, pa, MMU_PHYS_IDX, 0);
++        if (!(e & 1)) {
++            return 0;                       /* not present */
++        }
++        if (lvl < 3 && (e & 0x80)) {        /* huge leaf (1G @lvl1 / 2M @lvl2) */
++            uint64_t hmask = (1ULL << sh[lvl]) - 1;
++            return (e & 0x000ffffffffff000ULL & ~hmask) | (va & hmask);
++        }
++        base = e & 0x000ffffffffff000ULL;
++    }
++    return base | (va & 0xfff);             /* 4K leaf */
++}
++
++/* Read the guest kernel's struct page[cpfn] _refcount/_mapcount.  1 on success. */
++static int pgcl_read_page(CPUX86State *env, uint64_t cpfn,
++                          int *refcount, int *mapcount)
++{
++    uint64_t va = PGCL_VMEMMAP_BASE + cpfn * PGCL_PAGE_SIZE;
++    uint64_t pa = pgcl_kwalk(env, env->cr[3], va);
++
++    if (!pa || pa + PGCL_OFF_REFCOUNT + 4 > PGCL_RAMLIMIT) {
++        return 0;
++    }
++    *mapcount = (int)cpu_ldl_mmuidx_ra(env, pa + PGCL_OFF_MAPCOUNT, MMU_PHYS_IDX, 0);
++    *refcount = (int)cpu_ldl_mmuidx_ra(env, pa + PGCL_OFF_REFCOUNT, MMU_PHYS_IDX, 0);
++    return 1;
++}
++
++/*
++ * #143 underflow scanner with unwindable history: periodically read EVERY
++ * cluster's authoritative _refcount/_mapcount and keep a per-cluster ring of
++ * recent snapshots.  Flag the kernel's own invariant violations -- mapcount
++ * below the -1 "unmapped" floor, or a negative refcount = the refcount/mapcount
++ * UNDERFLOW that names #143 -- and dump the trajectory (when it went bad).
++ */
++#define PGCL_CLUSTER_SHIFT (12 + PGCL_MMUSHIFT)            /* 64K cluster @pgcl4 */
++#define PGCL_NCLUSTER      (PGCL_RAMLIMIT >> PGCL_CLUSTER_SHIFT)
++#define PGCL_HK            8
++struct pgcl_ufc { uint8_t head; uint8_t flagged; int rc[PGCL_HK]; int mc[PGCL_HK]; };
++static struct pgcl_ufc *pgcl_uf;
++static unsigned long pgcl_uf_hits;
++
++static void pgcl_uf_scan(CPUX86State *env)
++{
++    uint64_t c;
++
++    if (!pgcl_uf) {
++        pgcl_uf = g_malloc0(PGCL_NCLUSTER * sizeof(*pgcl_uf));
++    }
++    for (c = 0; c < PGCL_NCLUSTER; c++) {
++        struct pgcl_ufc *u = &pgcl_uf[c];
++        int rc, mc;
++
++        if (!pgcl_read_page(env, c, &rc, &mc)) {
++            continue;
++        }
++        u->rc[u->head] = rc;
++        u->mc[u->head] = mc;
++        u->head = (u->head + 1) % PGCL_HK;
++
++        /*
++         * offset 48 is a union: _mapcount on an in-use page, page_type on a
++         * free/typed page (PGTY_buddy = 0xf0000000 = -268435456).  A genuine
++         * mapcount underflow is a SMALL negative (< -1) on a REFERENCED page
++         * (rc > 0); exclude the page_type sentinel range.  refcount must never
++         * be negative.
++         */
++        if (((rc > 0 && mc < -1 && mc >= -4096) || rc < 0) &&
++            !u->flagged && pgcl_uf_hits < 64) {
++            int k;
++            u->flagged = 1;
++            pgcl_uf_hits++;
++            fprintf(stderr, "PGCL143underflow #%lu cpfn=0x%" PRIx64
++                    " refcount=%d mapcount=%d  history(rc,mc):",
++                    pgcl_uf_hits, c, rc, mc);
++            for (k = 0; k < PGCL_HK; k++) {
++                int idx = (u->head + k) % PGCL_HK;
++                fprintf(stderr, " (%d,%d)", u->rc[idx], u->mc[idx]);
++            }
++            fprintf(stderr, "\n");
++        }
++    }
++}
 +static unsigned long pgcl_dangle_hits;
 +static int pgcl_dangle_armed = -1;
 +static unsigned long pgcl_n_rec, pgcl_n_free, pgcl_n_alloc;
@@ -445,6 +558,22 @@ index f622b5d..6775475 100644
 +    }
 +    if (pgcl_npgd < PGCL_MAXPGD) {
 +        pgcl_pgds[pgcl_npgd++] = p;
++    }
++}
++
++/*
++ * Prune a pgd when its frame is freed: a stale/reused pgd frame (exited process)
++ * walked as a live page table reads garbage -> false FREE-WHILE-MAPPED.  Called
++ * for every freed frame; pgd phys == frame << 12.
++ */
++static void pgcl_pgd_drop(uint64_t pgd_phys)
++{
++    int i;
++    for (i = 0; i < pgcl_npgd; i++) {
++        if (pgcl_pgds[i] == pgd_phys) {
++            pgcl_pgds[i] = pgcl_pgds[--pgcl_npgd];
++            return;
++        }
 +    }
 +}
 +
@@ -544,13 +673,27 @@ index f622b5d..6775475 100644
 +        return;
 +    }
 +    /* Refresh the reverse map periodically so cold mappings are covered. */
-+    if (freed && (pgcl_n_free % 128) == 0) {
-+        pgcl_scan_all(env);
++    if (freed && (pgcl_n_free % 32) == 0) {
++        pgcl_uf_scan(env);              /* authoritative refcount/mapcount underflow scan */
++    }
++    if (freed && (pgcl_n_free % 256) == 0) {
++        pgcl_scan_all(env);            /* pgd reverse-map for the dangle cross-check */
 +    }
 +    if (freed) {
-+        if (pgcl_n_free < 8) {
-+            fprintf(stderr, "PGCL143free: base=0x%" PRIx64 " count=0x%" PRIx64
-+                    " (recs so far=%lu)\n", base, count, pgcl_n_rec);
++        /*
++         * SELF-TEST of the struct-page reader: at free, the kernel's own
++         * _refcount must read 0 and _mapcount -1 (page returning to buddy).
++         * Garbage here => wrong vmemmap base / layout / MMUSHIFT.
++         */
++        if (pgcl_n_free < 12) {
++            uint64_t cpfn = base >> PGCL_MMUSHIFT;
++            int rc = -77, mc = -77, ok;
++            ok = pgcl_read_page(env, cpfn, &rc, &mc);
++            fprintf(stderr, "PGCL143pgread: free base=0x%" PRIx64 " cpfn=0x%"
++                    PRIx64 " ok=%d refcount=%d mapcount=%d %s\n",
++                    base, cpfn, ok, rc, mc,
++                    (ok && rc == 0 && mc == -1) ? "READER-OK" :
++                    (ok ? "UNEXPECTED" : "READ-FAIL"));
 +        }
 +        pgcl_n_free++;
 +    } else {
@@ -563,6 +706,7 @@ index f622b5d..6775475 100644
 +        }
 +        if (freed) {
 +            struct pgcl_rme r = pgcl_rmap[f];
++            pgcl_pgd_drop(f << 12);         /* prune if this frame was a pgd */
 +            /*
 +             * The periodic full scan populates (cr3,va) even for COLD frames
 +             * (the victim's long-lived mapping).  Check EVERY known pgd at the
@@ -603,7 +747,7 @@ index f622b5d..6775475 100644
  static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
                            TranslateResult *out, TranslateFault *err,
                            uint64_t ra)
-@@ -306,6 +577,12 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
+@@ -306,6 +721,12 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
          /* combine pde and pte nx, user and rw protections */
          ptep &= pte ^ PG_NX_MASK;
          page_size = 4096;

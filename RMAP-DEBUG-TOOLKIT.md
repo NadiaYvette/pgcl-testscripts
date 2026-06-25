@@ -229,3 +229,15 @@ No-op without QEMU. (Kernel patch saved separately.)
 as the #143 cause; PGCL=0 control = 0 catches vs PGCL=4 (real, PGCL-specific);
 characterized the victim as long-lived fork-shared pages reclaimed-under-process
 (ip=0). See memory `pgcl143-rmap-underflow-hunt.md`.
+
+### F.1 struct-page reader (layer inversion, 2026-06-25)
+QEMU reads the guest kernel's OWN `struct page._refcount/_mapcount` from the
+vmemmap (validated: 12/12 READER-OK = refcount 0 / mapcount -1 at free).
+`pgcl_kwalk` (kernel-va walk, huge-page aware) + `pgcl_read_page(cluster_pfn)` +
+`pgcl_uf_scan` (periodic authoritative underflow scan with per-cluster (rc,mc)
+history rings). Layout via pahole (pgcl4-dbginfo vmlinux): struct page=64,
+off _mapcount=48, _refcount=52; vmemmap_base 0xffffea0000000000 (nokaslr 4-level,
+run -cpu max,la57=off). offset 48 is a union (page_type=PGTY_buddy=0xf0000000 on
+free pages) — read as mapcount only when refcount>0. NEXT: cross-check kernel
+_mapcount vs actual present sub-PTE count (pgd walk) per cluster — the
+PTE-vs-struct-page discrepancy is the accounting bug directly.

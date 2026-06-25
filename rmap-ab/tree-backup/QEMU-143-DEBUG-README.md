@@ -45,3 +45,24 @@ separately as a kernel patch.
 `PGCL_TLBSCAN=1` or `PGCL_DANGLE=1` env + `-cpu max,la57=off -smp 8 -m 2G`
 2x-oversubscribed via `rmap-ab/iso`, with the abl repro initramfs. The kernel
 must be built with the qsig channel.
+
+## Update: struct-page reader + underflow scanner (the layer inversion)
+QEMU now reads the guest kernel's OWN authoritative struct page fields, removing
+the inference/churn ambiguity of page-table walks.
+- `pgcl_kwalk()` — KERNEL-va page-table walk (no U-bit; handles 2M/1G huge
+  leaves) → guest physical address.
+- `pgcl_read_page(cpfn)` — reads `struct page[cpfn]._refcount`/`_mapcount` from
+  the vmemmap.  Layout from pahole on the pgcl4 vmlinux:
+  `sizeof(struct page)=64, off(_mapcount)=48, off(_refcount)=52`;
+  `vmemmap_base=0xffffea0000000000` (nokaslr, 4-level → run `-cpu max,la57=off`);
+  vmemmap is indexed by CLUSTER pfn = `qsig_base >> PAGE_MMUSHIFT` (4 @pgcl4).
+  Self-test at free prints `PGCL143pgread ... READER-OK` (refcount 0, mapcount -1).
+- `pgcl_uf_scan()` — periodic sweep of all clusters' authoritative counts with an
+  8-deep per-cluster history ring; flags genuine underflow (`refcount<0`, or a
+  small-negative `mapcount` on a REFERENCED page) and dumps the `(rc,mc)`
+  trajectory.  CAVEAT: offset 48 is a union — `_mapcount` on in-use pages,
+  `page_type` (PGTY_buddy=0xf0000000=-268435456) on free pages — so only read it
+  as mapcount when `refcount>0`.
+- NEXT (per design): compare kernel `_mapcount` (struct page) vs actual present
+  sub-PTE count (pgd walk) per cluster — the discrepancy between the two
+  accounting structures is the undercount/underflow directly.
