@@ -66,3 +66,22 @@ the inference/churn ambiguity of page-table walks.
 - NEXT (per design): compare kernel `_mapcount` (struct page) vs actual present
   sub-PTE count (pgd walk) per cluster — the discrepancy between the two
   accounting structures is the undercount/underflow directly.
+
+## Update: PTE-vs-struct-page cross-check (compare the two accounting structures)
+`pgcl_tally_level`/`pgcl_xcheck_scan`: tally the actual present USER sub-PTEs
+mapping each cluster (across LIVE pgds) and compare to the kernel's own
+`struct page` per cluster:
+ - FREED-WHILE-MAPPED: tally>0 but refcount==0 (PTE maps a freed page)
+ - MAPCOUNT-UNDERCOUNT: refcount>0 but _mapcount+1 < tally (kernel forgot PTEs)
+ - MAPCOUNT-OVERCOUNT: _mapcount+1 > tally (mappings removed, not decremented)
+ - per-scan summary: inuse/match/undercount/overcount/freed
+`pgcl_pgd_live` filters dead/reused pgd frames (x86 PGDs are slab-allocated, so
+prune-on-free can't catch them) by matching each pgd's vmemmap-PML4 entry to the
+current CR3's; also drops PTI user-pgds.  Skips PG_reserved (zero/vdso) and
+PG_head (THP) pages.
+FINDINGS: steady-state tally == kernel _mapcount EXACTLY (methodology validated);
+the undercount catches are TRANSIENT (non-atomic external scan vs concurrent
+guest PTE/mapcount updates) -> resolve by next scan.  Caveats: pgd coverage
+(npgd low); pgcl0 control needs PGCL_MMUSHIFT=0 (currently hardcoded 4).
+NEXT: per-write watch of the mapcount/refcount fields to catch the exact bad
+decrement (+RIP), isolating the bug window from normal update windows.

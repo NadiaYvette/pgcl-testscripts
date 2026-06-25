@@ -315,7 +315,7 @@ index 693a955..04a0988 100644
                          "CR3 update: CR3=" TARGET_FMT_lx "\n", new_cr3);
          tlb_flush(env_cpu(env));
 diff --git a/target/i386/tcg/system/excp_helper.c b/target/i386/tcg/system/excp_helper.c
-index f622b5d..57283c9 100644
+index f622b5d..8107f8f 100644
 --- a/target/i386/tcg/system/excp_helper.c
 +++ b/target/i386/tcg/system/excp_helper.c
 @@ -22,6 +22,9 @@
@@ -328,7 +328,7 @@ index f622b5d..57283c9 100644
  #include "exec/page-protection.h"
  #include "exec/target_page.h"
  #include "exec/tlb-flags.h"
-@@ -139,6 +142,418 @@ static inline bool ptw_setl(const PTETranslate *in, uint32_t old, uint32_t set)
+@@ -139,6 +142,566 @@ static inline bool ptw_setl(const PTETranslate *in, uint32_t old, uint32_t set)
      return true;
  }
  
@@ -359,6 +359,12 @@ index f622b5d..57283c9 100644
 + * the guest with -cpu max,la57=off so this 4-level walk matches the guest.
 + */
 +#define PGCL_RAMLIMIT (2ULL << 30)
++
++/* set of all guest USER pgds (CR3 phys); declared here so the cross-check can use it */
++#define PGCL_MAXPGD 4096
++static uint64_t pgcl_pgds[PGCL_MAXPGD];
++static int pgcl_npgd;
++static unsigned long pgcl_scan_gen;
 +
 +/*
 + * #143 struct-page reader ("layer inversion"): read the guest kernel's OWN
@@ -430,6 +436,150 @@ index f622b5d..57283c9 100644
 +struct pgcl_ufc { uint8_t head; uint8_t flagged; int rc[PGCL_HK]; int mc[PGCL_HK]; };
 +static struct pgcl_ufc *pgcl_uf;
 +static unsigned long pgcl_uf_hits;
++
++/*
++ * #143 THE detector: cross-check the two accounting structures.  Tally the
++ * actual present USER sub-PTEs mapping each cluster (across all live pgds), then
++ * compare to the kernel's own struct page:
++ *   (A) tally>0 but refcount==0  -> a PTE maps a page the kernel has FREED
++ *       (premature free / refcount underflow) -- the #143 corruption directly.
++ *   (B) refcount>0 but _mapcount+1 != tally -> the kernel's mapcount disagrees
++ *       with the real number of sub-PTEs (the under/over-count itself).
++ * Run the guest -cpu max,la57=off (4-level walk).  Churn (dead pgds) is pruned
++ * on free; remaining noise is filtered by the pgcl0 control showing zero.
++ */
++static int *pgcl_tally;
++static unsigned long pgcl_xck_hits;
++
++/*
++ * x86 PGDs are slab-allocated (pgd_cache), so a freed PGD never fires the qsig
++ * and prune-on-free can't drop it -> pgcl_pgds accumulates dead/reused frames
++ * that, walked as page tables, fabricate garbage PTEs (churn).  A LIVE pgd
++ * shares the kernel-half PML4 entries with every other live pgd; the current
++ * CR3 is always live, so a candidate whose vmemmap-PML4 entry matches the
++ * current CR3's is a real pgd.  A reused frame holding other data will not.
++ */
++static bool pgcl_pgd_live(CPUX86State *env, uint64_t pgd)
++{
++    uint64_t kidx = (PGCL_VMEMMAP_BASE >> 39) & 0x1ff;
++    uint64_t ref = (env->cr[3] & 0x000ffffffffff000ULL) + kidx * 8;
++    uint64_t cand = (pgd & 0x000ffffffffff000ULL) + kidx * 8;
++    uint64_t re, ce;
++
++    if (ref >= PGCL_RAMLIMIT || cand >= PGCL_RAMLIMIT) {
++        return false;
++    }
++    re = cpu_ldq_mmuidx_ra(env, ref, MMU_PHYS_IDX, 0);
++    ce = cpu_ldq_mmuidx_ra(env, cand, MMU_PHYS_IDX, 0);
++    return (re & 1) && re == ce;        /* same present kernel vmemmap PUD */
++}
++
++static void pgcl_tally_level(CPUX86State *env, uint64_t tbl, int lvl)
++{
++    static const int sh[4] = { 39, 30, 21, 12 };
++    int i, hi = (lvl == 0) ? 256 : 512;
++    (void)sh;
++
++    for (i = 0; i < hi; i++) {
++        uint64_t pa = tbl + (uint64_t)i * 8, e;
++
++        if (pa >= PGCL_RAMLIMIT) {
++            continue;
++        }
++        e = cpu_ldq_mmuidx_ra(env, pa, MMU_PHYS_IDX, 0);
++        if (!(e & 1) || !(e & 4)) {
++            continue;                       /* present + USER */
++        }
++        if (lvl == 3) {
++            uint64_t cl = ((e & 0x000ffffffffff000ULL) >> 12) >> PGCL_MMUSHIFT;
++            if (cl < PGCL_NCLUSTER) {
++                pgcl_tally[cl]++;
++            }
++            continue;
++        }
++        if (e & 0x80) {
++            continue;                       /* huge user leaf: skip (not order-0) */
++        }
++        pgcl_tally_level(env, e & 0x000ffffffffff000ULL, lvl + 1);
++    }
++}
++
++/* read struct page[cpfn].flags (offset 0); PG_head=bit6, PG_reserved=bit13 */
++static uint64_t pgcl_page_flags(CPUX86State *env, uint64_t cpfn)
++{
++    uint64_t va = PGCL_VMEMMAP_BASE + cpfn * PGCL_PAGE_SIZE;
++    uint64_t pa = pgcl_kwalk(env, env->cr[3], va);
++
++    if (!pa || pa + 8 > PGCL_RAMLIMIT) {
++        return 0;
++    }
++    return cpu_ldq_mmuidx_ra(env, pa, MMU_PHYS_IDX, 0);
++}
++
++static void pgcl_xcheck_scan(CPUX86State *env)
++{
++    uint64_t c;
++    int i;
++    unsigned long n_inuse = 0, n_match = 0, n_under = 0, n_over = 0, n_freed = 0;
++
++    if (!pgcl_tally) {
++        pgcl_tally = g_malloc0(PGCL_NCLUSTER * sizeof(int));
++    }
++    memset(pgcl_tally, 0, PGCL_NCLUSTER * sizeof(int));
++    for (i = 0; i < pgcl_npgd; i++) {
++        if (pgcl_pgd_live(env, pgcl_pgds[i])) {     /* skip dead/reused pgd frames */
++            pgcl_tally_level(env, pgcl_pgds[i], 0);
++        }
++    }
++    for (c = 0; c < PGCL_NCLUSTER; c++) {
++        int rc, mc;
++
++        if (pgcl_tally[c] == 0) {
++            continue;                       /* no PTE maps it: nothing to cross-check */
++        }
++        if (!pgcl_read_page(env, c, &rc, &mc)) {
++            continue;
++        }
++        {
++            uint64_t fl = pgcl_page_flags(env, c);
++            if ((fl >> 13) & 1) {
++                continue;               /* PG_reserved: special page (zero/vdso), untracked */
++            }
++            if ((fl >> 6) & 1) {
++                continue;               /* PG_head: THP, uses _entire_mapcount not _mapcount */
++            }
++        }
++        n_inuse++;
++        if (mc < -1 || mc >= 65536) {
++            continue;                       /* page_type/odd: skip (not a plain mapcount) */
++        }
++        if (rc == 0) {
++            n_freed++;
++            if (pgcl_xck_hits < 64) {
++                pgcl_xck_hits++;
++                fprintf(stderr, "PGCL143xcheck #%lu FREED-WHILE-MAPPED cpfn=0x%"
++                        PRIx64 " refcount=0 mapcount=%d but %d present USER sub-PTEs\n",
++                        pgcl_xck_hits, c, mc, pgcl_tally[c]);
++            }
++        } else if (mc + 1 < pgcl_tally[c]) {
++            n_under++;
++            if (pgcl_xck_hits < 64) {
++                pgcl_xck_hits++;
++                fprintf(stderr, "PGCL143xcheck #%lu MAPCOUNT-UNDERCOUNT cpfn=0x%"
++                        PRIx64 " refcount=%d kernel_mapcount=%d (=>%d) < %d present"
++                        " USER sub-PTEs\n",
++                        pgcl_xck_hits, c, rc, mc, mc + 1, pgcl_tally[c]);
++            }
++        } else if (mc + 1 > pgcl_tally[c]) {
++            n_over++;
++        } else {
++            n_match++;
++        }
++    }
++    fprintf(stderr, "PGCL143xck-summary: inuse=%lu match=%lu undercount=%lu"
++            " overcount=%lu freed_while_mapped=%lu (npgd=%d mmushift=%d)\n",
++            n_inuse, n_match, n_under, n_over, n_freed, pgcl_npgd, PGCL_MMUSHIFT);
++}
 +
 +static void pgcl_uf_scan(CPUX86State *env)
 +{
@@ -537,11 +687,6 @@ index f622b5d..57283c9 100644
 + * sitting in waitpid is not the last accessor, so access-time recording misses
 + * it) by a full page-table scan, and check ALL fork-sharers of a freed frame.
 + */
-+#define PGCL_MAXPGD 4096
-+static uint64_t pgcl_pgds[PGCL_MAXPGD];
-+static int pgcl_npgd;
-+static unsigned long pgcl_scan_gen;
-+
 +void pgcl_pgd_add(uint64_t cr3);
 +void pgcl_pgd_add(uint64_t cr3)
 +{
@@ -673,10 +818,13 @@ index f622b5d..57283c9 100644
 +        return;
 +    }
 +    /* Refresh the reverse map periodically so cold mappings are covered. */
-+    if (freed && (pgcl_n_free % 32) == 0) {
-+        pgcl_uf_scan(env);              /* authoritative refcount/mapcount underflow scan */
++    if (freed && (pgcl_n_free % 64) == 0) {
++        pgcl_xcheck_scan(env);         /* PTE-tally vs struct-page accounting cross-check (primary) */
 +    }
-+    if (freed && (pgcl_n_free % 256) == 0) {
++    if (freed && (pgcl_n_free % 128) == 0) {
++        pgcl_uf_scan(env);             /* authoritative refcount/mapcount underflow scan */
++    }
++    if (freed && (pgcl_n_free % 512) == 0) {
 +        pgcl_scan_all(env);            /* pgd reverse-map for the dangle cross-check */
 +    }
 +    if (freed) {
@@ -747,7 +895,7 @@ index f622b5d..57283c9 100644
  static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
                            TranslateResult *out, TranslateFault *err,
                            uint64_t ra)
-@@ -306,6 +721,12 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
+@@ -306,6 +869,12 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
          /* combine pde and pte nx, user and rw protections */
          ptep &= pte ^ PG_NX_MASK;
          page_size = 4096;
