@@ -1,5 +1,5 @@
 diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
-index b063a57..5ce5062 100644
+index b063a57..3b238c9 100644
 --- a/accel/tcg/cputlb.c
 +++ b/accel/tcg/cputlb.c
 @@ -408,6 +408,185 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
@@ -233,6 +233,137 @@ index b063a57..5ce5062 100644
      /* Now calculate the new entry */
      tn.addend = addend - addr_page;
  
+@@ -1810,6 +1999,122 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
+  * Probe for an atomic operation.  Do not allow unaligned operations,
+  * or io operations to proceed.  Return the host address.
+  */
++/*
++ * #143 per-write history: every guest atomic RMW funnels through
++ * atomic_mmu_lookup; when the target is a struct page's _refcount(off 52) or
++ * _mapcount(off 48) field in the vmemmap, record (value-before, cpu, guest RIP)
++ * into a per-cluster ring -> the "unwindable history" of every refcount/mapcount
++ * change with the kernel code that made it.  Dumped at free of an interesting
++ * (multi-ref) cluster.  Armed by env PGCL_RCHIST.  cputlb.c is target-agnostic,
++ * so the guest PC comes from cpu->cc->get_pc().  Run guest -cpu max,la57=off.
++ */
++#define PGCL_RC_VMEMMAP   0xffffea0000000000ULL
++#define PGCL_RC_PGSIZE    64
++#define PGCL_RC_MMUSHIFT  4
++#define PGCL_RC_NCLUSTER  (1u << (31 - 16))     /* 2G / 64K */
++#define PGCL_RC_K         24
++/* val = the field being written (value BEFORE the RMW); sib = the SIBLING count
++ * sampled at the same instant (mapcount when val is refcount, and vice versa) so
++ * each event exposes the rc-vs-mc invariant -> "refcount hit 0 while mc>=0" =
++ * page freed while still mapped = the #143 bug, visible directly in the dump. */
++struct pgcl_rcev { uint64_t rip; int32_t val; int32_t sib; uint16_t cpu; uint16_t off; };
++struct pgcl_rcc { uint8_t head; uint8_t maxrc; struct pgcl_rcev e[PGCL_RC_K]; };
++static struct pgcl_rcc *pgcl_rc;
++static int pgcl_rc_armed = -1;
++
++static inline void pgcl_rc_record(CPUState *cpu, vaddr addr, void *host,
++                                  uintptr_t retaddr)
++{
++    uint64_t off, cl, rip;
++    struct pgcl_rcc *c;
++    int32_t v, sib;
++
++    if (pgcl_rc_armed < 0) {
++        pgcl_rc_armed = getenv("PGCL_RCHIST") ? 1 : 0;
++        if (pgcl_rc_armed) {
++            pgcl_rc = g_malloc0((size_t)PGCL_RC_NCLUSTER * sizeof(*pgcl_rc));
++            fprintf(stderr, "PGCL143: refcount/mapcount write-history ACTIVE\n");
++        }
++    }
++    if (pgcl_rc_armed != 1 || addr < PGCL_RC_VMEMMAP) {
++        return;
++    }
++    off = addr - PGCL_RC_VMEMMAP;
++    cl = off / PGCL_RC_PGSIZE;
++    off %= PGCL_RC_PGSIZE;
++    if (cl >= PGCL_RC_NCLUSTER || (off != 48 && off != 52)) {
++        return;
++    }
++    v = *(volatile int32_t *)host;              /* value BEFORE the RMW */
++    /* sibling count at the same instant: rc field is +4 from mc field */
++    sib = (off == 52) ? *(volatile int32_t *)((char *)host - 4)
++                      : *(volatile int32_t *)((char *)host + 4);
++    /* Exact guest PC of the atomic op.  get_pc() alone is the stale TB-start PC;
++     * cpu_restore_state would unwind it but MODIFIES cpu state mid-op (corrupts
++     * the guest).  cpu_unwind_state_data is read-only, but for CF_PCREL TBs (all
++     * kernel code) x86 saves only the LOW page bits in data[0] (pc & ~PAGE_MASK,
++     * see i386_tr_insn_start / x86_restore_state_to_opc).  QEMU splits TBs at
++     * page boundaries, so the current insn shares get_pc()'s 4K page: rebuild the
++     * full PC = (TB-start page base) | (insn page offset). */
++    {
++        uint64_t ud[4] = { 0 };
++        uint64_t pcbase = cpu->cc->get_pc(cpu);
++        if (cpu_unwind_state_data(cpu, retaddr, ud)) {
++            rip = (pcbase & TARGET_PAGE_MASK) | (ud[0] & ~TARGET_PAGE_MASK);
++        } else {
++            rip = pcbase;
++        }
++    }
++    c = &pgcl_rc[cl];
++    c->e[c->head].rip = rip;
++    c->e[c->head].val = v;
++    c->e[c->head].sib = sib;
++    c->e[c->head].cpu = cpu->cpu_index;
++    c->e[c->head].off = off;
++    c->head = (c->head + 1) % PGCL_RC_K;
++    if (off == 52 && v > c->maxrc && v < 255) {
++        c->maxrc = v;                           /* track peak refcount = "interesting" */
++    }
++}
++
++/* dump a cluster's refcount/mapcount write history (called at free) */
++int pgcl_rc_dump(uint64_t cpfn, int only_interesting);
++int pgcl_rc_dump(uint64_t cpfn, int only_interesting)
++{
++    struct pgcl_rcc *c;
++    int k;
++
++    if (pgcl_rc_armed != 1 || cpfn >= PGCL_RC_NCLUSTER) {
++        return 0;
++    }
++    c = &pgcl_rc[cpfn];
++    if (only_interesting && c->maxrc < 2) {
++        return 0;                               /* boring once-mapped page */
++    }
++    fprintf(stderr, "PGCL143rchist cpfn=0x%" PRIx64 " maxrc=%d:", cpfn, c->maxrc);
++    for (k = 0; k < PGCL_RC_K; k++) {
++        int idx = (c->head + k) % PGCL_RC_K;
++        struct pgcl_rcev *e = &c->e[idx];
++        int rc, mc, bad;
++        if (!e->rip) {
++            continue;
++        }
++        /* normalize to (rc, mc) regardless of which field this event wrote */
++        rc = (e->off == 52) ? e->val : e->sib;
++        mc = (e->off == 52) ? e->sib : e->val;
++        /* invariant: a mapped page (mc >= 0 => mc+1 mappings) needs rc >= mc+1.
++         * rc <= mc means fewer refs than mappings = lost/early refcount drop. */
++        bad = (mc >= 0 && rc <= mc);
++        fprintf(stderr, " [%s=%d/%s=%d%s cpu%d @%" PRIx64 "]",
++                e->off == 52 ? "rc" : "mc", e->val,
++                e->off == 52 ? "mc" : "rc", e->sib,
++                bad ? "!" : "", e->cpu, e->rip);
++    }
++    fprintf(stderr, "\n");
++    c->maxrc = 0;                               /* reset for the reused frame */
++    return 1;
++}
++
+ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
+                                int size, uintptr_t retaddr)
+ {
+@@ -1910,6 +2215,7 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
+                              full->attrs, wp_flags, retaddr);
+     }
+ 
++    pgcl_rc_record(cpu, addr, hostaddr, retaddr);   /* #143 refcount/mapcount write history */
+     return hostaddr;
+ 
+  stop_the_world:
 diff --git a/target/i386/cpu.c b/target/i386/cpu.c
 index 25bbbf7..3a73e5e 100644
 --- a/target/i386/cpu.c
@@ -315,7 +446,7 @@ index 693a955..04a0988 100644
                          "CR3 update: CR3=" TARGET_FMT_lx "\n", new_cr3);
          tlb_flush(env_cpu(env));
 diff --git a/target/i386/tcg/system/excp_helper.c b/target/i386/tcg/system/excp_helper.c
-index f622b5d..8107f8f 100644
+index f622b5d..b0cd526 100644
 --- a/target/i386/tcg/system/excp_helper.c
 +++ b/target/i386/tcg/system/excp_helper.c
 @@ -22,6 +22,9 @@
@@ -328,7 +459,7 @@ index f622b5d..8107f8f 100644
  #include "exec/page-protection.h"
  #include "exec/target_page.h"
  #include "exec/tlb-flags.h"
-@@ -139,6 +142,566 @@ static inline bool ptw_setl(const PTETranslate *in, uint32_t old, uint32_t set)
+@@ -139,6 +142,752 @@ static inline bool ptw_setl(const PTETranslate *in, uint32_t old, uint32_t set)
      return true;
  }
  
@@ -449,6 +580,11 @@ index f622b5d..8107f8f 100644
 + * on free; remaining noise is filtered by the pgcl0 control showing zero.
 + */
 +static int *pgcl_tally;
++static int *pgcl_under_streak;       /* #143: consecutive-scan undercount persistence */
++static unsigned long pgcl_pu_reports;
++#define PAGE_MMUCOUNT_HINT (1 << PGCL_MMUSHIFT)   /* sub-PTEs per cluster (pgcl4=16) */
++static void pgcl_classify_cluster(CPUX86State *env, uint64_t cl,
++                                  int *out_npgd, int *out_maxsub);
 +static unsigned long pgcl_xck_hits;
 +
 +/*
@@ -531,10 +667,14 @@ index f622b5d..8107f8f 100644
 +            pgcl_tally_level(env, pgcl_pgds[i], 0);
 +        }
 +    }
++    if (!pgcl_under_streak) {
++        pgcl_under_streak = g_malloc0(PGCL_NCLUSTER * sizeof(int));
++    }
 +    for (c = 0; c < PGCL_NCLUSTER; c++) {
 +        int rc, mc;
 +
 +        if (pgcl_tally[c] == 0) {
++            pgcl_under_streak[c] = 0;        /* unmapped: reset persistence */
 +            continue;                       /* no PTE maps it: nothing to cross-check */
 +        }
 +        if (!pgcl_read_page(env, c, &rc, &mc)) {
@@ -563,6 +703,7 @@ index f622b5d..8107f8f 100644
 +            }
 +        } else if (mc + 1 < pgcl_tally[c]) {
 +            n_under++;
++            pgcl_under_streak[c]++;
 +            if (pgcl_xck_hits < 64) {
 +                pgcl_xck_hits++;
 +                fprintf(stderr, "PGCL143xcheck #%lu MAPCOUNT-UNDERCOUNT cpfn=0x%"
@@ -570,10 +711,32 @@ index f622b5d..8107f8f 100644
 +                        " USER sub-PTEs\n",
 +                        pgcl_xck_hits, c, rc, mc, mc + 1, pgcl_tally[c]);
 +            }
++            /* PERSISTENT (not a fork window): undercounted across many scans on a
++             * STABLE mapped cluster.  Classify it (capped, no per-free cost):
++             *   npgd>>maxsub  (many AS, few sub-PTEs each) => Contract-A large
++             *                  anon: mapcount-per-kernel-page is correct = FP.
++             *   maxsub~=PAGE_MMUCOUNT, refcount<tally => genuine per-sub-PTE
++             *                  undercount => page will be freed while mapped = BUG. */
++            if (pgcl_under_streak[c] == 6 && pgcl_pu_reports < 128) {
++                int npgd = 0, maxsub = 0;
++                pgcl_pu_reports++;
++                pgcl_classify_cluster(env, c, &npgd, &maxsub);
++                fprintf(stderr, "PGCL143PERSUNDER cpfn=0x%" PRIx64 " refcount=%d"
++                        " mapcount=%d(=>%d) tally=%d  npgd_mapping=%d"
++                        " max_subPTE_per_pgd=%d  refcount%staly  %s\n",
++                        c, rc, mc, mc + 1, pgcl_tally[c], npgd, maxsub,
++                        rc < pgcl_tally[c] ? "<" : ">=",
++                        (maxsub >= PAGE_MMUCOUNT_HINT / 2 && npgd <= 4
++                         && rc < pgcl_tally[c])
++                            ? "=> PER-SUBPTE-UNDERCOUNT(BUG?)"
++                            : "=> contract-A-anon(likely-FP)");
++            }
 +        } else if (mc + 1 > pgcl_tally[c]) {
 +            n_over++;
++            pgcl_under_streak[c] = 0;
 +        } else {
 +            n_match++;
++            pgcl_under_streak[c] = 0;
 +        }
 +    }
 +    fprintf(stderr, "PGCL143xck-summary: inuse=%lu match=%lu undercount=%lu"
@@ -807,6 +970,142 @@ index f622b5d..8107f8f 100644
 +    return hits;
 +}
 +
++/*
++ * Fresh, targeted at-free scan: walk one pgd's whole user half RIGHT NOW (no
++ * reliance on the sparse reverse map) for a present USER 4K leaf whose frame
++ * lands in cluster `cl`.  Returns the leaf frame (and its va) on first hit, else
++ * 0.  This is what catches the transient premature-free that periodic sampling
++ * misses: at the instant the cluster returns to buddy, is anyone still mapping it?
++ */
++static uint64_t pgcl_find_in_cluster(CPUX86State *env, uint64_t tbl, int lvl,
++                                     uint64_t va, uint64_t cl, uint64_t *out_va)
++{
++    static const int sh[4] = { 39, 30, 21, 12 };
++    int i, hi = (lvl == 0) ? 256 : 512;
++
++    for (i = 0; i < hi; i++) {
++        uint64_t pa = tbl + (uint64_t)i * 8, e, cva;
++
++        if (pa >= PGCL_RAMLIMIT) {
++            continue;
++        }
++        e = cpu_ldq_mmuidx_ra(env, pa, MMU_PHYS_IDX, 0);
++        if (!(e & 1) || !(e & 4)) {
++            continue;                       /* present + USER only */
++        }
++        cva = va | ((uint64_t)i << sh[lvl]);
++        if (lvl == 3) {
++            uint64_t f = (e & 0x000ffffffffff000ULL) >> 12;
++            if ((f >> PGCL_MMUSHIFT) == cl) {
++                *out_va = cva;
++                return f;
++            }
++            continue;
++        }
++        if (e & 0x80) {
++            continue;                       /* huge leaf: not our 4K case */
++        }
++        {
++            uint64_t r = pgcl_find_in_cluster(env, e & 0x000ffffffffff000ULL,
++                                              lvl + 1, cva, cl, out_va);
++            if (r) {
++                return r;
++            }
++        }
++    }
++    return 0;
++}
++
++/* Count present USER 4K leaves into cluster `cl` within ONE pgd (its sub-PTE
++ * mappings in that address space).  Used to classify a PERSUNDER cluster:
++ *   many pgds x few sub-PTEs each  => Contract-A large anon (mapcount per kernel
++ *                                     page is CORRECT; PERSUNDER = false positive)
++ *   few pgds  x ~PAGE_MMUCOUNT each => per-sub-PTE undercount = the #143 bug. */
++static int pgcl_count_in_cluster(CPUX86State *env, uint64_t tbl, int lvl,
++                                 uint64_t cl)
++{
++    int i, hi = (lvl == 0) ? 256 : 512, n = 0;
++
++    for (i = 0; i < hi; i++) {
++        uint64_t pa = tbl + (uint64_t)i * 8, e;
++
++        if (pa >= PGCL_RAMLIMIT) {
++            continue;
++        }
++        e = cpu_ldq_mmuidx_ra(env, pa, MMU_PHYS_IDX, 0);
++        if (!(e & 1) || !(e & 4)) {
++            continue;
++        }
++        if (lvl == 3) {
++            if (((e & 0x000ffffffffff000ULL) >> 12 >> PGCL_MMUSHIFT) == cl) {
++                n++;
++            }
++            continue;
++        }
++        if (e & 0x80) {
++            continue;
++        }
++        n += pgcl_count_in_cluster(env, e & 0x000ffffffffff000ULL, lvl + 1, cl);
++    }
++    return n;
++}
++
++/* Classify a cluster's mappings across all live pgds: how many distinct address
++ * spaces map it, and the most sub-PTEs any single one uses. */
++static void pgcl_classify_cluster(CPUX86State *env, uint64_t cl,
++                                  int *out_npgd, int *out_maxsub)
++{
++    int i, npgd = 0, maxsub = 0;
++    for (i = 0; i < pgcl_npgd; i++) {
++        int n;
++        if (!pgcl_pgd_live(env, pgcl_pgds[i])) {
++            continue;
++        }
++        n = pgcl_count_in_cluster(env, pgcl_pgds[i], 0, cl);
++        if (n > 0) {
++            npgd++;
++            if (n > maxsub) {
++                maxsub = n;
++            }
++        }
++    }
++    *out_npgd = npgd;
++    *out_maxsub = maxsub;
++}
++
++/* Check every live pgd for a present USER PTE still mapping cluster `cl`.
++ * (Kept for targeted use; NOT called per-free -- the walk perturbs the race.) */
++static G_GNUC_UNUSED int pgcl_cluster_dangle_at_free(CPUX86State *env, uint64_t cl)
++{
++    int i, hits = 0;
++    /* Cheap pre-filter: only clusters that were mapped as of the last periodic
++     * cross-check (<=64 frees ago) can plausibly be freed-while-mapped.  A stale
++     * tally only causes an extra confirming walk (which returns 0), never a false
++     * positive.  This bounds the cost to recently-mapped freed clusters. */
++    if (!pgcl_tally || cl >= PGCL_NCLUSTER || pgcl_tally[cl] == 0) {
++        return 0;
++    }
++    for (i = 0; i < pgcl_npgd; i++) {
++        uint64_t va = 0, f;
++        if (!pgcl_pgd_live(env, pgcl_pgds[i])) {
++            continue;
++        }
++        f = pgcl_find_in_cluster(env, pgcl_pgds[i], 0, 0, cl, &va);
++        if (f && pgcl_dangle_hits < 256) {
++            extern int pgcl_rc_dump(uint64_t cpfn, int only_interesting);
++            pgcl_dangle_hits++;
++            hits++;
++            fprintf(stderr,
++                "PGCL143dangleAF #%lu: FREE-WHILE-MAPPED cl=0x%" PRIx64
++                " frame=0x%" PRIx64 " still mapped USER cr3=0x%" PRIx64
++                " va=0x%" PRIx64 " (npgd=%d)\n",
++                pgcl_dangle_hits, cl, f, pgcl_pgds[i], va, pgcl_npgd);
++            pgcl_rc_dump(cl, 0);    /* the refcount/mapcount history that led here */
++        }
++    }
++    return hits;
++}
++
 +void pgcl_dangle_signal(CPUX86State *env, uint64_t base, uint64_t count,
 +                        int freed);
 +void pgcl_dangle_signal(CPUX86State *env, uint64_t base, uint64_t count,
@@ -842,6 +1141,24 @@ index f622b5d..8107f8f 100644
 +                    base, cpfn, ok, rc, mc,
 +                    (ok && rc == 0 && mc == -1) ? "READER-OK" :
 +                    (ok ? "UNEXPECTED" : "READ-FAIL"));
++        }
++        {
++            /* dump the refcount/mapcount write-history of interesting
++             * (multi-ref) clusters being freed = the trajectory + RIPs that led
++             * to this free (the "unwindable history"). */
++            extern int pgcl_rc_dump(uint64_t cpfn, int only_interesting);
++            static unsigned long ndump;
++            uint64_t cf = base >> PGCL_MMUSHIFT;
++            uint64_t cc = base + count;
++            /* NB: the fresh at-free pgd walk (pgcl_cluster_dangle_at_free) is too
++             * perturbing -- it suppressed the race (killinit 0/4).  Detection is
++             * instead done with ZERO per-free cost via the periodic-xcheck
++             * persistent-undercount tracker (PGCL143PERSUNDER). */
++            for (; (cf << PGCL_MMUSHIFT) < cc && ndump < 96; cf++) {
++                if (pgcl_rc_dump(cf, 1)) {
++                    ndump++;
++                }
++            }
 +        }
 +        pgcl_n_free++;
 +    } else {
@@ -895,7 +1212,7 @@ index f622b5d..8107f8f 100644
  static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
                            TranslateResult *out, TranslateFault *err,
                            uint64_t ra)
-@@ -306,6 +869,12 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
+@@ -306,6 +1055,12 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
          /* combine pde and pte nx, user and rw protections */
          ptep &= pte ^ PG_NX_MASK;
          page_size = 4096;

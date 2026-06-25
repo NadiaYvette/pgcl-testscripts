@@ -85,3 +85,41 @@ guest PTE/mapcount updates) -> resolve by next scan.  Caveats: pgd coverage
 (npgd low); pgcl0 control needs PGCL_MMUSHIFT=0 (currently hardcoded 4).
 NEXT: per-write watch of the mapcount/refcount fields to catch the exact bad
 decrement (+RIP), isolating the bug window from normal update windows.
+
+## Update: per-write refcount/mapcount history tracker (the watchpoint of the field)
+`accel/tcg/cputlb.c` `pgcl_rc_record` (hooked in `atomic_mmu_lookup`): every
+guest atomic RMW on a struct-page `_refcount`(off52)/`_mapcount`(off48) in the
+vmemmap records (value-before, sibling-count, cpu, exact guest RIP) into a
+per-cluster ring (K=24), dumped at free of an interesting (maxrc>=2) cluster.
+Arm with `PGCL_RCHIST=1`.
+ - EXACT-RIP fix: `cpu_unwind_state_data` is read-only (`cpu_restore_state`
+   corrupts guest state mid-op), but for CF_PCREL kernel TBs x86 saves only the
+   LOW page bits in data[0] (`i386_tr_insn_start` masks `pc & ~PAGE_MASK`).  QEMU
+   splits TBs at page boundaries, so rebuild the full PC =
+   `(get_pc()&TARGET_PAGE_MASK) | (data[0]&~TARGET_PAGE_MASK)`.
+ - Resolve RIPs via `nm -n` enclosing symbol (addr2line `-f` returns the
+   misleading inlined leaf); see `rmap-ab/resolve-rchist.sh`.
+ - excp_helper.c persistence + classification: `pgcl_xcheck_scan` tracks
+   consecutive-scan undercount streaks (PGCL143PERSUNDER) and
+   `pgcl_classify_cluster` (npgd_mapping + max_subPTE_per_pgd) distinguishes a
+   real per-sub-PTE undercount from Contract-A large-anon (mapcount per kernel
+   page) false positives.
+
+FINDINGS (decisive): (1) every atomic rc/mc sequence is WELL-FORMED even in
+crashing runs (no underflow, never rc<=mc); the big jumps are batched
+`folio_put_refs`.  (2) the cross-check "undercount" is a MEASUREMENT RACE, not a
+leak: the fresh re-walk shows mapcount == actual current sub-PTEs (npgd=1
+maxsub=16), only the earlier tally over-read (32) — a mid-fork transient under
+`thread=multi`.  CONFIRMED at `-smp 1`: undercount=0 across all scans.  (3)
+PERTURBATION WALL quantified: killinit fires 2/4 with the light per-write tracker
+but 0/4 with any per-free pgd walk or heavy I/O.
+NET: #143 is a genuine SMP-timing race -> a TRANSIENT premature refcount->0
+during a concurrent batch-update window, NOT a persistent miscount (accounting is
+correct at rest).  Freeing path = reclaim (shrink_folio_list).
+NEXT: (a) catch the one remaining blind spot — NON-ATOMIC stores (`atomic_set` via
+set_page_count/page_mapcount_reset) bypass `atomic_mmu_lookup` (TCG inlines
+fast-path stores); force the struct-page region through the slow path with a
+write-watchpoint so every write (atomic+non-atomic) is logged.  (b) a large
+RAM-ring history of every struct-page field write (seq,cpfn,off,oldval,rip,cpu)
+so the symptom can be rewound to the causal operation OFFLINE (no perturbing
+online checks).
