@@ -17,7 +17,7 @@ for i in $(seq 1 "$N"); do
     PGCL_DANGLE=1 PGCL_RCHIST=1 PGCL_HISTGB="$GB" PGCL_HISTFILE="$HF" \
       bash "$D/iso" timeout 360 "$QB/qemu-system-x86_64" -accel tcg,thread=multi \
         -cpu max,la57=off -smp 8 -m 2G -kernel "$D/bzImage-vandangle" \
-        -initrd "$A/initramfs.cpio.gz" -append "console=ttyS0 nokaslr ignore_loglevel panic=1" \
+        -initrd "$A/initramfs.cpio.gz" -append "console=ttyS0 nokaslr ignore_loglevel panic=1 pgcl143_setlog" \
         -drive file="$D/btrfs.img",format=raw,if=virtio \
         -drive file="$P/pgcl4-testbed/swap.raw",format=raw,if=virtio \
         -nographic -no-reboot > "$L" 2>&1

@@ -1,0 +1,103 @@
+diff --git a/mm/memory.c b/mm/memory.c
+index c41e852d2de8..284f427b0b14 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -42,6 +42,7 @@
+ #include <linux/kernel_stat.h>
+ #include <linux/mm.h>
+ #include <linux/mm_inline.h>
++#include <linux/moduleparam.h>	/* #143 folio-guard core_param */
+ #include <linux/sched/mm.h>
+ #include <linux/sched/numa_balancing.h>
+ #include <linux/sched/task.h>
+@@ -1834,6 +1835,39 @@ zap_install_uffd_wp_if_needed(struct vm_area_struct *vma,
+ 	return was_installed;
+ }
+ 
++/* === #143 folio-guard A/B (core_param pgcl143_guard) ====================
++ * 0 = off, 1 = folio-pfn-hashed spinlock (serializes the file rmap count+PTE
++ * step ACROSS mms on the same folio), 2 = per-CPU placebo (same lock/unlock
++ * cost, never serializes cross-mm).  Taken under the PTL (PTL -> glock order,
++ * consistent on install and teardown), so no lock inversion.  DEBUG ONLY.
++ */
++int pgcl143_guard;
++core_param(pgcl143_guard, pgcl143_guard, int, 0644);
++#define PGCL_GLOCKS 4096
++static spinlock_t pgcl_glocks[PGCL_GLOCKS];
++static DEFINE_PER_CPU(spinlock_t, pgcl_placebo_lock);
++static int __init pgcl143_guard_init(void)
++{
++	int i;
++	unsigned int c;
++
++	for (i = 0; i < PGCL_GLOCKS; i++)
++		spin_lock_init(&pgcl_glocks[i]);
++	for_each_possible_cpu(c)
++		spin_lock_init(per_cpu_ptr(&pgcl_placebo_lock, c));
++	return 0;
++}
++core_initcall(pgcl143_guard_init);
++static inline spinlock_t *pgcl143_glock(unsigned long pfn)
++{
++	if (pgcl143_guard == 1)
++		return &pgcl_glocks[pfn & (PGCL_GLOCKS - 1)];
++	if (pgcl143_guard == 2)
++		return this_cpu_ptr(&pgcl_placebo_lock);
++	return NULL;
++}
++/* ====================================================================== */
++
+ static __always_inline void zap_present_folio_ptes(struct mmu_gather *tlb,
+ 		struct vm_area_struct *vma, struct folio *folio,
+ 		struct page *page, pte_t *pte, pte_t ptent, unsigned int nr,
+@@ -1842,8 +1876,12 @@ static __always_inline void zap_present_folio_ptes(struct mmu_gather *tlb,
+ {
+ 	struct mm_struct *mm = tlb->mm;
+ 	bool delay_rmap = false;
++	spinlock_t *gl = NULL;	/* #143 folio-guard */
+ 
+ 	if (!folio_test_anon(folio)) {
++		gl = pgcl143_glock(folio_pfn(folio));
++		if (gl)
++			spin_lock(gl);
+ 		ptent = get_and_clear_full_ptes(mm, addr, pte, nr, tlb->fullmm);
+ 		if (pte_dirty(ptent)) {
+ 			folio_mark_dirty(folio);
+@@ -1873,6 +1911,8 @@ static __always_inline void zap_present_folio_ptes(struct mmu_gather *tlb,
+ 		if (unlikely(folio_mapcount(folio) < 0))
+ 			print_bad_pte(vma, addr, ptent, page);
+ 	}
++	if (gl)
++		spin_unlock(gl);	/* #143 folio-guard */
+ 	if (unlikely(__tlb_remove_folio_pages(tlb, page, nr, delay_rmap))) {
+ 		*force_flush = true;
+ 		*force_break = true;
+@@ -6450,6 +6490,7 @@ void set_pte_range(struct vm_fault *vmf, struct folio *folio,
+ 	 */
+ 	unsigned int nr_ptes = (PAGE_MMUSHIFT && nr > 1) ?
+ 		nr * PAGE_MMUCOUNT : nr;
++	spinlock_t *gl = NULL;	/* #143 folio-guard */
+ 
+ 	flush_icache_pages(vma, page, nr);
+ 	entry = mk_pte(page, vma->vm_page_prot);
+@@ -6497,6 +6538,11 @@ void set_pte_range(struct vm_fault *vmf, struct folio *folio,
+ 		 * per-page counter with no scan, because the zap removes the
+ 		 * same way.
+ 		 */
++		if (!folio_test_anon(folio)) {		/* #143 folio-guard */
++			gl = pgcl143_glock(folio_pfn(folio));
++			if (gl)
++				spin_lock(gl);
++		}
+ 		if (nr == 1) {
+ 			folio_add_rmap_subptes(folio, page, 1, vma);
+ 		} else {
+@@ -6511,6 +6557,8 @@ void set_pte_range(struct vm_fault *vmf, struct folio *folio,
+ #endif
+ 	}
+ 	set_ptes(vma->vm_mm, addr, vmf->pte, entry, nr_ptes);
++	if (gl)
++		spin_unlock(gl);	/* #143 folio-guard */
+ 
+ 	/* no need to invalidate: a not-present page won't be cached */
+ 	update_mmu_cache_range(vmf, vma, addr, vmf->pte, nr_ptes);

@@ -1,0 +1,29 @@
+diff --git a/mm/filemap.c b/mm/filemap.c
+index f9e6604ffa05..38bf22ea7034 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -3781,6 +3781,24 @@ static int filemap_set_ptes_cluster(struct vm_fault *vmf,
+ 	pte_t base;
+ 	int i, nr_set = 0;
+ 
++	{
++		/*
++		 * #143: does the fault install this folio at the SAME VA the
++		 * rmap walk will later derive from its pgoff?  If not, reclaim's
++		 * try_to_unmap clears the wrong VA, removes the mapcount, and
++		 * leaves the real PTE present-but-uncounted => freed-while-mapped
++		 * dangler that no rmap-based audit can see.
++		 */
++		static atomic_t vamiss_n = ATOMIC_INIT(0);
++		unsigned long rmap_va = pgoff_to_vma_addr(vma, page_pgoff(folio, page));
++
++		if (rmap_va != addr && (long)rmap_va != -EFAULT &&
++		    atomic_inc_return(&vamiss_n) <= 24)
++			pr_err("PGCL143vamiss: install addr=%lx != rmap_va=%lx folio_index=%lx page_pgoff=%lx vm_pgoff=%lx vm_start=%lx pfn=%lx\n",
++			       addr, rmap_va, folio->index, page_pgoff(folio, page),
++			       vma->vm_pgoff, vma->vm_start, folio_pfn(folio));
++	}
++
+ 	base = mk_pte(page, vma->vm_page_prot);
+ 	if (pte_write(base) && folio_test_dirty(folio))
+ 		base = pte_mkdirty(base);

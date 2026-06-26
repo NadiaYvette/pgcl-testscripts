@@ -1,0 +1,43 @@
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 7f797beeca91..72ba05fceda6 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1915,7 +1915,38 @@ static __always_inline void __folio_remove_rmap(struct folio *folio,
+ 	switch (level) {
+ 	case PGTABLE_LEVEL_PTE:
+ 		if (!folio_test_large(folio)) {
++#if PAGE_MMUSHIFT
++			/*
++			 * #143 laptop capture (light, non-perturbing): order-0
++			 * mapcount must never drop below -1.  atomic_add_negative()
++			 * can't distinguish -1 (clean last unmap) from -2/-3 (the
++			 * #143 freed-while-mapped / dangling-PTE underflow), so read
++			 * the result and report on underflow.  This fires ONLY on the
++			 * bug, so it does not perturb the timing race (unlike a ring
++			 * tracer); dump_page()+PAGE_OWNER+DEBUG_VM give the page
++			 * history, dump_stack() (once) names the remove path.  No
++			 * WARN/BUG -> cannot trip panic_on_warn/panic on the laptop.
++			 */
++			int v = atomic_sub_return(1, &folio->_mapcount);
++
++			if (unlikely(v < -1)) {
++				static atomic_t pgcl143_uf = ATOMIC_INIT(0);
++				int n = atomic_inc_return(&pgcl143_uf);
++
++				if (n <= 8) {
++					pr_err("PGCL143wp #%d: order-0 mapcount underflow pfn=%lx mc=%d rc=%d anon=%d index=%lx\n",
++					       n, folio_pfn(folio), v,
++					       folio_ref_count(folio),
++					       folio_test_anon(folio), folio->index);
++					dump_page(&folio->page, "PGCL143 order-0 underflow");
++					if (n == 1)
++						dump_stack();
++				}
++			}
++			nr = (v < 0);
++#else
+ 			nr = atomic_add_negative(-1, &folio->_mapcount);
++#endif
+ 			break;
+ 		}
+ 

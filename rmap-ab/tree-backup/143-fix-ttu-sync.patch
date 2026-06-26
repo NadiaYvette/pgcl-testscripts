@@ -1,0 +1,25 @@
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 212a8f20ae65..917c147f0597 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1343,8 +1343,19 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
+ 			 * unmapped after try_to_unmap; TTU_SYNC helps
+ 			 * try_to_unmap acquire PTL from the first PTE,
+ 			 * eliminating the influence of temporary PTE values.
++			 *
++			 * PGCL (#143): an order-0 file/shmem folio is mapped by
++			 * up to PAGE_MMUCOUNT hardware sub-PTEs, so it is
++			 * multiply-mapped exactly like a large folio and suffers
++			 * the identical lazy-PTL race against a concurrent COW
++			 * that transiently clears a sub-PTE -- the unsynchronised
++			 * reclaim walk skips it, folio_mapped() reads a too-low
++			 * count, and the folio is freed while a sub-PTE stays
++			 * mapped (dangling PTE -> later zap drives _mapcount
++			 * negative -> page-cache corruption).  So synchronise for
++			 * every mapped folio under PGCL, not just large ones.
+ 			 */
+-			if (folio_test_large(folio))
++			if (folio_test_large(folio) || PAGE_MMUSHIFT)
+ 				flags |= TTU_SYNC;
+ 
+ 			try_to_unmap(folio, flags);

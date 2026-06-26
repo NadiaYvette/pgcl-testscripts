@@ -81,6 +81,18 @@ rmap-ab/file_reclaim_race_repro
 rmap-ab/file_rmap_repro
 rmap-ab/file_reclaim_race_repro
 rmap-ab/setup-cpu-partitions-wrap
+# QEMU icount record/replay + reverse-debug: KEEP the scripts (rr-record.sh,
+# replay-rr.sh, rr-verify.sh, rev-debug.gdb, RR-REVERSE-DEBUG.md); ignore the
+# heavy regenerable bits — recordings, qcow2 overlays, deep-history dumps and
+# the generated initramfs (init.c is the only source there).
+*.qcow2
+rmap-ab/*.bin
+*.cpio.gz
+*.tar.gz
+rmap-ab/abl-initramfs/init
+rmap-ab/abl-initramfs/repro
+rmap-ab/abl-initramfs/stage/
+pgcl143-laptop-*/
 # Phone boot-video captures (superseded by pstore/journal)
 laptop-boot-video/
 pgcl-boot-vids/

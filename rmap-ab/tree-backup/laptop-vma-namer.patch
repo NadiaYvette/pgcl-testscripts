@@ -1,0 +1,57 @@
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 7f797beeca91..5b5c8d508e36 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1902,6 +1902,36 @@ void folio_add_file_rmap_pud(struct folio *folio, struct page *page,
+ #endif
+ }
+ 
++#if PAGE_MMUSHIFT
++/*
++ * #143 VMA-namer: order-0 mapcount underflow means a sub-PTE was removed that
++ * was never counted (a dangling PTE installed without an rmap event -- invisible
++ * to any rmap-event trace).  We can't see the *creator* here, but the remover
++ * holds the offending @vma, so name the mapping that ACCUMULATED the dangler:
++ * its file (%pD), flags (shared/private/write), pgoff, and the tearing-down
++ * task.  Catch-time only (rare) => zero hot-path cost => responsive.
++ */
++static atomic_t pgcl143_wp_n = ATOMIC_INIT(0);
++static void pgcl143_wp_catch(struct folio *folio, struct page *page,
++			     struct vm_area_struct *vma, int mc)
++{
++	int n = atomic_inc_return(&pgcl143_wp_n);
++
++	if (n > 16)
++		return;
++	pr_err("PGCL143wp #%d: order-0 underflow pfn=%lx mc=%d rc=%d anon=%d mapping=%px\n",
++	       n, folio_pfn(folio), mc, folio_ref_count(folio),
++	       folio_test_anon(folio), folio->mapping);
++	pr_err("   remover comm=%s pid=%d %s-mm vma=%px flags=%#lx pgoff=%lx file=%pD\n",
++	       current->comm, current->pid,
++	       (vma && vma->vm_mm == current->mm) ? "own" : "foreign",
++	       vma, vma ? (unsigned long)vma->vm_flags : 0UL,
++	       vma ? vma->vm_pgoff : 0UL, vma ? vma->vm_file : NULL);
++	dump_page(page, "PGCL143 order-0 underflow");
++	dump_stack();
++}
++#endif
++
+ static __always_inline void __folio_remove_rmap(struct folio *folio,
+ 		struct page *page, int nr_pages, struct vm_area_struct *vma,
+ 		enum pgtable_level level)
+@@ -1915,7 +1945,15 @@ static __always_inline void __folio_remove_rmap(struct folio *folio,
+ 	switch (level) {
+ 	case PGTABLE_LEVEL_PTE:
+ 		if (!folio_test_large(folio)) {
++#if PAGE_MMUSHIFT
++			int mc143 = atomic_sub_return(1, &folio->_mapcount);
++
++			nr = (mc143 < 0);
++			if (unlikely(mc143 < -1))
++				pgcl143_wp_catch(folio, page, vma, mc143);
++#else
+ 			nr = atomic_add_negative(-1, &folio->_mapcount);
++#endif
+ 			break;
+ 		}
+ 

@@ -1,0 +1,288 @@
+diff --git a/mm/memory.c b/mm/memory.c
+index c41e852d2de8..59da901e0fb2 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -5669,6 +5669,21 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 		add_mm_counter(vma->vm_mm, MM_SWAPENTS, -nr_rss);
+ 	}
+ 	pte = mk_pte(page, vma->vm_page_prot);
++#if PAGE_MMUSHIFT
++	/*
++	 * PGCL swap fix: the cluster's sub-pages share one swap slot, so map
++	 * THIS faulting sub-PTE to its own sub-page via the fault-address
++	 * sub-offset (not always sub-page 0).  Large folios (nr_pages>1) get
++	 * their sub-offsets from the nr_ptes/set_ptes stride below; order-0
++	 * (nr_pages==1) must have it stamped here.
++	 */
++	if (nr_pages == 1) {
++		unsigned int sub = (address & (PAGE_SIZE - 1)) >> MMUPAGE_SHIFT;
++
++		pte = __pte(pte_val(pte) +
++			    __phys_to_pte_val((phys_addr_t)sub * MMUPAGE_SIZE));
++	}
++#endif
+ 	if (pte_swp_soft_dirty(vmf->orig_pte))
+ 		pte = pte_mksoft_dirty(pte);
+ 	if (pte_swp_uffd_wp(vmf->orig_pte))
+@@ -5767,33 +5782,57 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 	 * entries and prefetch them into the swap cache asynchronously.
+ 	 * This avoids I/O stalls on subsequent sub-page faults.
+ 	 */
++	/*
++	 * PGCL swap fix: prefetch DISABLED.  Under the 1-slot-per-cluster swap
++	 * model every sibling sub-PTE holds the SAME swap entry, so the first
++	 * swap-in already reads the whole cluster folio and the neighbours are
++	 * folio cache hits.  Prefetching them is therefore redundant, and the
++	 * 15 read_swap_cache_async() folio allocations per fault amplify reclaim
++	 * into a swap thrash under memory pressure.
++	 */
+ 	if (PAGE_MMUSHIFT && nr_pages == 1 && !folio_test_large(folio)) {
+ 		unsigned long cluster_start = address & PAGE_MASK;
+ 		unsigned long sub_idx = (address - cluster_start) >> MMUPAGE_SHIFT;
+ 		pte_t *cluster_ptep = ptep - sub_idx;
+-		unsigned long neighbor_addr;
+ 		int i;
+ 
++		/*
++		 * PGCL swap fix: this cluster's PAGE_MMUCOUNT sub-pages share ONE
++		 * swap slot, so the folio just read back holds ALL of them.  Map
++		 * every sibling sub-PTE that still carries this slot's swap entry
++		 * NOW, under the PTL, each to its own sub-page -- one fault per
++		 * cluster, no stragglers to race or lose (the old prefetch here
++		 * assumed distinct per-sub-page slots, which don't exist).
++		 */
+ 		for (i = 0; i < PAGE_MMUCOUNT; i++) {
+-			pte_t neighbor;
+-			softleaf_t sl;
++			unsigned long na = cluster_start +
++					   ((unsigned long)i << MMUPAGE_SHIFT);
++			pte_t nold = ptep_get(cluster_ptep + i);
++			softleaf_t sl = softleaf_from_pte(nold);
++			swp_entry_t ne;
++			pte_t np;
+ 
+ 			if (i == (int)sub_idx)
++				continue;	/* faulting sub-PTE already mapped */
++			if (na < vma->vm_start || na >= vma->vm_end)
+ 				continue;
+-
+-			neighbor_addr = cluster_start + ((unsigned long)i << MMUPAGE_SHIFT);
+-			if (neighbor_addr < vma->vm_start ||
+-			    neighbor_addr >= vma->vm_end)
+-				continue;
+-
+-			neighbor = ptep_get(cluster_ptep + i);
+-			sl = softleaf_from_pte(neighbor);
+ 			if (!softleaf_is_swap(sl))
+ 				continue;
+-
+-			swap_prefetch[swap_prefetch_nr++] = sl;
+-			if (swap_prefetch_nr >= PAGE_MMUCOUNT - 1)
+-				break;
++			ne = sl;
++			if (ne.val != entry.val)
++				continue;	/* a different slot -- leave it */
++
++			/* faulting pte's perms/flags, re-based to sub-page i */
++			np = __pte(pte_val(pte)
++				   - __phys_to_pte_val((unsigned long)sub_idx * MMUPAGE_SIZE)
++				   + __phys_to_pte_val((unsigned long)i * MMUPAGE_SIZE));
++			folio_ref_inc(folio);
++			folio_add_anon_rmap_pte(folio, page, vma, na, rmap_flags);
++			set_pte_at(vma->vm_mm, na, cluster_ptep + i, np);
++			update_mmu_cache_range(vmf, vma, na, cluster_ptep + i, 1);
++			folio_put_swap(folio, page);	/* drop this slot ref (== ne) */
++			add_mm_counter(vma->vm_mm, MM_ANONPAGES, 1);
++			add_mm_counter(vma->vm_mm, MM_SWAPENTS, -1);
+ 		}
+ 	}
+ 
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 7f797beeca91..52caf6b28654 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1902,6 +1902,77 @@ void folio_add_file_rmap_pud(struct folio *folio, struct page *page,
+ #endif
+ }
+ 
++#if PAGE_MMUSHIFT
++/*
++ * #143 VMA-namer: order-0 mapcount underflow means a sub-PTE was removed that
++ * was never counted (a dangling PTE installed without an rmap event -- invisible
++ * to any rmap-event trace).  We can't see the *creator* here, but the remover
++ * holds the offending @vma, so name the mapping that ACCUMULATED the dangler:
++ * its file (%pD), flags (shared/private/write), pgoff, and the tearing-down
++ * task.  Catch-time only (rare) => zero hot-path cost => responsive.
++ */
++static atomic_t pgcl143_wp_n = ATOMIC_INIT(0);
++static void pgcl143_wp_catch(struct folio *folio, struct page *page,
++			     struct vm_area_struct *vma, int mc)
++{
++	int n = atomic_inc_return(&pgcl143_wp_n);
++
++	if (n > 16)
++		return;
++	pr_err("PGCL143wp #%d: order-0 underflow pfn=%lx mc=%d rc=%d anon=%d mapping=%px\n",
++	       n, folio_pfn(folio), mc, folio_ref_count(folio),
++	       folio_test_anon(folio), folio->mapping);
++	pr_err("   remover comm=%s pid=%d %s-mm vma=%px flags=%#lx pgoff=%lx file=%pD\n",
++	       current->comm, current->pid,
++	       (vma && vma->vm_mm == current->mm) ? "own" : "foreign",
++	       vma, vma ? (unsigned long)vma->vm_flags : 0UL,
++	       vma ? vma->vm_pgoff : 0UL, vma ? vma->vm_file : NULL);
++	dump_page(page, "PGCL143 order-0 underflow");
++	dump_stack();
++}
++
++static bool pgcl143_dangle_one(struct folio *folio, struct vm_area_struct *vma,
++			       unsigned long address, void *arg)
++{
++	DEFINE_FOLIO_VMA_WALK(pvmw, folio, vma, address, PVMW_SYNC);
++	int *cnt = arg;
++
++	while (page_vma_mapped_walk(&pvmw)) {
++		(*cnt)++;
++		pr_err("PGCL143dangle:   comm=%s mm=%px vaddr=%lx (rmap-base=%lx) pte=%lx\n",
++		       current->comm, (void *)vma->vm_mm, pvmw.address, address,
++		       pvmw.pte ? (unsigned long)pte_val(ptep_get(pvmw.pte)) : 0UL);
++	}
++	return true;
++}
++
++/*
++ * #143: called from shrink_folio_list AFTER try_to_unmap left folio_mapped()
++ * == false (mapcount says fully unmapped) and just before the folio is freed.
++ * Re-walk the rmap for any STILL-PRESENT PTE -- a freed-while-mapped, uncounted
++ * dangling mapping (the #143 corruption seed).  Prints each survivor's address
++ * next to the rmap-computed base so an install-vs-walk VA skew shows up.
++ */
++void pgcl143_audit_dangler(struct folio *folio)
++{
++	static atomic_t n = ATOMIC_INIT(0);
++	struct rmap_walk_control rwc = {
++		.rmap_one = pgcl143_dangle_one,
++		.anon_lock = folio_lock_anon_vma_read,
++	};
++	int cnt = 0;
++
++	if (atomic_read(&n) > 24)
++		return;
++	rwc.arg = &cnt;
++	rmap_walk(folio, &rwc);
++	if (cnt && atomic_inc_return(&n) <= 24)
++		pr_err("PGCL143dangle: FREED-WHILE-MAPPED pfn=%lx index=%lx mapcount=%d refcount=%d anon=%d -- %d present PTE(s) survived reclaim\n",
++		       folio_pfn(folio), folio->index, folio_mapcount(folio),
++		       folio_ref_count(folio), folio_test_anon(folio), cnt);
++}
++#endif
++
+ static __always_inline void __folio_remove_rmap(struct folio *folio,
+ 		struct page *page, int nr_pages, struct vm_area_struct *vma,
+ 		enum pgtable_level level)
+@@ -1915,7 +1986,15 @@ static __always_inline void __folio_remove_rmap(struct folio *folio,
+ 	switch (level) {
+ 	case PGTABLE_LEVEL_PTE:
+ 		if (!folio_test_large(folio)) {
++#if PAGE_MMUSHIFT
++			int mc143 = atomic_sub_return(1, &folio->_mapcount);
++
++			nr = (mc143 < 0);
++			if (unlikely(mc143 < -1))
++				pgcl143_wp_catch(folio, page, vma, mc143);
++#else
+ 			nr = atomic_add_negative(-1, &folio->_mapcount);
++#endif
+ 			break;
+ 		}
+ 
+@@ -2423,9 +2502,25 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
+ 				goto discard;
+ 			}
+ 
+-			if (folio_dup_swap(folio, subpage) < 0) {
+-				set_pte_at(mm, address, pvmw.pte, pteval);
+-				goto walk_abort;
++			{
++				/*
++				 * PGCL swap fix: nr_pages sub-PTEs of this cluster
++				 * share ONE swap slot -> take nr_pages refs, matched
++				 * by the per-fault folio_put_swap on swap-in.  (Was 1
++				 * ref + 1 installed entry => 15/16 sub-pages lost as
++				 * zero on swap-in: the "swap quirk".)
++				 */
++				unsigned int _dn = 0;
++
++				while (_dn < nr_pages &&
++				       folio_dup_swap(folio, subpage) >= 0)
++					_dn++;
++				if (_dn != nr_pages) {
++					while (_dn--)
++						folio_put_swap(folio, subpage);
++					set_ptes(mm, address, pvmw.pte, pteval, nr_pages);
++					goto walk_abort;
++				}
+ 			}
+ 
+ 			/*
+@@ -2434,16 +2529,22 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
+ 			 * so we'll not check/care.
+ 			 */
+ 			if (arch_unmap_one(mm, vma, address, pteval) < 0) {
+-				folio_put_swap(folio, subpage);
+-				set_pte_at(mm, address, pvmw.pte, pteval);
++				unsigned int _i;
++
++				for (_i = 0; _i < nr_pages; _i++)
++					folio_put_swap(folio, subpage);
++				set_ptes(mm, address, pvmw.pte, pteval, nr_pages);
+ 				goto walk_abort;
+ 			}
+ 
+ 			/* See folio_try_share_anon_rmap(): clear PTE first. */
+ 			if (anon_exclusive &&
+ 			    folio_try_share_anon_rmap_pte(folio, subpage)) {
+-				folio_put_swap(folio, subpage);
+-				set_pte_at(mm, address, pvmw.pte, pteval);
++				unsigned int _i;
++
++				for (_i = 0; _i < nr_pages; _i++)
++					folio_put_swap(folio, subpage);
++				set_ptes(mm, address, pvmw.pte, pteval, nr_pages);
+ 				goto walk_abort;
+ 			}
+ 			if (list_empty(&mm->mmlist)) {
+@@ -2463,7 +2564,7 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
+ 			 * (pre-existing PGCL swap quirk).
+ 			 */
+ 			add_mm_counter(mm, MM_ANONPAGES, -nr_pages);
+-			inc_mm_counter(mm, MM_SWAPENTS);
++			add_mm_counter(mm, MM_SWAPENTS, nr_pages);
+ 			swp_pte = swp_entry_to_pte(entry);
+ 			if (anon_exclusive)
+ 				swp_pte = pte_swp_mkexclusive(swp_pte);
+@@ -2478,7 +2579,25 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
+ 				if (pte_swp_uffd_wp(pteval))
+ 					swp_pte = pte_swp_mkuffd_wp(swp_pte);
+ 			}
++#if PAGE_MMUSHIFT
++			{
++				/*
++				 * PGCL swap fix: install the swap entry in ALL
++				 * nr_pages sub-PTEs of the cluster (same slot; the
++				 * sub-page is derived from the fault address on
++				 * swap-in).  Without this, only 1 sub-PTE held the
++				 * entry and the other 15 faulted as zero pages.
++				 */
++				unsigned int _i;
++
++				for (_i = 0; _i < nr_pages; _i++)
++					set_pte_at(mm,
++						address + (unsigned long)_i * MMUPAGE_SIZE,
++						pvmw.pte + _i, swp_pte);
++			}
++#else
+ 			set_pte_at(mm, address, pvmw.pte, swp_pte);
++#endif
+ 		} else {
+ 			/*
+ 			 * This is a locked file-backed folio,

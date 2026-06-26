@@ -1,0 +1,59 @@
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+index b063a57..922d3ee 100644
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -408,6 +408,21 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
+     }
+ }
+ 
++/*
++ * PGCL #143 over-flush probe: when env PGCL_OVERFLUSH is set, escalate every
++ * guest page/range TLB flush to a FULL flush.  If the bug is the kernel failing
++ * to invalidate a cluster's sibling sub-PTEs (leaving stale softmmu-TLB
++ * entries), this papers over exactly that gap and the repro goes clean ->
++ * confirms a TLB-flush gap.  Toggle without rebuilding via the env var.
++ */
++static bool pgcl_overflush_on(void)
++{
++    static int v = -1;
++    if (v < 0)
++        v = !!getenv("PGCL_OVERFLUSH");
++    return v;
++}
++
+ void tlb_flush_by_mmuidx(CPUState *cpu, uint16_t idxmap)
+ {
+     tlb_debug("mmu_idx: 0x%" PRIx16 "\n", idxmap);
+@@ -601,6 +616,7 @@ static void tlb_flush_page_by_mmuidx_async_2(CPUState *cpu,
+ 
+ void tlb_flush_page_by_mmuidx(CPUState *cpu, vaddr addr, uint16_t idxmap)
+ {
++    if (pgcl_overflush_on()) { tlb_flush(cpu); return; }
+     tlb_debug("addr: %016" VADDR_PRIx " mmu_idx:%" PRIx16 "\n", addr, idxmap);
+ 
+     assert_cpu_is_self(cpu);
+@@ -620,6 +636,7 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
+                                               vaddr addr,
+                                               uint16_t idxmap)
+ {
++    if (pgcl_overflush_on()) { tlb_flush_all_cpus_synced(src_cpu); return; }
+     tlb_debug("addr: %016" VADDR_PRIx " mmu_idx:%"PRIx16"\n", addr, idxmap);
+ 
+     /* This should already be page aligned */
+@@ -771,6 +788,7 @@ void tlb_flush_range_by_mmuidx(CPUState *cpu, vaddr addr,
+ {
+     TLBFlushRangeData d;
+ 
++    if (pgcl_overflush_on()) { tlb_flush(cpu); return; }
+     assert_cpu_is_self(cpu);
+ 
+     /* If no page bits are significant, this devolves to tlb_flush. */
+@@ -811,6 +829,8 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
+     TLBFlushRangeData d, *p;
+     CPUState *dst_cpu;
+ 
++    if (pgcl_overflush_on()) { tlb_flush_all_cpus_synced(src_cpu); return; }
++
+     /* If no page bits are significant, this devolves to tlb_flush. */
+     if (bits < TARGET_PAGE_BITS) {
+         tlb_flush_by_mmuidx_all_cpus_synced(src_cpu, idxmap);

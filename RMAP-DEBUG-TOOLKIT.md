@@ -241,3 +241,34 @@ run -cpu max,la57=off). offset 48 is a union (page_type=PGTY_buddy=0xf0000000 on
 free pages) — read as mapcount only when refcount>0. NEXT: cross-check kernel
 _mapcount vs actual present sub-PTE count (pgd walk) per cluster — the
 PTE-vs-struct-page discrepancy is the accounting bug directly.
+
+---
+
+## G. Deterministic record/replay + reverse debugging (2026-06-26)
+
+The forward probes (A, F) answer *what* the counts did; record/replay answers
+*why*, by running the deterministic recording **backward** from the symptom to
+the causal instruction.
+
+**Enabling finding:** #143 **reproduces at `-smp 1`** (~2/3 under icount), so it
+is a single-CPU **scheduling-sensitive interleaving** (faulting task vs
+kswapd/reclaim across context switches), **not a parallel cross-CPU race**. This
+both explains the clean parallel-race audits (there is no two-CPU race) and makes
+it recordable — QEMU record/replay is `-smp 1` only.
+
+**Files (`rmap-ab/`):** `RR-REVERSE-DEBUG.md` (full how-to), `rr-record.sh`
+(record until kill-init, keep the rrfile), `rr-verify.sh` (prove bit-exact
+replay), `replay-rr.sh` (replay under a frozen gdbstub), `rev-debug.gdb` (gdb
+macros + recipe).
+
+**Recipe:** record a crashing run → replay it under gdb → `continue` to the fatal
+`RIP=0` fault → `reverse-stepi` to the bad `ret` → translate the stale stack slot
+to its **victim cluster pfn** → `watch` that cluster's `_refcount` at its vmemmap
+address → `reverse-continue` → the write that drove refcount to 0 prematurely →
+`bt` = root cause. Needs a not-stripped `vmlinux` matching `bzImage-vandangle`
+(`kernel-rpm-build/pgcl4-debug/vmlinux`) and a QEMU advertising `ReverseContinue+`.
+
+**Setup lessons (in RR-REVERSE-DEBUG.md):** fresh qcow2 overlay per run instead of
+`rrsnapshot` (which wrote duplicate snapshots → replay diverged); `blkreplay`-wrap
+the drives; never share a RAW image between two live QEMU; watch kernel-linear
+(vmemmap) addresses so the watchpoint survives context switches.

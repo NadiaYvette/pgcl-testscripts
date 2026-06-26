@@ -22,7 +22,7 @@ import sys, struct, bisect, subprocess
 
 EREC = struct.Struct("<QQIiiBBBB")
 KIND = {0: "rc", 1: "mc", 2: "FREE", 3: "alloc", 4: "nonatomic", 5: "map",
-        8: "swapout"}
+        8: "swapout", 9: "install"}
 MMUSHIFT = 4
 
 def load(path, want=None):
@@ -38,7 +38,7 @@ def load(path, want=None):
         if seq == 0 or seq < lo or seq >= head:
             continue
         if want is not None:        # filter on read (memory-safe for huge dumps)
-            if kind in (0, 1, 5, 8):
+            if kind in (0, 1, 5, 8, 9):
                 if frame != want:
                     continue
             elif kind in (2, 3):
@@ -94,7 +94,7 @@ def main():
     bycpfn = {}
     for e in evs:
         seq, rip, frame, a, b, kind, cpu, off = e
-        if kind in (0, 1, 5, 8):
+        if kind in (0, 1, 5, 8, 9):
             bycpfn.setdefault(frame, []).append(e)
         elif kind in (2, 3):       # free/alloc may span clusters
             ncl = max(1, a >> MMUSHIFT)
@@ -115,6 +115,9 @@ def main():
                 print(f"  seq={seq:<10} swapout   pgd=0x{a:x}000 "
                       f"nr={b & 0xff} sub_off={(b >> 8) & 0xff} "
                       f"cpu{cpu} @{rip:016x} {sym(addrs,names,rip)}")
+            elif kind == 9:
+                print(f"  seq={seq:<10} install   nr={a} va=0x{b << 12:x} "
+                      f"sub={off} cpu{cpu} @{rip:016x} {sym(addrs,names,rip)}")
             else:
                 print(f"  seq={seq:<10} {KIND[kind]:9} count={a}")
 

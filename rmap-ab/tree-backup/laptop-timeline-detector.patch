@@ -1,0 +1,157 @@
+diff --git a/mm/internal.h b/mm/internal.h
+index e120f307998e..3a768d083622 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -459,6 +459,9 @@ static inline struct folio *pgcl_page_folio(struct page *page)
+ #endif
+ 
+ #if PAGE_MMUSHIFT
++/* #143 laptop add/remove timeline recorder (defined in mm/rmap.c) */
++void pgcl143_rec(unsigned long pfn, int delta, int mc, int rc, char tag,
++		 unsigned long ip);
+ /**
+  * pgcl_pte_batch - count contiguous PTEs mapping the same kernel page
+  * @pte: first PTE value (must be present)
+diff --git a/mm/memory.c b/mm/memory.c
+index c41e852d2de8..5a84fadf9fd2 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -4505,6 +4505,9 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 				 */
+ 				folio_ref_add(new_folio, extra);
+ 				atomic_add(extra, &new_folio->_mapcount);
++				pgcl143_rec(folio_pfn(new_folio), extra,
++					    atomic_read(&new_folio->_mapcount),
++					    folio_ref_count(new_folio), 'c', _RET_IP_);
+ 				/*
+ 				 * Drop old folio refs for the remapped
+ 				 * neighbor PTEs.  The faulting PTE's ref
+@@ -6247,6 +6250,9 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 		if (rss > 1) {
+ 			folio_ref_add(folio, rss - 1);
+ 			atomic_add(rss - 1, &folio->_mapcount);
++			pgcl143_rec(folio_pfn(folio), rss - 1,
++				    atomic_read(&folio->_mapcount),
++				    folio_ref_count(folio), 'e', _RET_IP_);
+ 			lruvec_stat_mod_folio(folio, NR_ANON_MAPPED, rss - 1);
+ 		}
+ 		/* Fix RSS: we added 1 above (nr_pages), need rss total */
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 7f797beeca91..ada0e0490d26 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1433,6 +1433,9 @@ static __always_inline void __folio_add_rmap(struct folio *folio,
+ 	case PGTABLE_LEVEL_PTE:
+ 		if (!folio_test_large(folio)) {
+ 			nr = atomic_inc_and_test(&folio->_mapcount);
++			pgcl143_rec(folio_pfn(folio), 1,
++				    atomic_read(&folio->_mapcount),
++				    folio_ref_count(folio), 'a', _RET_IP_);
+ 			break;
+ 		}
+ 
+@@ -1823,6 +1826,42 @@ void folio_add_file_rmap_ptes(struct folio *folio, struct page *page,
+  *
+  * The caller needs to hold the page table lock.
+  */
++/* === #143 laptop add/remove timeline (per-pfn ring) =====================
++ * Light + NON-perturbing: per-pfn-hashed ring with a NON-atomic, slot-masked
++ * head (zero hot-path atomics).  Records each order-0 mapcount delta with the
++ * resulting mc, the live rc, cpu, a 1-char path tag, and the caller IP.  Dumped
++ * at the underflow catch to expose the under-add / phantom-remove (the captured
++ * signature: mc falling -2..-8 while rc holds steady => mapcount-only removes).
++ */
++#define PGCL143_NB 16384
++#define PGCL143_NK 32
++struct pgcl143_ev { unsigned long pfn, ip; short delta, mc, rc; unsigned char cpu; char tag; };
++static struct { unsigned int head; struct pgcl143_ev ev[PGCL143_NK]; } pgcl143_ring[PGCL143_NB];
++void pgcl143_rec(unsigned long pfn, int delta, int mc, int rc, char tag, unsigned long ip)
++{
++	unsigned int b = pfn & (PGCL143_NB - 1);
++	struct pgcl143_ev *e = &pgcl143_ring[b].ev[pgcl143_ring[b].head++ & (PGCL143_NK - 1)];
++
++	e->pfn = pfn; e->ip = ip; e->delta = delta; e->mc = mc;
++	e->rc = rc > 32767 ? 32767 : rc;
++	e->cpu = raw_smp_processor_id(); e->tag = tag;
++}
++static void pgcl143_dump(unsigned long pfn)
++{
++	unsigned int bb = pfn & (PGCL143_NB - 1), i, h = pgcl143_ring[bb].head;
++
++	pr_err("PGCL143tl: pfn=%lx timeline (last %d on bucket, oldest first)\n",
++	       pfn, PGCL143_NK);
++	for (i = 0; i < PGCL143_NK; i++) {
++		struct pgcl143_ev *e = &pgcl143_ring[bb].ev[(h + i) & (PGCL143_NK - 1)];
++
++		if (e->pfn != pfn || !e->tag)
++			continue;
++		pr_err("   %c d%+d -> mc=%d rc=%d cpu=%u  %pS\n",
++		       e->tag, e->delta, e->mc, e->rc, e->cpu, (void *)e->ip);
++	}
++}
++
+ void folio_add_rmap_subptes(struct folio *folio, struct page *page,
+ 		int count, struct vm_area_struct *vma)
+ {
+@@ -1830,6 +1869,9 @@ void folio_add_rmap_subptes(struct folio *folio, struct page *page,
+ 
+ 	if (!folio_test_large(folio)) {
+ 		atomic_add(count, &folio->_mapcount);
++		pgcl143_rec(folio_pfn(folio), count,
++			    atomic_read(&folio->_mapcount),
++			    folio_ref_count(folio), 'A', _RET_IP_);
+ 	} else {
+ 		if (atomic_fetch_add(count, &page->_mapcount) == -1)
+ 			atomic_inc(&folio->_nr_pages_mapped);
+@@ -1852,6 +1894,9 @@ void folio_remove_rmap_subptes(struct folio *folio, struct page *page,
+ 
+ 	if (!folio_test_large(folio)) {
+ 		atomic_sub(count, &folio->_mapcount);
++		pgcl143_rec(folio_pfn(folio), -count,
++			    atomic_read(&folio->_mapcount),
++			    folio_ref_count(folio), 'R', _RET_IP_);
+ 	} else {
+ 		folio_sub_large_mapcount(folio, count, vma);
+ 		if (atomic_sub_return(count, &page->_mapcount) == -1)
+@@ -1915,7 +1960,41 @@ static __always_inline void __folio_remove_rmap(struct folio *folio,
+ 	switch (level) {
+ 	case PGTABLE_LEVEL_PTE:
+ 		if (!folio_test_large(folio)) {
++#if PAGE_MMUSHIFT
++			/*
++			 * #143 laptop capture (light, non-perturbing): order-0
++			 * mapcount must never drop below -1.  atomic_add_negative()
++			 * can't distinguish -1 (clean last unmap) from -2/-3 (the
++			 * #143 freed-while-mapped / dangling-PTE underflow), so read
++			 * the result and report on underflow.  This fires ONLY on the
++			 * bug, so it does not perturb the timing race (unlike a ring
++			 * tracer); dump_page()+PAGE_OWNER+DEBUG_VM give the page
++			 * history, dump_stack() (once) names the remove path.  No
++			 * WARN/BUG -> cannot trip panic_on_warn/panic on the laptop.
++			 */
++			int v = atomic_sub_return(1, &folio->_mapcount);
++
++			pgcl143_rec(folio_pfn(folio), -1, v,
++				    folio_ref_count(folio), 'r', _RET_IP_);
++			if (unlikely(v < -1)) {
++				static atomic_t pgcl143_uf = ATOMIC_INIT(0);
++				int n = atomic_inc_return(&pgcl143_uf);
++
++				if (n <= 8) {
++					pr_err("PGCL143wp #%d: order-0 mapcount underflow pfn=%lx mc=%d rc=%d anon=%d index=%lx\n",
++					       n, folio_pfn(folio), v,
++					       folio_ref_count(folio),
++					       folio_test_anon(folio), folio->index);
++					dump_page(&folio->page, "PGCL143 order-0 underflow");
++					pgcl143_dump(folio_pfn(folio));
++					if (n == 1)
++						dump_stack();
++				}
++			}
++			nr = (v < 0);
++#else
+ 			nr = atomic_add_negative(-1, &folio->_mapcount);
++#endif
+ 			break;
+ 		}
+ 
