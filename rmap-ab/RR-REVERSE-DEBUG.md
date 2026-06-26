@@ -99,6 +99,13 @@ Then follow the recipe printed by `rev-debug.gdb`:
   completion order is nondeterministic and replay diverges.
 * **Never point two live QEMU at the same RAW image** — `Failed to get "write"
   lock`. Overlays open the base read-only, so concurrent runs are fine.
+* **The crash is late (guest ~381 s)** — boot (~45 s) + the 120 s repro + the
+  interleaving that frees the victim. Single-threaded icount QEMU runs *below*
+  real-time under host contention, so a run starved of CPU is cut off before
+  guest 381 s and looks like a non-crash. **Pin to idle cores** (`taskset -c`,
+  `rr-record.sh` uses `$RRCORES`) and keep the timeout generous; confirm each run
+  reaches guest > 381 s before trusting a 0-crash result. (This is what made an
+  early no-`rrsnapshot` batch look like 0/6 when the rate is really ~2/3.)
 * **Watch kernel-linear addresses, not userspace VAs**, so the watchpoint
   survives context switches during `reverse-continue`.
 * `reverse-continue` re-executes from periodic internal snapshots, so it is

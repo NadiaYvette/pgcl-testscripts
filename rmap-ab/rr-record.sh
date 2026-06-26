@@ -22,16 +22,21 @@
 #    thread=multi repro so the bug is unchanged.
 #  * Never run two QEMU against the same RAW image at once (write-lock error);
 #    the overlays make concurrent runs safe (base opened read-only).
+#  * The crash lands LATE (guest time ~381 s: boot ~45 s + the 120 s repro + the
+#    interleaving that frees the victim).  Single-threaded icount QEMU runs below
+#    real-time under host contention, so a run can be cut off before guest 381 s
+#    and look like a non-crash.  Pin to idle cores (taskset, $RRCORES) and keep
+#    the timeout generous so every run actually reaches the crash window.
 set -u
 P=/home/nyc/src/pgcl; D=$P/rmap-ab; A=$D/abl-initramfs; QB=/home/nyc/src/qemu/build
-N="${1:-6}"; TMO="${2:-400}"
+N="${1:-8}"; TMO="${2:-700}"; CORES="${RRCORES:-8-11}"
 crashbin=""
 for i in $(seq 1 "$N"); do
   rm -f "$D"/rrx-btrfs.qcow2 "$D"/rrx-swap.qcow2
   qemu-img create -f qcow2 -b "$D/btrfs.img"            -F raw "$D"/rrx-btrfs.qcow2 >/dev/null
   qemu-img create -f qcow2 -b "$P/pgcl4-testbed/swap.raw" -F raw "$D"/rrx-swap.qcow2 >/dev/null
   L=$D/rrcrash-$i.log; BIN=$D/rrcrash-$i.bin; rm -f "$BIN"
-  timeout "$TMO" "$QB/qemu-system-x86_64" -icount shift=auto,rr=record,rrfile="$BIN" \
+  taskset -c "$CORES" timeout "$TMO" "$QB/qemu-system-x86_64" -icount shift=auto,rr=record,rrfile="$BIN" \
     -accel tcg -cpu max,la57=off -smp 1 -m 2G -kernel "$D/bzImage-vandangle" \
     -initrd "$A/initramfs.cpio.gz" -append "console=ttyS0 nokaslr ignore_loglevel panic=1" \
     -drive file="$D"/rrx-btrfs.qcow2,if=none,id=disk0 \
@@ -40,7 +45,8 @@ for i in $(seq 1 "$N"); do
     -drive driver=blkreplay,if=none,image=disk1,id=disk1-rr -device virtio-blk-pci,drive=disk1-rr \
     -nographic -no-reboot > "$L" 2>&1
   ki=$(grep -ac 'kill init\|segfault at 0 ip 0000000000000000' "$L")
-  echo "rec-$i: killinit=$ki  rrfile=$(ls -la "$BIN" 2>/dev/null | awk '{print $5}')  log=$L"
+  gt=$(grep -aoE '^\[[ 0-9.]+\]' "$L" | tail -1)   # guest time reached (want > ~381s)
+  echo "rec-$i: killinit=$ki  guest_reached=$gt  rrfile=$(ls -la "$BIN" 2>/dev/null | awk '{print $5}')  log=$L"
   if [ "$ki" -gt 0 ]; then
     crashbin="$BIN"
     echo ">>> CRASH CAUGHT: $BIN"
