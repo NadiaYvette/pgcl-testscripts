@@ -1,0 +1,48 @@
+diff --git a/mm/filemap.c b/mm/filemap.c
+index f9e6604ffa05..65a5c960c30d 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -3818,6 +3818,10 @@ static int filemap_set_ptes_cluster(struct vm_fault *vmf,
+ 
+ 	if (nr_set) {
+ 		int j;
++		/* PGCL #143 producer-resurrection detector: a cluster mapped
++		 * while already at refcount 0, or a per-cluster page not in this
++		 * folio (#140 mis-key), names the bug via the WARN backtrace. */
++		VM_WARN_ON_ONCE(!folio_ref_count(folio) || page_folio(page) != folio);
+ 		for (j = 0; j < nr_set; j++)
+ 			folio_add_file_rmap_ptes(folio, page, 1, vma);
+ 		update_mmu_cache_range(vmf, vma, addr, ptep, PAGE_MMUCOUNT);
+diff --git a/mm/memory.c b/mm/memory.c
+index bb5f6f556a46..c42cfb314858 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -5676,6 +5676,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 	if (nr_pages > 1) {
+ 		unsigned int c;
+ 
++		VM_WARN_ON_ONCE(!folio_ref_count(folio)); /* PGCL #143 producer-resurrection detector */
+ 		for (c = 0; c < nr_pages; c++)
+ 			folio_add_rmap_subptes(folio, page + c,
+ 					       PAGE_MMUCOUNT - 1, vma);
+@@ -5957,6 +5958,7 @@ void map_anon_folio_pte_nopf(struct folio *folio, pte_t *pte,
+ 	if (nr_pages > 1) {
+ 		unsigned int c;
+ 
++		VM_WARN_ON_ONCE(!folio_ref_count(folio)); /* PGCL #143 producer-resurrection detector */
+ 		for (c = 0; c < nr_pages; c++)
+ 			folio_add_rmap_subptes(folio, folio_page(folio, c),
+ 					       PAGE_MMUCOUNT - 1, vma);
+@@ -6435,10 +6437,12 @@ void set_pte_range(struct vm_fault *vmf, struct folio *folio,
+ 		 * same way.
+ 		 */
+ 		if (nr == 1) {
++			VM_WARN_ON_ONCE(!folio_ref_count(folio)); /* PGCL #143 producer-resurrection detector */
+ 			folio_add_rmap_subptes(folio, page, 1, vma);
+ 		} else {
+ 			unsigned int c;
+ 
++			VM_WARN_ON_ONCE(!folio_ref_count(folio)); /* PGCL #143 producer-resurrection detector */
+ 			for (c = 0; c < nr; c++)
+ 				folio_add_rmap_subptes(folio, page + c,
+ 						       PAGE_MMUCOUNT, vma);

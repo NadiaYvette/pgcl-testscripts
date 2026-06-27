@@ -1,0 +1,17 @@
+143-producer-detector.patch — NOT a fix; a NON-PERTURBING DETECTOR.
+
+Applies VM_WARN_ON_ONCE(!folio_ref_count(folio)) (+ page_folio(page)!=folio at the
+filemap site) immediately before each per-cluster rmap-add:
+  mm/filemap.c filemap_set_ptes_cluster (file fault-around)
+  mm/memory.c  set_pte_range            (file fault, incl. order-0 nr==1 branch)
+  mm/memory.c  do_swap_page sibling loop (swap-in)
+  mm/memory.c  map_anon_folio sibling loop (anon)
+
+It fires ONCE, with a backtrace naming the exact add-site, iff a cluster is being
+mapped while already at refcount 0 (the CBMC-proven producer resurrection) or a
+per-cluster page does not belong to its folio (#140 coordinate mis-key). Because it
+only fires on the bug, it does not change timing — the crash still reproduces.
+
+Run: BZ=bzImage-143detect bash run-smp8-trip.sh 4 240 (after build-run-143detect.sh).
+A fired "at mm/FILE.c:LINE FUNC" line is the named producer site → apply folio_try_get
+(bail/retry on false) there, rebuild, A/B vs run-smp8-live.sh. Requires CONFIG_DEBUG_VM=y.
