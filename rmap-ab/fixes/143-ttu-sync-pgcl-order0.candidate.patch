@@ -1,0 +1,22 @@
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 212a8f20ae65..05c89ad834e3 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1344,7 +1344,16 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
+ 			 * try_to_unmap acquire PTL from the first PTE,
+ 			 * eliminating the influence of temporary PTE values.
+ 			 */
+-			if (folio_test_large(folio))
++			/*
++			 * PGCL #143: an order-0 cluster is multiply-mapped by
++			 * its sub-PTEs, so it faces the same _mapcount-vs-PTE
++			 * de-sync race that TTU_SYNC guards for large folios,
++			 * yet folio_test_large() is false for it.  Key the SYNC
++			 * on "multiply-mapped under PGCL" too.  (No-op when
++			 * PAGE_MMUSHIFT == 0: reduces to folio_test_large.)
++			 */
++			if (folio_test_large(folio) ||
++			    (PAGE_MMUSHIFT && folio_mapped(folio)))
+ 				flags |= TTU_SYNC;
+ 
+ 			try_to_unmap(folio, flags);
