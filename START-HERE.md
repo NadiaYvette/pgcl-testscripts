@@ -89,12 +89,17 @@ re-derive everything from:
 
 ## Lineage and attribution
 - **2001:** Hugh Dickins' "larpage" (Linux 2.4).
-- **2002-2003:** a large-memory-32-bit forward-port that achieved the first boot
-  of Linux on x86-32 with 64 GiB RAM, and was chosen over kernel/user
-  address-space switching (the XKVA / "4G/4G" approach) precisely because raising
-  the allocation unit carries forward to 64-bit and to superpages. *(Archived on
-  lore.kernel.org; those early postings predate the author's current name and are
-  historical attribution only — see the RFC references.)*
+- **2002-2003:** a large-memory-32-bit forward-port that booted Linux on x86-32
+  (PAE) with 64 GiB of RAM on Sequent NUMA-Q hardware. Large-memory 32-bit was not
+  itself new — that platform ran 64 GiB commercially under DYNIX/ptx, with
+  unconfirmed reports of Linux reaching such sizes via a 2:2 address-space split —
+  but doing it by raising the kernel's *allocation unit*, rather than the
+  kernel/user address-space switching of the XKVA / "4G:4G" approach, was the
+  distinguishing choice, because the allocation-unit route carries forward to
+  64-bit and to superpages. The genuine novelty is the page-clustering approach,
+  not the memory ceiling. *(Archived on lore.kernel.org; those early postings
+  predate the author's current name and are historical attribution only — see the
+  RFC references.)*
 - **2020s:** this revival — forward-port to Linux 7.1, 20 architectures, posted
   to linux-mm.
 

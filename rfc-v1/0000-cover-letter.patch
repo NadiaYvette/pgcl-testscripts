@@ -248,7 +248,11 @@ times, including in the last two years. The through-line, for the record:
 - **The 2.4/2.5 forward-port.** I forward-ported and extended Hugh's larpage
   through the 2.4/2.5 era, including booting Linux on a 64 GiB NUMA-Q on 32-bit
   x86 (PAE) in 2003 — feasible precisely because clustering shrinks the `struct page`
-  array enough to fit a 64 GiB memmap in 32-bit lowmem. Clustering was chosen there
+  array enough to fit a 64 GiB memmap in 32-bit lowmem. Large-memory 32-bit x86 was
+  not itself novel — that same NUMA-Q hardware ran 64 GiB under Sequent's DYNIX/ptx,
+  and I have heard unconfirmed accounts of Linux reaching comparable sizes via a 2:2
+  address-space split — so the contribution was the clustering approach, not the
+  memory ceiling. Clustering was chosen there
 over full kernel/user address-space switching — the XKVA approach, from the
 DYNIX/ptx and AIX lineage I came from — precisely because address-space switching
 is a terminal 32-bit expedient, whereas raising the allocation unit carries
