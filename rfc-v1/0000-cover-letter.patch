@@ -41,7 +41,7 @@ hardware superpages/THP:
   above the MMU page — a software optimisation. Userspace still sees the small
   hardware page.
 
-The two compose, and the composition is the point. Clustering shrinks per-page
+The two compose, and the composition is the point. Page clustering shrinks per-page
 management overhead (one `struct page` per cluster rather than per hardware page,
 shorter LRU/rmap walks, less buddy/slab churn, a memmap smaller by
 `PAGE_MMUCOUNT`). More fundamentally, raising the allocation quantum changes the
@@ -113,7 +113,7 @@ hardware-page units for anything the MMU or userspace observes.
 
 The series is built so that at `PAGE_MMUSHIFT == 0` it is bisectable and a
 no-op at every step, and so that at `PAGE_MMUSHIFT > 0` the story is
-incrementally correct — all generic code an arch's clustered boot exercises
+incrementally correct — all generic code an arch's page-clustered boot exercises
 (core mm, plumbing, boot drivers, rootfs filesystems) lands *before* the
 per-arch commit that turns the knob on for that arch.
 
@@ -122,11 +122,11 @@ per-arch commit that turns the knob on for that arch.
       - PAGE_MMUSHIFT Kconfig + MMUPAGE_* definitions (page.h, vdso, mm.h)
       - generic MMUPAGE pte/pgoff/fixmap helpers
       - folio_pte_batch_flags() classified-batch return + callers
-      - fault / COW / PTE-install clustering (+ pte_cluster.h)
-      - fork copy + zap clustering
-      - swap-in clustering
+      - fault / COW / PTE-install page clustering (+ pte_cluster.h)
+      - fork copy + zap page clustering
+      - swap-in page clustering
       - rmap: one-kernel-page-per-PVMW-step convention
-      - THP split + PMD accounting under clustering
+      - THP split + PMD accounting under page clustering
       - filemap MMUPAGE file fault + fault-around clamp
       - mmap-family syscalls MMUPAGE-aligned (mincore/madvise/mmap/mremap/
         mprotect/mlock/msync/vma)
@@ -140,7 +140,7 @@ per-arch commit that turns the knob on for that arch.
   D.  Drivers: drm/i915 MMUPAGE audit, drm GEM/TTM, fbdev, misc generic drivers
   E.  fs / misc: 9p, exec, fat, slub oo cap
   C.  Per-arch enablement — one self-contained "<arch>: support page
-      clustering (PAGE_MMUSHIFT)" patch per arch:
+      page clustering (PAGE_MMUSHIFT)" patch per arch:
         x86, arm64, arm, s390, powerpc, sparc, mips, loongarch, riscv,
         parisc, alpha, microblaze, m68k, arc, csky, sh, xtensa
       (each no-op at PAGE_MMUSHIFT==0; arch-coupled drivers — parisc IOMMU,
@@ -153,30 +153,29 @@ fixes surfaced during the port — riscv ptrace CFI regset, microblaze/alpha
 entry.S save-area, parisc PDC result buffer) lead the series and stand on their
 own.
 
-The series as posted, and the full development tree it was distilled from (all
-architectures, complete history, and the `PAGE_MMUSHIFT` matrix configuration),
-are browsable at:
+The series as posted (branch `pgcl-rfc-v1`) and the full development tree it was
+distilled from (branch `nadia.chambers/page-clustering-001`; all architectures,
+complete history, and the `PAGE_MMUSHIFT` matrix configuration) are at:
 
-- posted series — https://github.com/NadiaYvette/linux branch `pgcl-rfc-v1`
-- full development tree — https://github.com/NadiaYvette/linux branch `nadia.chambers/page-clustering-001`
-- SourceHut mirror — https://git.sr.ht/~nadiayvette/linux-pgcl
+- SourceHut — https://git.sr.ht/~nadiayvette/linux-pgcl
+- GitHub — https://github.com/NadiaYvette/linux
 
 ## Testing
 
 Validated with a per-arch QEMU matrix (`PAGE_MMUSHIFT` ∈ {0, 2, 4, 6}) running,
-per arch: a clustering unit test, a clustering stress test, the kernel
+per arch: a page clustering unit test, a page clustering stress test, the kernel
 `selftests/mm` suite, and the LTP mm suite. Highlights:
 
 - **16 architectures boot and pass at `PAGE_MMUSHIFT = 4`** (64 KiB kernel page
   on a 4 KiB MMU; 16 hardware PTEs per cluster), with full LTP mm runs and zero
-  clustering-specific failures: x86_64, arm64, arm(+lpae), riscv(32/64), s390x,
+  page clustering-specific failures: x86_64, arm64, arm(+lpae), riscv(32/64), s390x,
   ppc64, sparc64, mips64, loongarch64, alpha, parisc(32/64), m68k, microblaze.
-- **Four further architectures boot and pass the clustering smoke test at
+- **Four further architectures boot and pass the page clustering smoke test at
   `PAGE_MMUSHIFT = 4`** (anonymous mmap + per-MMUPAGE touch over a cluster,
   fork + COW; userspace page size confirmed unchanged at the 4–8 KiB hardware
   page): **sh4, csky, openrisc (or1k), and xtensa** (the last verified with
   highmem both disabled and active). Full LTP for these four awaits libc
-  cross-toolchains; they are exercised today with a nolibc clustering smoke test.
+  cross-toolchains; they are exercised today with a nolibc page clustering smoke test.
   **arc** is build-tested only — no system emulator (`qemu-system-arc`) exists.
 - **`PAGE_MMUSHIFT = 6`** (256 KiB kernel page; 1 MiB on 16 KiB-MMU loongarch)
   additionally verified on x86_64, aarch64, parisc(32/64), s390x, arm-lpae,
@@ -190,31 +189,37 @@ per arch: a clustering unit test, a clustering stress test, the kernel
 
 The few residual selftest/LTP deltas are architecture-specific and reproduce at
 `PAGE_MMUSHIFT == 0` / on mainline (HW SHMLBA, musl libc stubs, missing optional
-Kconfig); they are not introduced by clustering. (Per-arch result tables to be
+Kconfig); they are not introduced by page clustering. (Per-arch result tables to be
 appended.)
 
 The complete test harness — the per-architecture QEMU matrix driver, the
-boot/run configurations, the clustering unit and stress tests, the nolibc smoke
+boot/run configurations, the page clustering unit and stress tests, the nolibc smoke
 test, and the result logs — is maintained in a companion repository:
 
-- https://github.com/NadiaYvette/pgcl-testscripts
-- https://git.sr.ht/~nadiayvette/pgcl-testscripts (mirror)
+- https://git.disroot.org/NadiaYvette/pgcl-testscripts (Disroot, NL)
+- https://framagit.org/NadiaYvette/pgcl-testscripts (Framagit, FR)
+- https://git.sr.ht/~nadiayvette/pgcl-testscripts (SourceHut)
+- https://github.com/NadiaYvette/pgcl-testscripts (GitHub)
+
+(All four are identical mirrors; the non-US mirrors are listed first for expected
+durability, and the paths are parallel, so any URL can be derived from another —
+the *tessera* repository below lives on the same four hosts.)
 
 Separately, an early formal-verification effort — *tessera* — is under way: a
-Lean 4 formalisation of the core clustering algorithms (the cluster/MMUPAGE
+Lean 4 formalisation of the core page clustering algorithms (the cluster/MMUPAGE
 coordinate model and the sharing and atomicity properties that the rmap and
 refcount accounting rely on), accompanied by concurrency litmus tests, and
-intended in time to span elements of the Linux C API surface for clustering. It
+intended in time to span elements of the Linux C API surface for page clustering. It
 is work in progress and not a dependency of this series.
 
-- https://github.com/NadiaYvette/tessera
-- https://git.sr.ht/~nadiayvette/tessera (mirror)
+- https://git.disroot.org/NadiaYvette/tessera — and its Framagit / SourceHut /
+  GitHub mirrors (same path scheme as the test harness above).
 
 ## Known issues / RFC questions
 
 1. **Core-mm conventions** — does the "one `struct page` per kernel page + one
    rmap event per PVMW yield + MMUPAGE-granular userspace units" split match how
-   maintainers would want clustering expressed? This is the crux of the RFC.
+   maintainers would want page clustering expressed? This is the crux of the RFC.
 2. **`folio_pte_batch_flags()` returning a classified struct** (`{nr, kind}`) —
    acceptable, or preferred as an out-param / separate helper?
 3. **Per-arch surface** — each arch needs a small, mechanical set of MMUPAGE
@@ -232,7 +237,7 @@ Page clustering has a long pedigree, and the core idea — decoupling the kernel
 allocation unit from the MMU page — has been independently rediscovered several
 times, including in the last two years. The through-line, for the record:
 
-- **Academic roots.** Clustering descends from Babaoğlu and Joy's paging work
+- **Academic roots.** Page clustering descends from Babaoğlu and Joy's paging work
   (SOSP 1981, doi:10.1145/800217.806663); its use as a substrate for *superpage
   promotion* follows Navarro, Iyer, Druschel and Cox, "Practical, transparent
   operating system support for superpages" (OSDI 2002).
@@ -247,12 +252,15 @@ times, including in the last two years. The through-line, for the record:
   except in the case of an mmap()."*
 - **The 2.4/2.5 forward-port.** I forward-ported and extended Hugh's larpage
   through the 2.4/2.5 era, including booting Linux on a 64 GiB NUMA-Q on 32-bit
-  x86 (PAE) in 2003 — feasible precisely because clustering shrinks the `struct page`
-  array enough to fit a 64 GiB memmap in 32-bit lowmem. Large-memory 32-bit x86 was
-  not itself novel — that same NUMA-Q hardware ran 64 GiB under Sequent's DYNIX/ptx,
-  and I have heard unconfirmed accounts of Linux reaching comparable sizes via a 2:2
-  address-space split — so the contribution was the clustering approach, not the
-  memory ceiling. Clustering was chosen there
+  x86 (PAE) in 2003 — to my knowledge the first verified, publicly-disclosed
+  characterisation of Linux's behaviour at that scale. Large-memory 32-bit was not
+  itself new — that same NUMA-Q hardware ran 64 GiB under Sequent's DYNIX/ptx, and
+  unverified reports of Linux reaching such sizes via a 2:2 address-space split
+  circulated but were never substantiated — so the novelty was the open
+  characterisation, not the memory ceiling. Two things made a 64 GiB memmap fit in
+  32-bit lowmem: the `struct page` size reductions I had landed earlier, already
+  paying off before clustering, and page clustering's one `struct page` per cluster.
+  Page clustering was chosen there
 over full kernel/user address-space switching — the XKVA approach, from the
 DYNIX/ptx and AIX lineage I came from — precisely because address-space switching
 is a terminal 32-bit expedient, whereas raising the allocation unit carries
