@@ -121,3 +121,14 @@ rmap.c:1620/1635 with `> PAGE_MMUCOUNT - 1` to unbury real corruption dumps.
 `page_folio(target)!=folio` WARN at install loops); (b) free racing folio_try_get via a
 non-_refcount sentinel. **Next probe:** migrate-pair balance asserts (remove_migration_pte
 + try_to_migrate_one) — the freed-while-mapped creator, fires only on the bug.
+
+## Update 2026-06-27 (probe): migrate-pair refuted; #143 is an ORPHAN-PTE bug
+The migrate-pair invariant probe (folio_mapcount > folio_ref_count at migrate-in/out)
+fired 0/4; the #146 WARN-guard is confirmed (false rmap.c:1620/1635 WARNs now 0/4).
+**Four counting-based fix-classes are now refuted** (TTU_SYNC, producer-at-install,
+AnonExclusive, migrate-pair). **The lesson:** #143 is an *orphan PTE* — a present
+sub-PTE whose rmap+ref were already removed — which is **invisible to
+mapcount/refcount detectors** (uncounted PTE; refcount reached 0 normally). The next
+probe MUST be **structural**: a PTE-scan for a present PTE pointing to a freed /
+refcount-0 cluster, or enrich bad_page to dump the orphan PTE's owning mm/vma/addr.
+Do not run further count-based A/B probes — they cannot see this bug.
