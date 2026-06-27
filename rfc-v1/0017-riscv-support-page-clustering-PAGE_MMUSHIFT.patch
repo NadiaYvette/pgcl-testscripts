@@ -1,0 +1,1030 @@
+From 5de1a073b6be148a6aeeb93abb97ff2e10e231d0 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:35 +0200
+Subject: [RFC PATCH 17/28] riscv: support page clustering (PAGE_MMUSHIFT)
+
+---
+ arch/riscv/Kconfig                  |  9 ++++
+ arch/riscv/include/asm/elf.h        |  2 +-
+ arch/riscv/include/asm/fixmap.h     |  4 +-
+ arch/riscv/include/asm/kfence.h     |  2 +-
+ arch/riscv/include/asm/pgalloc.h    | 40 +++++----------
+ arch/riscv/include/asm/pgtable-64.h | 20 ++++----
+ arch/riscv/include/asm/pgtable.h    | 33 ++++++++++---
+ arch/riscv/kernel/head.S            |  4 +-
+ arch/riscv/kernel/hibernate.c       |  2 +-
+ arch/riscv/kernel/patch.c           | 30 +++++++-----
+ arch/riscv/kernel/sys_riscv.c       |  4 +-
+ arch/riscv/kernel/vdso.c            | 17 ++++---
+ arch/riscv/mm/context.c             |  4 +-
+ arch/riscv/mm/fault.c               |  2 +-
+ arch/riscv/mm/hugetlbpage.c         | 10 ++--
+ arch/riscv/mm/init.c                | 76 ++++++++++++++---------------
+ arch/riscv/mm/kasan_init.c          |  4 +-
+ arch/riscv/mm/pageattr.c            |  8 ++-
+ arch/riscv/mm/ptdump.c              |  2 +-
+ arch/riscv/mm/tlbflush.c            | 14 +++---
+ 20 files changed, 156 insertions(+), 131 deletions(-)
+
+diff --git a/arch/riscv/Kconfig b/arch/riscv/Kconfig
+index c5754942cf85..dda74815cfa7 100644
+--- a/arch/riscv/Kconfig
++++ b/arch/riscv/Kconfig
+@@ -312,6 +312,15 @@ config ARCH_SPARSEMEM_ENABLE
+ config ARCH_SELECT_MEMORY_MODEL
+ 	def_bool ARCH_SPARSEMEM_ENABLE
+ 
++# PGCL widens PAGE_SIZE by 2^PAGE_MMUSHIFT; cap MAX_PAGE_ORDER so
++# PAGE_SHIFT + MAX_PAGE_ORDER stays under SECTION_SIZE_BITS (=27).
++config ARCH_FORCE_MAX_ORDER
++	int
++	default "5" if PAGE_MMUSHIFT >= 6
++	default "8" if PAGE_MMUSHIFT >= 4
++	default "10" if PAGE_MMUSHIFT >= 2
++	default "10"
++
+ config ARCH_SUPPORTS_UPROBES
+ 	def_bool y
+ 
+diff --git a/arch/riscv/include/asm/elf.h b/arch/riscv/include/asm/elf.h
+index aa4961b0e208..572d3bdf4142 100644
+--- a/arch/riscv/include/asm/elf.h
++++ b/arch/riscv/include/asm/elf.h
+@@ -42,7 +42,7 @@ extern bool compat_elf_check_arch(Elf32_Ehdr *hdr);
+ 
+ #define CORE_DUMP_USE_REGSET
+ #define ELF_FDPIC_CORE_EFLAGS	0
+-#define ELF_EXEC_PAGESIZE	(PAGE_SIZE)
++#define ELF_EXEC_PAGESIZE	(MMUPAGE_SIZE)
+ 
+ /*
+  * This is the location that an ET_DYN program is loaded if exec'ed.  Typical
+diff --git a/arch/riscv/include/asm/fixmap.h b/arch/riscv/include/asm/fixmap.h
+index 0a55099bb734..b6da6b7bcde5 100644
+--- a/arch/riscv/include/asm/fixmap.h
++++ b/arch/riscv/include/asm/fixmap.h
+@@ -27,7 +27,7 @@ enum fixed_addresses {
+ 	 * using PMD entries in fixmap_pmd in 64-bit and a PGD entry in 32-bit.
+ 	 */
+ 	FIX_FDT_END,
+-	FIX_FDT = FIX_FDT_END + FIX_FDT_SIZE / PAGE_SIZE - 1,
++	FIX_FDT = FIX_FDT_END + FIX_FDT_SIZE / MMUPAGE_SIZE - 1,
+ 
+ 	/* Below fixmaps will be mapped using fixmap_pte */
+ 	FIX_PTE,
+@@ -43,7 +43,7 @@ enum fixed_addresses {
+ 	 * Temporary boot-time mappings, used by early_ioremap(),
+ 	 * before ioremap() is functional.
+ 	 */
+-#define NR_FIX_BTMAPS		(SZ_256K / PAGE_SIZE)
++#define NR_FIX_BTMAPS		(SZ_256K / MMUPAGE_SIZE)
+ #define FIX_BTMAPS_SLOTS	7
+ #define TOTAL_FIX_BTMAPS	(NR_FIX_BTMAPS * FIX_BTMAPS_SLOTS)
+ 
+diff --git a/arch/riscv/include/asm/kfence.h b/arch/riscv/include/asm/kfence.h
+index d08bf7fb3aee..a6d0b660134b 100644
+--- a/arch/riscv/include/asm/kfence.h
++++ b/arch/riscv/include/asm/kfence.h
+@@ -23,7 +23,7 @@ static inline bool kfence_protect_page(unsigned long addr, bool protect)
+ 		set_pte(pte, __pte(pte_val(ptep_get(pte)) | _PAGE_PRESENT));
+ 
+ 	preempt_disable();
+-	local_flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
++	local_flush_tlb_kernel_range(addr, addr + MMUPAGE_SIZE);
+ 	preempt_enable();
+ 
+ 	return true;
+diff --git a/arch/riscv/include/asm/pgalloc.h b/arch/riscv/include/asm/pgalloc.h
+index 770ce18a7328..8144565b61e5 100644
+--- a/arch/riscv/include/asm/pgalloc.h
++++ b/arch/riscv/include/asm/pgalloc.h
+@@ -18,65 +18,47 @@
+ static inline void pmd_populate_kernel(struct mm_struct *mm,
+ 	pmd_t *pmd, pte_t *pte)
+ {
+-	unsigned long pfn = virt_to_pfn(pte);
+-
+-	set_pmd(pmd, __pmd((pfn << _PAGE_PFN_SHIFT) | _PAGE_TABLE));
++	set_pmd(pmd, __pmd(__phys_to_pte_val(__pa(pte)) | _PAGE_TABLE));
+ }
+ 
+ static inline void pmd_populate(struct mm_struct *mm,
+ 	pmd_t *pmd, pgtable_t pte)
+ {
+-	unsigned long pfn = virt_to_pfn(page_address(pte));
+-
+-	set_pmd(pmd, __pmd((pfn << _PAGE_PFN_SHIFT) | _PAGE_TABLE));
++	set_pmd(pmd, __pmd(__phys_to_pte_val(__pa(page_address(pte))) | _PAGE_TABLE));
+ }
+ 
+ #ifndef __PAGETABLE_PMD_FOLDED
+ static inline void pud_populate(struct mm_struct *mm, pud_t *pud, pmd_t *pmd)
+ {
+-	unsigned long pfn = virt_to_pfn(pmd);
+-
+-	set_pud(pud, __pud((pfn << _PAGE_PFN_SHIFT) | _PAGE_TABLE));
++	set_pud(pud, __pud(__phys_to_pte_val(__pa(pmd)) | _PAGE_TABLE));
+ }
+ 
+ static inline void p4d_populate(struct mm_struct *mm, p4d_t *p4d, pud_t *pud)
+ {
+-	if (pgtable_l4_enabled) {
+-		unsigned long pfn = virt_to_pfn(pud);
+-
+-		set_p4d(p4d, __p4d((pfn << _PAGE_PFN_SHIFT) | _PAGE_TABLE));
+-	}
++	if (pgtable_l4_enabled)
++		set_p4d(p4d, __p4d(__phys_to_pte_val(__pa(pud)) | _PAGE_TABLE));
+ }
+ 
+ static inline void p4d_populate_safe(struct mm_struct *mm, p4d_t *p4d,
+ 				     pud_t *pud)
+ {
+-	if (pgtable_l4_enabled) {
+-		unsigned long pfn = virt_to_pfn(pud);
+-
++	if (pgtable_l4_enabled)
+ 		set_p4d_safe(p4d,
+-			     __p4d((pfn << _PAGE_PFN_SHIFT) | _PAGE_TABLE));
+-	}
++			     __p4d(__phys_to_pte_val(__pa(pud)) | _PAGE_TABLE));
+ }
+ 
+ static inline void pgd_populate(struct mm_struct *mm, pgd_t *pgd, p4d_t *p4d)
+ {
+-	if (pgtable_l5_enabled) {
+-		unsigned long pfn = virt_to_pfn(p4d);
+-
+-		set_pgd(pgd, __pgd((pfn << _PAGE_PFN_SHIFT) | _PAGE_TABLE));
+-	}
++	if (pgtable_l5_enabled)
++		set_pgd(pgd, __pgd(__phys_to_pte_val(__pa(p4d)) | _PAGE_TABLE));
+ }
+ 
+ static inline void pgd_populate_safe(struct mm_struct *mm, pgd_t *pgd,
+ 				     p4d_t *p4d)
+ {
+-	if (pgtable_l5_enabled) {
+-		unsigned long pfn = virt_to_pfn(p4d);
+-
++	if (pgtable_l5_enabled)
+ 		set_pgd_safe(pgd,
+-			     __pgd((pfn << _PAGE_PFN_SHIFT) | _PAGE_TABLE));
+-	}
++			     __pgd(__phys_to_pte_val(__pa(p4d)) | _PAGE_TABLE));
+ }
+ 
+ #define pud_free pud_free
+diff --git a/arch/riscv/include/asm/pgtable-64.h b/arch/riscv/include/asm/pgtable-64.h
+index 6e789fa58514..d49d5915e305 100644
+--- a/arch/riscv/include/asm/pgtable-64.h
++++ b/arch/riscv/include/asm/pgtable-64.h
+@@ -48,7 +48,7 @@ typedef struct {
+ 
+ #define p4d_val(x)	((x).p4d)
+ #define __p4d(x)	((p4d_t) { (x) })
+-#define PTRS_PER_P4D	(PAGE_SIZE / sizeof(p4d_t))
++#define PTRS_PER_P4D	(MMUPAGE_SIZE / sizeof(p4d_t))
+ 
+ /* Page Upper Directory entry */
+ typedef struct {
+@@ -57,7 +57,7 @@ typedef struct {
+ 
+ #define pud_val(x)      ((x).pud)
+ #define __pud(x)        ((pud_t) { (x) })
+-#define PTRS_PER_PUD    (PAGE_SIZE / sizeof(pud_t))
++#define PTRS_PER_PUD    (MMUPAGE_SIZE / sizeof(pud_t))
+ 
+ /* Page Middle Directory entry */
+ typedef struct {
+@@ -67,7 +67,7 @@ typedef struct {
+ #define pmd_val(x)      ((x).pmd)
+ #define __pmd(x)        ((pmd_t) { (x) })
+ 
+-#define PTRS_PER_PMD    (PAGE_SIZE / sizeof(pmd_t))
++#define PTRS_PER_PMD    (MMUPAGE_SIZE / sizeof(pmd_t))
+ 
+ #define MAX_POSSIBLE_PHYSMEM_BITS 56
+ 
+@@ -101,7 +101,7 @@ enum napot_cont_order {
+ 	     order >= NAPOT_CONT_ORDER_BASE; order--)
+ #define napot_cont_order(val)	(__builtin_ctzl((val.pte >> _PAGE_PFN_SHIFT) << 1))
+ 
+-#define napot_cont_shift(order)	((order) + PAGE_SHIFT)
++#define napot_cont_shift(order)	((order) + MMUPAGE_SHIFT)
+ #define napot_cont_size(order)	BIT(napot_cont_shift(order))
+ #define napot_cont_mask(order)	(~(napot_cont_size(order) - 1UL))
+ #define napot_pte_num(order)	BIT(order)
+@@ -212,7 +212,7 @@ static inline void pud_clear(pud_t *pudp)
+ 
+ static inline pud_t pfn_pud(unsigned long pfn, pgprot_t prot)
+ {
+-	return __pud((pfn << _PAGE_PFN_SHIFT) | pgprot_val(prot));
++	return __pud(__phys_to_pte_val((phys_addr_t)pfn << PAGE_SHIFT) | pgprot_val(prot));
+ }
+ 
+ static inline unsigned long _pud_pfn(pud_t pud)
+@@ -222,7 +222,7 @@ static inline unsigned long _pud_pfn(pud_t pud)
+ 
+ static inline pmd_t *pud_pgtable(pud_t pud)
+ {
+-	return (pmd_t *)pfn_to_virt(__page_val_to_pfn(pud_val(pud)));
++	return (pmd_t *)__va(__pte_val_to_phys(pud_val(pud)));
+ }
+ 
+ static inline struct page *pud_page(pud_t pud)
+@@ -256,7 +256,7 @@ static inline pmd_t pfn_pmd(unsigned long pfn, pgprot_t prot)
+ 
+ 	ALT_THEAD_PMA(prot_val);
+ 
+-	return __pmd((pfn << _PAGE_PFN_SHIFT) | prot_val);
++	return __pmd(__phys_to_pte_val((phys_addr_t)pfn << PAGE_SHIFT) | prot_val);
+ }
+ 
+ static inline unsigned long _pmd_pfn(pmd_t pmd)
+@@ -313,7 +313,7 @@ static inline void p4d_clear(p4d_t *p4d)
+ 
+ static inline p4d_t pfn_p4d(unsigned long pfn, pgprot_t prot)
+ {
+-	return __p4d((pfn << _PAGE_PFN_SHIFT) | pgprot_val(prot));
++	return __p4d(__phys_to_pte_val((phys_addr_t)pfn << PAGE_SHIFT) | pgprot_val(prot));
+ }
+ 
+ static inline unsigned long _p4d_pfn(p4d_t p4d)
+@@ -324,7 +324,7 @@ static inline unsigned long _p4d_pfn(p4d_t p4d)
+ static inline pud_t *p4d_pgtable(p4d_t p4d)
+ {
+ 	if (pgtable_l4_enabled)
+-		return (pud_t *)pfn_to_virt(__page_val_to_pfn(p4d_val(p4d)));
++		return (pud_t *)__va(__pte_val_to_phys(p4d_val(p4d)));
+ 
+ 	return (pud_t *)pud_pgtable((pud_t) { p4d_val(p4d) });
+ }
+@@ -381,7 +381,7 @@ static inline void pgd_clear(pgd_t *pgd)
+ static inline p4d_t *pgd_pgtable(pgd_t pgd)
+ {
+ 	if (pgtable_l5_enabled)
+-		return (p4d_t *)pfn_to_virt(__page_val_to_pfn(pgd_val(pgd)));
++		return (p4d_t *)__va(__pte_val_to_phys(pgd_val(pgd)));
+ 
+ 	return (p4d_t *)p4d_pgtable((p4d_t) { pgd_val(pgd) });
+ }
+diff --git a/arch/riscv/include/asm/pgtable.h b/arch/riscv/include/asm/pgtable.h
+index a1a7c6520a09..2d3e1e0e8fb7 100644
+--- a/arch/riscv/include/asm/pgtable.h
++++ b/arch/riscv/include/asm/pgtable.h
+@@ -30,9 +30,9 @@
+ #endif
+ 
+ /* Number of entries in the page global directory */
+-#define PTRS_PER_PGD    (PAGE_SIZE / sizeof(pgd_t))
++#define PTRS_PER_PGD    (MMUPAGE_SIZE / sizeof(pgd_t))
+ /* Number of entries in the page table */
+-#define PTRS_PER_PTE    (PAGE_SIZE / sizeof(pte_t))
++#define PTRS_PER_PTE    (MMUPAGE_SIZE / sizeof(pte_t))
+ 
+ /*
+  * Half of the kernel address space (1/4 of the entries of the page global
+@@ -97,7 +97,17 @@
+ #define PCI_IO_END       VMEMMAP_START
+ #define PCI_IO_START     (PCI_IO_END - PCI_IO_SIZE)
+ 
++/*
++ * On 32-bit, the FDT early mapping uses PGDIR_SIZE superpages.
++ * FIXADDR_TOP must be PGDIR-aligned so that fix_fdt_va lands at
++ * the start of a PGD entry and the dtb_early_va calculation in
++ * create_fdt_early_page_table() is correct.
++ */
++#ifdef CONFIG_64BIT
+ #define FIXADDR_TOP      PCI_IO_START
++#else
++#define FIXADDR_TOP      (PCI_IO_START & ~(PGDIR_SIZE - 1))
++#endif
+ #ifdef CONFIG_64BIT
+ #define MAX_FDT_SIZE	 PMD_SIZE
+ #define FIX_FDT_SIZE	 (MAX_FDT_SIZE + SZ_2M)
+@@ -119,7 +129,16 @@
+ #include <asm/compat.h>
+ #include <asm/cpufeature.h>
+ 
+-#define __page_val_to_pfn(_val)  (((_val) & _PAGE_PFN_MASK) >> _PAGE_PFN_SHIFT)
++/*
++ * Convert between physical addresses and PTE values.
++ * With PGCL, the kernel PFN (phys >> PAGE_SHIFT) differs from the hardware
++ * PPN (phys >> MMUPAGE_SHIFT). These helpers preserve MMUPAGE granularity.
++ */
++#define __phys_to_pte_val(phys)  (((phys) >> MMUPAGE_SHIFT) << _PAGE_PFN_SHIFT)
++#define __pte_val_to_phys(val)   ((((val) & _PAGE_PFN_MASK) >> _PAGE_PFN_SHIFT) << MMUPAGE_SHIFT)
++
++/* Extract kernel PFN (phys >> PAGE_SHIFT) from a page table entry value */
++#define __page_val_to_pfn(_val)  (__pte_val_to_phys(_val) >> PAGE_SHIFT)
+ 
+ #ifdef CONFIG_64BIT
+ #include <asm/pgtable-64.h>
+@@ -243,7 +262,7 @@ static inline pgd_t pfn_pgd(unsigned long pfn, pgprot_t prot)
+ 
+ 	ALT_THEAD_PMA(prot_val);
+ 
+-	return __pgd((pfn << _PAGE_PFN_SHIFT) | prot_val);
++	return __pgd(__phys_to_pte_val((phys_addr_t)pfn << PAGE_SHIFT) | prot_val);
+ }
+ 
+ static inline unsigned long _pgd_pfn(pgd_t pgd)
+@@ -258,7 +277,7 @@ static inline struct page *pmd_page(pmd_t pmd)
+ 
+ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
+ {
+-	return (unsigned long)pfn_to_virt(__page_val_to_pfn(pmd_val(pmd)));
++	return (unsigned long)__va(__pte_val_to_phys(pmd_val(pmd)));
+ }
+ 
+ static inline pte_t pmd_pte(pmd_t pmd)
+@@ -323,7 +342,7 @@ static inline pte_t pfn_pte(unsigned long pfn, pgprot_t prot)
+ 
+ 	ALT_THEAD_PMA(prot_val);
+ 
+-	return __pte((pfn << _PAGE_PFN_SHIFT) | prot_val);
++	return __pte(__phys_to_pte_val((phys_addr_t)pfn << PAGE_SHIFT) | prot_val);
+ }
+ 
+ #define pte_pgprot pte_pgprot
+@@ -574,7 +593,7 @@ static inline void update_mmu_cache_range(struct vm_fault *vmf,
+ 	 * the extra traps reduce performance.  So, eagerly SFENCE.VMA.
+ 	 */
+ 	while (nr--)
+-		local_flush_tlb_page(address + nr * PAGE_SIZE);
++		local_flush_tlb_page(address + nr * MMUPAGE_SIZE);
+ 
+ }
+ #define update_mmu_cache(vma, addr, ptep) \
+diff --git a/arch/riscv/kernel/head.S b/arch/riscv/kernel/head.S
+index f6a8ca49e627..76ff1a36ce86 100644
+--- a/arch/riscv/kernel/head.S
++++ b/arch/riscv/kernel/head.S
+@@ -85,7 +85,7 @@ relocate_enable_mmu:
+ 	csrw CSR_TVEC, a2
+ 
+ 	/* Compute satp for kernel page tables, but don't load it yet */
+-	srl a2, a0, PAGE_SHIFT
++	srl a2, a0, MMUPAGE_SHIFT
+ 	la a1, satp_mode
+ 	REG_L a1, 0(a1)
+ 	or a2, a2, a1
+@@ -97,7 +97,7 @@ relocate_enable_mmu:
+ 	 * to ensure the new translations are in use.
+ 	 */
+ 	la a0, trampoline_pg_dir
+-	srl a0, a0, PAGE_SHIFT
++	srl a0, a0, MMUPAGE_SHIFT
+ 	or a0, a0, a1
+ 	sfence.vma
+ 	csrw CSR_SATP, a0
+diff --git a/arch/riscv/kernel/hibernate.c b/arch/riscv/kernel/hibernate.c
+index 982843828adb..2d794112edb5 100644
+--- a/arch/riscv/kernel/hibernate.c
++++ b/arch/riscv/kernel/hibernate.c
+@@ -395,7 +395,7 @@ int swsusp_arch_resume(void)
+ 	if (ret)
+ 		return ret;
+ 
+-	hibernate_restore_image(resume_hdr.saved_satp, (PFN_DOWN(__pa(resume_pg_dir)) | satp_mode),
++	hibernate_restore_image(resume_hdr.saved_satp, ((__pa(resume_pg_dir) >> MMUPAGE_SHIFT) | satp_mode),
+ 				resume_hdr.restore_cpu_addr);
+ 
+ 	return 0;
+diff --git a/arch/riscv/kernel/patch.c b/arch/riscv/kernel/patch.c
+index 16b243376f36..157df0c7f0bd 100644
+--- a/arch/riscv/kernel/patch.c
++++ b/arch/riscv/kernel/patch.c
+@@ -42,20 +42,26 @@ static inline bool is_kernel_exittext(uintptr_t addr)
+ static __always_inline void *patch_map(void *addr, const unsigned int fixmap)
+ {
+ 	uintptr_t uintaddr = (uintptr_t) addr;
+-	phys_addr_t phys;
++	phys_addr_t pa;
+ 
+ 	if (core_kernel_text(uintaddr) || is_kernel_exittext(uintaddr)) {
+-		phys = __pa_symbol(addr);
++		/*
++		 * Use __pa_symbol() directly instead of the phys_to_page() /
++		 * page_to_phys() roundtrip.  The latter requires a populated
++		 * sparsemem section map, which is not yet available when
++		 * apply_boot_alternatives() runs from setup_arch().
++		 */
++		pa = __pa_symbol(addr);
+ 	} else if (IS_ENABLED(CONFIG_STRICT_MODULE_RWX)) {
+ 		struct page *page = vmalloc_to_page(addr);
+ 
+ 		BUG_ON(!page);
+-		phys = page_to_phys(page) + offset_in_page(addr);
++		pa = page_to_phys(page) + offset_in_page(addr);
+ 	} else {
+ 		return addr;
+ 	}
+ 
+-	return (void *)set_fixmap_offset(fixmap, phys);
++	return (void *)set_fixmap_offset(fixmap, pa);
+ }
+ 
+ static void patch_unmap(int fixmap)
+@@ -66,13 +72,13 @@ NOKPROBE_SYMBOL(patch_unmap);
+ 
+ static int __patch_insn_set(void *addr, u8 c, size_t len)
+ {
+-	bool across_pages = (offset_in_page(addr) + len) > PAGE_SIZE;
++	bool across_pages = (((uintptr_t)addr & ~MMUPAGE_MASK) + len) > MMUPAGE_SIZE;
+ 	void *waddr = addr;
+ 
+ 	/*
+ 	 * Only two pages can be mapped at a time for writing.
+ 	 */
+-	if (len + offset_in_page(addr) > 2 * PAGE_SIZE)
++	if (len + ((uintptr_t)addr & ~MMUPAGE_MASK) > 2 * MMUPAGE_SIZE)
+ 		return -EINVAL;
+ 	/*
+ 	 * Before reaching here, it was expected to lock the text_mutex
+@@ -84,7 +90,7 @@ static int __patch_insn_set(void *addr, u8 c, size_t len)
+ 	preempt_disable();
+ 
+ 	if (across_pages)
+-		patch_map(addr + PAGE_SIZE, FIX_TEXT_POKE1);
++		patch_map(addr + MMUPAGE_SIZE, FIX_TEXT_POKE1);
+ 
+ 	waddr = patch_map(addr, FIX_TEXT_POKE0);
+ 
+@@ -111,14 +117,14 @@ NOKPROBE_SYMBOL(__patch_insn_set);
+ 
+ static int __patch_insn_write(void *addr, const void *insn, size_t len)
+ {
+-	bool across_pages = (offset_in_page(addr) + len) > PAGE_SIZE;
++	bool across_pages = (((uintptr_t)addr & ~MMUPAGE_MASK) + len) > MMUPAGE_SIZE;
+ 	void *waddr = addr;
+ 	int ret;
+ 
+ 	/*
+ 	 * Only two pages can be mapped at a time for writing.
+ 	 */
+-	if (len + offset_in_page(addr) > 2 * PAGE_SIZE)
++	if (len + ((uintptr_t)addr & ~MMUPAGE_MASK) > 2 * MMUPAGE_SIZE)
+ 		return -EINVAL;
+ 
+ 	/*
+@@ -138,7 +144,7 @@ static int __patch_insn_write(void *addr, const void *insn, size_t len)
+ 	preempt_disable();
+ 
+ 	if (across_pages)
+-		patch_map(addr + PAGE_SIZE, FIX_TEXT_POKE1);
++		patch_map(addr + MMUPAGE_SIZE, FIX_TEXT_POKE1);
+ 
+ 	waddr = patch_map(addr, FIX_TEXT_POKE0);
+ 
+@@ -188,7 +194,7 @@ static int patch_insn_set(void *addr, u8 c, size_t len)
+ 	 * loop with len <= 2 * PAGE_SIZE.
+ 	 */
+ 	while (len) {
+-		size = min(len, PAGE_SIZE * 2 - offset_in_page(addr));
++		size = min(len, MMUPAGE_SIZE * 2 - ((uintptr_t)addr & ~MMUPAGE_MASK));
+ 		ret = __patch_insn_set(addr, c, size);
+ 		if (ret)
+ 			return ret;
+@@ -223,7 +229,7 @@ int patch_insn_write(void *addr, const void *insn, size_t len)
+ 	 * because __patch_insn_write() can only handle len <= 2 * PAGE_SIZE.
+ 	 */
+ 	while (len) {
+-		size = min(len, PAGE_SIZE * 2 - offset_in_page(addr));
++		size = min(len, MMUPAGE_SIZE * 2 - ((uintptr_t)addr & ~MMUPAGE_MASK));
+ 		ret = __patch_insn_write(addr, insn, size);
+ 		if (ret)
+ 			return ret;
+diff --git a/arch/riscv/kernel/sys_riscv.c b/arch/riscv/kernel/sys_riscv.c
+index 22fc9b3268be..273c593b6880 100644
+--- a/arch/riscv/kernel/sys_riscv.c
++++ b/arch/riscv/kernel/sys_riscv.c
+@@ -14,7 +14,7 @@ static long riscv_sys_mmap(unsigned long addr, unsigned long len,
+ 			   unsigned long fd, unsigned long offset,
+ 			   unsigned long page_shift_offset)
+ {
+-	if (unlikely(offset & (~PAGE_MASK >> page_shift_offset)))
++	if (unlikely(offset & (~MMUPAGE_MASK >> page_shift_offset)))
+ 		return -EINVAL;
+ 
+ 	/*
+@@ -27,7 +27,7 @@ static long riscv_sys_mmap(unsigned long addr, unsigned long len,
+ 		prot |= PROT_READ;
+ 
+ 	return ksys_mmap_pgoff(addr, len, prot, flags, fd,
+-			       offset >> (PAGE_SHIFT - page_shift_offset));
++			       offset >> (MMUPAGE_SHIFT - page_shift_offset));
+ }
+ 
+ #ifdef CONFIG_64BIT
+diff --git a/arch/riscv/kernel/vdso.c b/arch/riscv/kernel/vdso.c
+index 9c2f5e442338..431e43f98a48 100644
+--- a/arch/riscv/kernel/vdso.c
++++ b/arch/riscv/kernel/vdso.c
+@@ -17,7 +17,7 @@
+ #include <vdso/datapage.h>
+ #include <vdso/vsyscall.h>
+ 
+-#define VVAR_SIZE  (VDSO_NR_PAGES << PAGE_SHIFT)
++#define VVAR_SIZE  (VDSO_NR_PAGES << MMUPAGE_SHIFT)
+ 
+ struct __vdso_info {
+ 	const char *name;
+@@ -53,17 +53,22 @@ static void __init __vdso_init(struct __vdso_info *vdso_info)
+ 	vdso_info->vdso_pages = (
+ 		vdso_info->vdso_code_end -
+ 		vdso_info->vdso_code_start) >>
+-		PAGE_SHIFT;
++		MMUPAGE_SHIFT;
+ 
+ 	vdso_pagelist = kzalloc_objs(struct page *, vdso_info->vdso_pages);
+ 	if (vdso_pagelist == NULL)
+ 		panic("vDSO kcalloc failed!\n");
+ 
+-	/* Grab the vDSO code pages. */
++	/*
++	 * Grab the vDSO code pages.  With PGCL, iterate at MMUPAGE
++	 * granularity: multiple hardware pages may share one struct page.
++	 */
+ 	pfn = sym_to_pfn(vdso_info->vdso_code_start);
+ 
+-	for (i = 0; i < vdso_info->vdso_pages; i++)
+-		vdso_pagelist[i] = pfn_to_page(pfn + i);
++	for (i = 0; i < vdso_info->vdso_pages; i++) {
++		unsigned long offset = i << MMUPAGE_SHIFT;
++		vdso_pagelist[i] = pfn_to_page(pfn + (offset >> PAGE_SHIFT));
++	}
+ 
+ 	vdso_info->cm->pages = vdso_pagelist;
+ }
+@@ -122,7 +127,7 @@ static int __setup_additional_pages(struct mm_struct *mm,
+ 
+ 	BUILD_BUG_ON(VDSO_NR_PAGES != __VDSO_PAGES);
+ 
+-	vdso_text_len = vdso_info->vdso_pages << PAGE_SHIFT;
++	vdso_text_len = vdso_info->vdso_pages << MMUPAGE_SHIFT;
+ 	/* Be sure to map the data page */
+ 	vdso_mapping_len = vdso_text_len + VVAR_SIZE;
+ 
+diff --git a/arch/riscv/mm/context.c b/arch/riscv/mm/context.c
+index 55c20ad1f744..3be7bac8ebd1 100644
+--- a/arch/riscv/mm/context.c
++++ b/arch/riscv/mm/context.c
+@@ -189,7 +189,7 @@ static void set_mm_asid(struct mm_struct *mm, unsigned int cpu)
+ 	raw_spin_unlock_irqrestore(&context_lock, flags);
+ 
+ switch_mm_fast:
+-	csr_write(CSR_SATP, virt_to_pfn(mm->pgd) |
++	csr_write(CSR_SATP, (__pa(mm->pgd) >> MMUPAGE_SHIFT) |
+ 		  (cntx2asid(cntx) << SATP_ASID_SHIFT) |
+ 		  satp_mode);
+ 
+@@ -200,7 +200,7 @@ static void set_mm_asid(struct mm_struct *mm, unsigned int cpu)
+ static void set_mm_noasid(struct mm_struct *mm)
+ {
+ 	/* Switch the page table and blindly nuke entire local TLB */
+-	csr_write(CSR_SATP, virt_to_pfn(mm->pgd) | satp_mode);
++	csr_write(CSR_SATP, (__pa(mm->pgd) >> MMUPAGE_SHIFT) | satp_mode);
+ 	local_flush_tlb_all_asid(0);
+ }
+ 
+diff --git a/arch/riscv/mm/fault.c b/arch/riscv/mm/fault.c
+index 04ed6f8acae4..229619f0c526 100644
+--- a/arch/riscv/mm/fault.c
++++ b/arch/riscv/mm/fault.c
+@@ -189,7 +189,7 @@ static inline void vmalloc_fault(struct pt_regs *regs, int code, unsigned long a
+ 	 */
+ 	index = pgd_index(addr);
+ 	pfn = csr_read(CSR_SATP) & SATP_PPN;
+-	pgd = (pgd_t *)pfn_to_virt(pfn) + index;
++	pgd = (pgd_t *)__va((phys_addr_t)pfn << MMUPAGE_SHIFT) + index;
+ 	pgd_k = init_mm.pgd + index;
+ 
+ 	if (!pgd_present(pgdp_get(pgd_k))) {
+diff --git a/arch/riscv/mm/hugetlbpage.c b/arch/riscv/mm/hugetlbpage.c
+index a6d217112cf4..e68c24097e71 100644
+--- a/arch/riscv/mm/hugetlbpage.c
++++ b/arch/riscv/mm/hugetlbpage.c
+@@ -157,7 +157,7 @@ static pte_t get_clear_contig(struct mm_struct *mm,
+ 	present = pte_present(pte);
+ 	while (--ncontig) {
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 		tmp_pte = ptep_get_and_clear(mm, addr, ptep);
+ 		if (present) {
+ 			if (pte_dirty(tmp_pte))
+@@ -179,7 +179,7 @@ static pte_t get_clear_contig_flush(struct mm_struct *mm,
+ 	bool valid = !pte_none(orig_pte);
+ 
+ 	if (valid)
+-		flush_tlb_range(&vma, addr, addr + (PAGE_SIZE * pte_num));
++		flush_tlb_range(&vma, addr, addr + (MMUPAGE_SIZE * pte_num));
+ 
+ 	return orig_pte;
+ }
+@@ -228,7 +228,7 @@ static int num_contig_ptes_from_size(unsigned long sz, size_t *pgsize)
+ 	else if (sz >= PMD_SIZE)
+ 		hugepage_shift = PMD_SHIFT;
+ 	else
+-		hugepage_shift = PAGE_SHIFT;
++		hugepage_shift = MMUPAGE_SHIFT;
+ 
+ 	*pgsize = 1 << hugepage_shift;
+ 
+@@ -296,7 +296,7 @@ int huge_ptep_set_access_flags(struct vm_area_struct *vma,
+ 	if (pte_young(orig_pte))
+ 		pte = pte_mkyoung(pte);
+ 
+-	for (i = 0; i < pte_num; i++, addr += PAGE_SIZE, ptep++)
++	for (i = 0; i < pte_num; i++, addr += MMUPAGE_SIZE, ptep++)
+ 		set_pte_at(mm, addr, ptep, pte);
+ 
+ 	return true;
+@@ -339,7 +339,7 @@ void huge_ptep_set_wrprotect(struct mm_struct *mm,
+ 
+ 	orig_pte = pte_wrprotect(orig_pte);
+ 
+-	for (i = 0; i < pte_num; i++, addr += PAGE_SIZE, ptep++)
++	for (i = 0; i < pte_num; i++, addr += MMUPAGE_SIZE, ptep++)
+ 		set_pte_at(mm, addr, ptep, orig_pte);
+ }
+ 
+diff --git a/arch/riscv/mm/init.c b/arch/riscv/mm/init.c
+index fa8d2f6f554b..475c3f7c93d7 100644
+--- a/arch/riscv/mm/init.c
++++ b/arch/riscv/mm/init.c
+@@ -344,7 +344,7 @@ pgd_t swapper_pg_dir[PTRS_PER_PGD] __page_aligned_bss;
+ pgd_t trampoline_pg_dir[PTRS_PER_PGD] __page_aligned_bss;
+ static pte_t fixmap_pte[PTRS_PER_PTE] __page_aligned_bss;
+ 
+-pgd_t early_pg_dir[PTRS_PER_PGD] __initdata __aligned(PAGE_SIZE);
++pgd_t early_pg_dir[PTRS_PER_PGD] __initdata __aligned(MMUPAGE_SIZE);
+ 
+ static const pgprot_t protection_map[16] = {
+ 	[VM_NONE]					= PAGE_NONE,
+@@ -376,7 +376,7 @@ void __set_fixmap(enum fixed_addresses idx, phys_addr_t phys, pgprot_t prot)
+ 	ptep = &fixmap_pte[pte_index(addr)];
+ 
+ 	if (pgprot_val(prot))
+-		set_pte(ptep, pfn_pte(phys >> PAGE_SHIFT, prot));
++		set_pte(ptep, __pte(__phys_to_pte_val(phys) | pgprot_val(prot)));
+ 	else
+ 		pte_clear(&init_mm, addr, ptep);
+ 	local_flush_tlb_page(addr);
+@@ -409,7 +409,7 @@ static inline phys_addr_t __init alloc_pte_early(uintptr_t va)
+ 
+ static inline phys_addr_t __init alloc_pte_fixmap(uintptr_t va)
+ {
+-	return memblock_phys_alloc(PAGE_SIZE, PAGE_SIZE);
++	return memblock_phys_alloc(MMUPAGE_SIZE, MMUPAGE_SIZE);
+ }
+ 
+ static phys_addr_t __meminit alloc_pte_late(uintptr_t va)
+@@ -430,25 +430,25 @@ static void __meminit create_pte_mapping(pte_t *ptep, uintptr_t va, phys_addr_t
+ {
+ 	uintptr_t pte_idx = pte_index(va);
+ 
+-	BUG_ON(sz != PAGE_SIZE);
++	BUG_ON(sz != MMUPAGE_SIZE);
+ 
+ 	if (pte_none(ptep[pte_idx]))
+-		ptep[pte_idx] = pfn_pte(PFN_DOWN(pa), prot);
++		ptep[pte_idx] = __pte(__phys_to_pte_val(pa) | pgprot_val(prot));
+ }
+ 
+ #ifndef __PAGETABLE_PMD_FOLDED
+ 
+ static pmd_t trampoline_pmd[PTRS_PER_PMD] __page_aligned_bss;
+ static pmd_t fixmap_pmd[PTRS_PER_PMD] __page_aligned_bss;
+-static pmd_t early_pmd[PTRS_PER_PMD] __initdata __aligned(PAGE_SIZE);
++static pmd_t early_pmd[PTRS_PER_PMD] __initdata __aligned(MMUPAGE_SIZE);
+ 
+ static p4d_t trampoline_p4d[PTRS_PER_P4D] __page_aligned_bss;
+ static p4d_t fixmap_p4d[PTRS_PER_P4D] __page_aligned_bss;
+-static p4d_t early_p4d[PTRS_PER_P4D] __initdata __aligned(PAGE_SIZE);
++static p4d_t early_p4d[PTRS_PER_P4D] __initdata __aligned(MMUPAGE_SIZE);
+ 
+ static pud_t trampoline_pud[PTRS_PER_PUD] __page_aligned_bss;
+ static pud_t fixmap_pud[PTRS_PER_PUD] __page_aligned_bss;
+-static pud_t early_pud[PTRS_PER_PUD] __initdata __aligned(PAGE_SIZE);
++static pud_t early_pud[PTRS_PER_PUD] __initdata __aligned(MMUPAGE_SIZE);
+ 
+ static pmd_t *__init get_pmd_virt_early(phys_addr_t pa)
+ {
+@@ -476,7 +476,7 @@ static phys_addr_t __init alloc_pmd_early(uintptr_t va)
+ 
+ static phys_addr_t __init alloc_pmd_fixmap(uintptr_t va)
+ {
+-	return memblock_phys_alloc(PAGE_SIZE, PAGE_SIZE);
++	return memblock_phys_alloc(MMUPAGE_SIZE, MMUPAGE_SIZE);
+ }
+ 
+ static phys_addr_t __meminit alloc_pmd_late(uintptr_t va)
+@@ -498,17 +498,17 @@ static void __meminit create_pmd_mapping(pmd_t *pmdp,
+ 
+ 	if (sz == PMD_SIZE) {
+ 		if (pmd_none(pmdp[pmd_idx]))
+-			pmdp[pmd_idx] = pfn_pmd(PFN_DOWN(pa), prot);
++			pmdp[pmd_idx] = __pmd(__phys_to_pte_val(pa) | pgprot_val(prot));
+ 		return;
+ 	}
+ 
+ 	if (pmd_none(pmdp[pmd_idx])) {
+ 		pte_phys = pt_ops.alloc_pte(va);
+-		pmdp[pmd_idx] = pfn_pmd(PFN_DOWN(pte_phys), PAGE_TABLE);
++		pmdp[pmd_idx] = __pmd(__phys_to_pte_val(pte_phys) | pgprot_val(PAGE_TABLE));
+ 		ptep = pt_ops.get_pte_virt(pte_phys);
+-		memset(ptep, 0, PAGE_SIZE);
++		memset(ptep, 0, MMUPAGE_SIZE);
+ 	} else {
+-		pte_phys = PFN_PHYS(_pmd_pfn(pmdp[pmd_idx]));
++		pte_phys = __pte_val_to_phys(pmd_val(pmdp[pmd_idx]));
+ 		ptep = pt_ops.get_pte_virt(pte_phys);
+ 	}
+ 
+@@ -541,7 +541,7 @@ static phys_addr_t __init alloc_pud_early(uintptr_t va)
+ 
+ static phys_addr_t __init alloc_pud_fixmap(uintptr_t va)
+ {
+-	return memblock_phys_alloc(PAGE_SIZE, PAGE_SIZE);
++	return memblock_phys_alloc(MMUPAGE_SIZE, MMUPAGE_SIZE);
+ }
+ 
+ static phys_addr_t __meminit alloc_pud_late(uintptr_t va)
+@@ -579,7 +579,7 @@ static phys_addr_t __init alloc_p4d_early(uintptr_t va)
+ 
+ static phys_addr_t __init alloc_p4d_fixmap(uintptr_t va)
+ {
+-	return memblock_phys_alloc(PAGE_SIZE, PAGE_SIZE);
++	return memblock_phys_alloc(MMUPAGE_SIZE, MMUPAGE_SIZE);
+ }
+ 
+ static phys_addr_t __meminit alloc_p4d_late(uintptr_t va)
+@@ -600,17 +600,17 @@ static void __meminit create_pud_mapping(pud_t *pudp, uintptr_t va, phys_addr_t
+ 
+ 	if (sz == PUD_SIZE) {
+ 		if (pud_val(pudp[pud_index]) == 0)
+-			pudp[pud_index] = pfn_pud(PFN_DOWN(pa), prot);
++			pudp[pud_index] = __pud(__phys_to_pte_val(pa) | pgprot_val(prot));
+ 		return;
+ 	}
+ 
+ 	if (pud_val(pudp[pud_index]) == 0) {
+ 		next_phys = pt_ops.alloc_pmd(va);
+-		pudp[pud_index] = pfn_pud(PFN_DOWN(next_phys), PAGE_TABLE);
++		pudp[pud_index] = __pud(__phys_to_pte_val(next_phys) | pgprot_val(PAGE_TABLE));
+ 		nextp = pt_ops.get_pmd_virt(next_phys);
+-		memset(nextp, 0, PAGE_SIZE);
++		memset(nextp, 0, MMUPAGE_SIZE);
+ 	} else {
+-		next_phys = PFN_PHYS(_pud_pfn(pudp[pud_index]));
++		next_phys = __pte_val_to_phys(pud_val(pudp[pud_index]));
+ 		nextp = pt_ops.get_pmd_virt(next_phys);
+ 	}
+ 
+@@ -626,17 +626,17 @@ static void __meminit create_p4d_mapping(p4d_t *p4dp, uintptr_t va, phys_addr_t
+ 
+ 	if (sz == P4D_SIZE) {
+ 		if (p4d_val(p4dp[p4d_index]) == 0)
+-			p4dp[p4d_index] = pfn_p4d(PFN_DOWN(pa), prot);
++			p4dp[p4d_index] = __p4d(__phys_to_pte_val(pa) | pgprot_val(prot));
+ 		return;
+ 	}
+ 
+ 	if (p4d_val(p4dp[p4d_index]) == 0) {
+ 		next_phys = pt_ops.alloc_pud(va);
+-		p4dp[p4d_index] = pfn_p4d(PFN_DOWN(next_phys), PAGE_TABLE);
++		p4dp[p4d_index] = __p4d(__phys_to_pte_val(next_phys) | pgprot_val(PAGE_TABLE));
+ 		nextp = pt_ops.get_pud_virt(next_phys);
+-		memset(nextp, 0, PAGE_SIZE);
++		memset(nextp, 0, MMUPAGE_SIZE);
+ 	} else {
+-		next_phys = PFN_PHYS(_p4d_pfn(p4dp[p4d_index]));
++		next_phys = __pte_val_to_phys(p4d_val(p4dp[p4d_index]));
+ 		nextp = pt_ops.get_pud_virt(next_phys);
+ 	}
+ 
+@@ -683,17 +683,17 @@ void __meminit create_pgd_mapping(pgd_t *pgdp, uintptr_t va, phys_addr_t pa, phy
+ 
+ 	if (sz == PGDIR_SIZE) {
+ 		if (pgd_val(pgdp[pgd_idx]) == 0)
+-			pgdp[pgd_idx] = pfn_pgd(PFN_DOWN(pa), prot);
++			pgdp[pgd_idx] = __pgd(__phys_to_pte_val(pa) | pgprot_val(prot));
+ 		return;
+ 	}
+ 
+ 	if (pgd_val(pgdp[pgd_idx]) == 0) {
+ 		next_phys = alloc_pgd_next(va);
+-		pgdp[pgd_idx] = pfn_pgd(PFN_DOWN(next_phys), PAGE_TABLE);
++		pgdp[pgd_idx] = __pgd(__phys_to_pte_val(next_phys) | pgprot_val(PAGE_TABLE));
+ 		nextp = get_pgd_next_virt(next_phys);
+-		memset(nextp, 0, PAGE_SIZE);
++		memset(nextp, 0, MMUPAGE_SIZE);
+ 	} else {
+-		next_phys = PFN_PHYS(_pgd_pfn(pgdp[pgd_idx]));
++		next_phys = __pte_val_to_phys(pgd_val(pgdp[pgd_idx]));
+ 		nextp = get_pgd_next_virt(next_phys);
+ 	}
+ 
+@@ -703,7 +703,7 @@ void __meminit create_pgd_mapping(pgd_t *pgdp, uintptr_t va, phys_addr_t pa, phy
+ static uintptr_t __meminit best_map_size(phys_addr_t pa, uintptr_t va, phys_addr_t size)
+ {
+ 	if (debug_pagealloc_enabled())
+-		return PAGE_SIZE;
++		return MMUPAGE_SIZE;
+ 
+ 	if (pgtable_l5_enabled &&
+ 	    !(pa & (P4D_SIZE - 1)) && !(va & (P4D_SIZE - 1)) && size >= P4D_SIZE)
+@@ -717,7 +717,7 @@ static uintptr_t __meminit best_map_size(phys_addr_t pa, uintptr_t va, phys_addr
+ 	    !(pa & (PMD_SIZE - 1)) && !(va & (PMD_SIZE - 1)) && size >= PMD_SIZE)
+ 		return PMD_SIZE;
+ 
+-	return PAGE_SIZE;
++	return MMUPAGE_SIZE;
+ }
+ 
+ #ifdef CONFIG_STRICT_KERNEL_RWX
+@@ -863,7 +863,7 @@ static __init void set_satp_mode(uintptr_t dtb_pa)
+ 				(uintptr_t)early_p4d : (uintptr_t)early_pud,
+ 			   PGDIR_SIZE, PAGE_TABLE);
+ 
+-	identity_satp = PFN_DOWN((uintptr_t)&early_pg_dir) | satp_mode;
++	identity_satp = ((uintptr_t)&early_pg_dir >> MMUPAGE_SHIFT) | satp_mode;
+ 
+ 	local_flush_tlb_all();
+ 	csr_write(CSR_SATP, identity_satp);
+@@ -873,17 +873,17 @@ static __init void set_satp_mode(uintptr_t dtb_pa)
+ 	if (hw_satp != identity_satp) {
+ 		if (pgtable_l5_enabled) {
+ 			disable_pgtable_l5();
+-			memset(early_pg_dir, 0, PAGE_SIZE);
++			memset(early_pg_dir, 0, MMUPAGE_SIZE);
+ 			goto retry;
+ 		}
+ 		disable_pgtable_l4();
+ 	}
+ 
+ out:
+-	memset(early_pg_dir, 0, PAGE_SIZE);
+-	memset(early_p4d, 0, PAGE_SIZE);
+-	memset(early_pud, 0, PAGE_SIZE);
+-	memset(early_pmd, 0, PAGE_SIZE);
++	memset(early_pg_dir, 0, MMUPAGE_SIZE);
++	memset(early_p4d, 0, MMUPAGE_SIZE);
++	memset(early_pud, 0, MMUPAGE_SIZE);
++	memset(early_pmd, 0, MMUPAGE_SIZE);
+ }
+ #endif
+ 
+@@ -930,7 +930,7 @@ static void __init create_fdt_early_page_table(uintptr_t fix_fdt_va,
+ 	uintptr_t pa = dtb_pa & ~(PMD_SIZE - 1);
+ 
+ 	/* Make sure the fdt fixmap address is always aligned on PMD size */
+-	BUILD_BUG_ON(FIX_FDT % (PMD_SIZE / PAGE_SIZE));
++	BUILD_BUG_ON(FIX_FDT % (PMD_SIZE / MMUPAGE_SIZE));
+ 
+ 	/* In 32-bit only, the fdt lies in its own PGD */
+ 	if (!IS_ENABLED(CONFIG_64BIT)) {
+@@ -1247,7 +1247,7 @@ static void __init create_linear_mapping_page_table(void)
+ #endif
+ 
+ #ifdef CONFIG_KFENCE
+-	create_linear_mapping_range(kfence_pool, kfence_pool + KFENCE_POOL_SIZE, PAGE_SIZE, NULL);
++	create_linear_mapping_range(kfence_pool, kfence_pool + KFENCE_POOL_SIZE, MMUPAGE_SIZE, NULL);
+ 
+ 	memblock_clear_nomap(kfence_pool, KFENCE_POOL_SIZE);
+ #endif
+@@ -1288,7 +1288,7 @@ static void __init setup_vm_final(void)
+ 	clear_fixmap(FIX_P4D);
+ 
+ 	/* Move to swapper page table */
+-	csr_write(CSR_SATP, PFN_DOWN(__pa_symbol(swapper_pg_dir)) | satp_mode);
++	csr_write(CSR_SATP, (__pa_symbol(swapper_pg_dir) >> MMUPAGE_SHIFT) | satp_mode);
+ 	local_flush_tlb_all();
+ 
+ 	pt_ops_set_late();
+diff --git a/arch/riscv/mm/kasan_init.c b/arch/riscv/mm/kasan_init.c
+index c4a2a9e5586e..c63909e43621 100644
+--- a/arch/riscv/mm/kasan_init.c
++++ b/arch/riscv/mm/kasan_init.c
+@@ -486,7 +486,7 @@ void __init kasan_init(void)
+ 	u64 i;
+ 
+ 	create_tmp_mapping();
+-	csr_write(CSR_SATP, PFN_DOWN(__pa(tmp_pg_dir)) | satp_mode);
++	csr_write(CSR_SATP, (__pa(tmp_pg_dir) >> MMUPAGE_SHIFT) | satp_mode);
+ 
+ 	kasan_early_clear_pgd(pgd_offset_k(KASAN_SHADOW_START),
+ 			      KASAN_SHADOW_START, KASAN_SHADOW_END);
+@@ -531,7 +531,7 @@ void __init kasan_init(void)
+ 	memset(kasan_early_shadow_page, KASAN_SHADOW_INIT, PAGE_SIZE);
+ 	init_task.kasan_depth = 0;
+ 
+-	csr_write(CSR_SATP, PFN_DOWN(__pa(swapper_pg_dir)) | satp_mode);
++	csr_write(CSR_SATP, (__pa(swapper_pg_dir) >> MMUPAGE_SHIFT) | satp_mode);
+ 	local_flush_tlb_all();
+ 	kasan_init_generic();
+ }
+diff --git a/arch/riscv/mm/pageattr.c b/arch/riscv/mm/pageattr.c
+index 3f76db3d2769..fbbe39b30b03 100644
+--- a/arch/riscv/mm/pageattr.c
++++ b/arch/riscv/mm/pageattr.c
+@@ -120,8 +120,12 @@ static int __split_linear_mapping_pmd(pud_t *pudp,
+ 				return -ENOMEM;
+ 
+ 			ptep_new = (pte_t *)page_address(pte_page);
+-			for (i = 0; i < PTRS_PER_PTE; ++i, ++ptep_new)
+-				set_pte(ptep_new, pfn_pte(pfn + i, prot));
++			{
++				phys_addr_t base = (phys_addr_t)pfn << PAGE_SHIFT;
++				for (i = 0; i < PTRS_PER_PTE; ++i, ++ptep_new)
++					set_pte(ptep_new,
++						__pte(__phys_to_pte_val(base + (unsigned long)i * MMUPAGE_SIZE) | pgprot_val(prot)));
++			}
+ 
+ 			smp_wmb();
+ 
+diff --git a/arch/riscv/mm/ptdump.c b/arch/riscv/mm/ptdump.c
+index 34299c2b231f..dbfd5cf7c61b 100644
+--- a/arch/riscv/mm/ptdump.c
++++ b/arch/riscv/mm/ptdump.c
+@@ -272,7 +272,7 @@ static void note_prot_wx(struct pg_state *st, unsigned long addr)
+ 	WARN_ONCE(1, "riscv/mm: Found insecure W+X mapping at address %p/%pS\n",
+ 		  (void *)st->start_address, (void *)st->start_address);
+ 
+-	st->wx_pages += (addr - st->start_address) / PAGE_SIZE;
++	st->wx_pages += (addr - st->start_address) / MMUPAGE_SIZE;
+ }
+ 
+ static void note_page(struct ptdump_state *pt_st, unsigned long addr,
+diff --git a/arch/riscv/mm/tlbflush.c b/arch/riscv/mm/tlbflush.c
+index 8404530ec00f..37dd406e3c41 100644
+--- a/arch/riscv/mm/tlbflush.c
++++ b/arch/riscv/mm/tlbflush.c
+@@ -78,7 +78,7 @@ static inline void local_flush_tlb_range_asid(unsigned long start,
+ /* Flush a range of kernel pages without broadcasting */
+ void local_flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ {
+-	local_flush_tlb_range_asid(start, end - start, PAGE_SIZE, FLUSH_TLB_NO_ASID);
++	local_flush_tlb_range_asid(start, end - start, MMUPAGE_SIZE, FLUSH_TLB_NO_ASID);
+ }
+ 
+ static void __ipi_flush_tlb_all(void *info)
+@@ -151,7 +151,7 @@ static void __flush_tlb_range(struct mm_struct *mm,
+ 
+ void flush_tlb_mm(struct mm_struct *mm)
+ {
+-	__flush_tlb_range(mm, mm_cpumask(mm), 0, FLUSH_TLB_MAX_SIZE, PAGE_SIZE);
++	__flush_tlb_range(mm, mm_cpumask(mm), 0, FLUSH_TLB_MAX_SIZE, MMUPAGE_SIZE);
+ }
+ 
+ void flush_tlb_mm_range(struct mm_struct *mm,
+@@ -164,7 +164,7 @@ void flush_tlb_mm_range(struct mm_struct *mm,
+ void flush_tlb_page(struct vm_area_struct *vma, unsigned long addr)
+ {
+ 	__flush_tlb_range(vma->vm_mm, mm_cpumask(vma->vm_mm),
+-			  addr, PAGE_SIZE, PAGE_SIZE);
++			  addr, MMUPAGE_SIZE, MMUPAGE_SIZE);
+ }
+ 
+ void flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+@@ -173,7 +173,7 @@ void flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 	unsigned long stride_size;
+ 
+ 	if (!is_vm_hugetlb_page(vma)) {
+-		stride_size = PAGE_SIZE;
++		stride_size = MMUPAGE_SIZE;
+ 	} else {
+ 		stride_size = huge_page_size(hstate_vma(vma));
+ 
+@@ -192,7 +192,7 @@ void flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 			else if (stride_size >= PMD_SIZE)
+ 				stride_size = PMD_SIZE;
+ 			else
+-				stride_size = PAGE_SIZE;
++				stride_size = MMUPAGE_SIZE;
+ 		}
+ 	}
+ 
+@@ -203,7 +203,7 @@ void flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ void flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ {
+ 	__flush_tlb_range(NULL, cpu_online_mask,
+-			  start, end - start, PAGE_SIZE);
++			  start, end - start, MMUPAGE_SIZE);
+ }
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+@@ -237,6 +237,6 @@ void arch_tlbbatch_add_pending(struct arch_tlbflush_unmap_batch *batch,
+ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+ {
+ 	__flush_tlb_range(NULL, &batch->cpumask,
+-			  0, FLUSH_TLB_MAX_SIZE, PAGE_SIZE);
++			  0, FLUSH_TLB_MAX_SIZE, MMUPAGE_SIZE);
+ 	cpumask_clear(&batch->cpumask);
+ }
+-- 
+2.54.0
+

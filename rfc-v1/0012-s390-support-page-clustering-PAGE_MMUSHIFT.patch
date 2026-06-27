@@ -1,0 +1,916 @@
+From 71b030fbd0331b958b5a7aec495a66c887283e4f Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:31 +0200
+Subject: [RFC PATCH 12/28] s390: support page clustering (PAGE_MMUSHIFT)
+
+---
+ arch/s390/Kconfig                   |  9 ++++
+ arch/s390/boot/decompressor.c       |  2 +-
+ arch/s390/boot/startup.c            |  2 +-
+ arch/s390/boot/vmem.c               | 12 ++---
+ arch/s390/include/asm/elf.h         |  2 +-
+ arch/s390/include/asm/ipl.h         |  6 +--
+ arch/s390/include/asm/maccess.h     |  4 +-
+ arch/s390/include/asm/page.h        |  4 +-
+ arch/s390/include/asm/pgtable.h     | 10 ++---
+ arch/s390/include/asm/sclp.h        |  7 +--
+ arch/s390/include/asm/thread_info.h |  4 +-
+ arch/s390/include/asm/tlb.h         | 10 +++++
+ arch/s390/include/asm/uv.h          |  2 +-
+ arch/s390/kernel/abs_lowcore.c      |  8 ++--
+ arch/s390/kernel/ipl.c              |  2 +-
+ arch/s390/kernel/os_info.c          |  2 +-
+ arch/s390/kernel/relocate_kernel.S  | 12 ++---
+ arch/s390/kernel/setup.c            |  2 +-
+ arch/s390/kernel/vdso.c             | 20 ++++-----
+ arch/s390/kvm/dat.h                 |  2 +-
+ arch/s390/kvm/gaccess.c             |  2 +-
+ arch/s390/kvm/kvm-s390.c            |  4 +-
+ arch/s390/kvm/vsie.c                | 12 ++---
+ arch/s390/mm/fault.c                |  6 +--
+ arch/s390/mm/maccess.c              |  2 +-
+ arch/s390/mm/mmap.c                 | 18 ++++----
+ arch/s390/mm/pageattr.c             |  8 ++--
+ arch/s390/mm/pgalloc.c              | 70 ++++++++++++++++++++++++++++-
+ arch/s390/mm/vmem.c                 | 18 +++++---
+ 29 files changed, 179 insertions(+), 83 deletions(-)
+
+diff --git a/arch/s390/Kconfig b/arch/s390/Kconfig
+index 9921a3772bf7..2779db72713a 100644
+--- a/arch/s390/Kconfig
++++ b/arch/s390/Kconfig
+@@ -714,6 +714,15 @@ config ARCH_SPARSEMEM_ENABLE
+ config ARCH_SPARSEMEM_DEFAULT
+ 	def_bool y
+ 
++# PGCL widens PAGE_SIZE by 2^PAGE_MMUSHIFT; cap MAX_PAGE_ORDER so
++# PAGE_SHIFT + MAX_PAGE_ORDER stays under SECTION_SIZE_BITS (=27).
++config ARCH_FORCE_MAX_ORDER
++	int
++	default "5" if PAGE_MMUSHIFT >= 6
++	default "8" if PAGE_MMUSHIFT >= 4
++	default "10" if PAGE_MMUSHIFT >= 2
++	default "10"
++
+ config ILLEGAL_POINTER_VALUE
+ 	hex
+ 	default 0xdead000000000000
+diff --git a/arch/s390/boot/decompressor.c b/arch/s390/boot/decompressor.c
+index 8d1bc25a6bf4..3e98884b154e 100644
+--- a/arch/s390/boot/decompressor.c
++++ b/arch/s390/boot/decompressor.c
+@@ -73,7 +73,7 @@ static void decompress_error(char *m)
+ 
+ unsigned long mem_safe_offset(void)
+ {
+-	return ALIGN(free_mem_end_ptr, PAGE_SIZE);
++	return ALIGN(free_mem_end_ptr, MMUPAGE_SIZE);
+ }
+ 
+ void deploy_kernel(void *output)
+diff --git a/arch/s390/boot/startup.c b/arch/s390/boot/startup.c
+index c1dcf8b1b579..d4d834b2a6e0 100644
+--- a/arch/s390/boot/startup.c
++++ b/arch/s390/boot/startup.c
+@@ -413,7 +413,7 @@ static unsigned long setup_kernel_memory_layout(unsigned long kernel_size)
+ 	VMALLOC_START = VMALLOC_END - vmalloc_size;
+ 	boot_debug("vmalloc area:        0x%016lx-0x%016lx\n", VMALLOC_START, VMALLOC_END);
+ 
+-	__memcpy_real_area = round_down(VMALLOC_START - MEMCPY_REAL_SIZE, PAGE_SIZE);
++	__memcpy_real_area = round_down(VMALLOC_START - MEMCPY_REAL_SIZE, MMUPAGE_SIZE);
+ 	boot_debug("memcpy real area:    0x%016lx-0x%016lx\n", __memcpy_real_area,
+ 		   __memcpy_real_area + MEMCPY_REAL_SIZE);
+ 	__abs_lowcore = round_down(__memcpy_real_area - ABS_LOWCORE_MAP_SIZE,
+diff --git a/arch/s390/boot/vmem.c b/arch/s390/boot/vmem.c
+index 7d6cc4c85af0..9af349ec3bfa 100644
+--- a/arch/s390/boot/vmem.c
++++ b/arch/s390/boot/vmem.c
+@@ -246,8 +246,8 @@ static pte_t *boot_pte_alloc(void)
+ {
+ 	pte_t *pte;
+ 
+-	pte = (void *)physmem_alloc_or_die(RR_VMEM, PAGE_SIZE, PAGE_SIZE);
+-	__arch_set_page_dat(pte, 1);
++	pte = (void *)physmem_alloc_or_die(RR_VMEM, _PAGE_TABLE_SIZE, _PAGE_TABLE_SIZE);
++	__arch_set_page_dat(pte, DIV_ROUND_UP(_PAGE_TABLE_SIZE, PAGE_SIZE));
+ 	memset64((u64 *)pte, _PAGE_INVALID, PTRS_PER_PTE);
+ 	return pte;
+ }
+@@ -271,7 +271,7 @@ static unsigned long resolve_pa_may_alloc(unsigned long addr, unsigned long size
+ #ifdef CONFIG_KASAN
+ 	case POPULATE_KASAN_MAP_SHADOW:
+ 		/* Allow to fail large page allocations, this will fall back to 1mb/4k pages */
+-		addr = physmem_alloc(RR_VMEM, size, size, size == PAGE_SIZE);
++		addr = physmem_alloc(RR_VMEM, size, size, size == MMUPAGE_SIZE);
+ 		if (addr) {
+ 			memset((void *)addr, 0, size);
+ 			return addr;
+@@ -337,11 +337,11 @@ static void pgtable_pte_populate(pmd_t *pmd, unsigned long addr, unsigned long e
+ 	pte_t *pte, entry;
+ 
+ 	pte = pte_offset_kernel(pmd, addr);
+-	for (; addr < end; addr += PAGE_SIZE, pte++) {
++	for (; addr < end; addr += MMUPAGE_SIZE, pte++) {
+ 		if (pte_none(*pte)) {
+ 			if (kasan_pte_populate_zero_shadow(pte, mode))
+ 				continue;
+-			entry = __pte(resolve_pa_may_alloc(addr, PAGE_SIZE, mode));
++			entry = __pte(resolve_pa_may_alloc(addr, MMUPAGE_SIZE, mode));
+ 			entry = set_pte_bit(entry, PAGE_KERNEL);
+ 			set_pte(pte, entry);
+ 			pages++;
+@@ -538,7 +538,7 @@ void setup_vmem(unsigned long kernel_start, unsigned long kernel_end, unsigned l
+ 	pgtable_populate(AMODE31_START, AMODE31_END, POPULATE_DIRECT);
+ 	pgtable_populate(__abs_lowcore, __abs_lowcore + sizeof(struct lowcore),
+ 			 POPULATE_ABS_LOWCORE);
+-	pgtable_populate(__memcpy_real_area, __memcpy_real_area + PAGE_SIZE,
++	pgtable_populate(__memcpy_real_area, __memcpy_real_area + MMUPAGE_SIZE,
+ 			 POPULATE_NONE);
+ 	memcpy_real_ptep = __identity_va(__virt_to_kpte(__memcpy_real_area));
+ 
+diff --git a/arch/s390/include/asm/elf.h b/arch/s390/include/asm/elf.h
+index bb63fa4d20bb..3ed434726e5b 100644
+--- a/arch/s390/include/asm/elf.h
++++ b/arch/s390/include/asm/elf.h
+@@ -187,7 +187,7 @@ typedef s390_regs elf_gregset_t;
+ 	} while (0)
+ 
+ #define CORE_DUMP_USE_REGSET
+-#define ELF_EXEC_PAGESIZE	PAGE_SIZE
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ 
+ /* This is the location that an ET_DYN program is loaded if exec'ed.  Typical
+    use of this is to invoke "./ld.so someprog" to test out a new version of
+diff --git a/arch/s390/include/asm/ipl.h b/arch/s390/include/asm/ipl.h
+index b0d00032479d..a1e56e1ae8b8 100644
+--- a/arch/s390/include/asm/ipl.h
++++ b/arch/s390/include/asm/ipl.h
+@@ -24,9 +24,9 @@ struct ipl_parameter_block {
+ 		struct ipl_pb0_ccw ccw;
+ 		struct ipl_pb0_eckd eckd;
+ 		struct ipl_pb0_nvme nvme;
+-		char raw[PAGE_SIZE - sizeof(struct ipl_pl_hdr)];
++		char raw[MMUPAGE_SIZE - sizeof(struct ipl_pl_hdr)];
+ 	};
+-} __packed __aligned(PAGE_SIZE);
++} __packed __aligned(MMUPAGE_SIZE);
+ 
+ #define NSS_NAME_SIZE 8
+ 
+@@ -53,7 +53,7 @@ struct ipl_parameter_block {
+ #define DIAG308_VMPARM_SIZE (64)
+ #define DIAG308_SCPDATA_OFFSET offsetof(struct ipl_parameter_block, \
+ 					fcp.scp_data)
+-#define DIAG308_SCPDATA_SIZE (PAGE_SIZE - DIAG308_SCPDATA_OFFSET)
++#define DIAG308_SCPDATA_SIZE (MMUPAGE_SIZE - DIAG308_SCPDATA_OFFSET)
+ 
+ struct save_area;
+ struct save_area * __init save_area_alloc(bool is_boot_cpu);
+diff --git a/arch/s390/include/asm/maccess.h b/arch/s390/include/asm/maccess.h
+index 50225940d971..53c62a6a4b98 100644
+--- a/arch/s390/include/asm/maccess.h
++++ b/arch/s390/include/asm/maccess.h
+@@ -4,8 +4,8 @@
+ 
+ #include <linux/types.h>
+ 
+-#define MEMCPY_REAL_SIZE	PAGE_SIZE
+-#define MEMCPY_REAL_MASK	PAGE_MASK
++#define MEMCPY_REAL_SIZE	MMUPAGE_SIZE
++#define MEMCPY_REAL_MASK	MMUPAGE_MASK
+ 
+ struct iov_iter;
+ 
+diff --git a/arch/s390/include/asm/page.h b/arch/s390/include/asm/page.h
+index 56da819a79e6..af7f6350ba17 100644
+--- a/arch/s390/include/asm/page.h
++++ b/arch/s390/include/asm/page.h
+@@ -55,9 +55,9 @@ static inline void copy_page(void *to, void *from)
+ 	union register_pair dst, src;
+ 
+ 	dst.even = (unsigned long) to;
+-	dst.odd  = 0x1000;
++	dst.odd  = PAGE_SIZE;
+ 	src.even = (unsigned long) from;
+-	src.odd  = 0xb0001000;
++	src.odd  = 0xb0000000UL | PAGE_SIZE;
+ 
+ 	asm volatile(
+ 		"	mvcl	%[dst],%[src]"
+diff --git a/arch/s390/include/asm/pgtable.h b/arch/s390/include/asm/pgtable.h
+index 2c6cee8241e0..f117c1514806 100644
+--- a/arch/s390/include/asm/pgtable.h
++++ b/arch/s390/include/asm/pgtable.h
+@@ -206,7 +206,7 @@ void setup_protection_map(void);
+ #define _PAGE_SWP_EXCLUSIVE _PAGE_LARGE	/* SW pte exclusive swap bit */
+ 
+ /* Set of bits not changed in pte_modify */
+-#define _PAGE_CHG_MASK		(PAGE_MASK | _PAGE_SPECIAL | _PAGE_DIRTY | \
++#define _PAGE_CHG_MASK		(MMUPAGE_MASK | _PAGE_SPECIAL | _PAGE_DIRTY | \
+ 				 _PAGE_YOUNG | _PAGE_SOFT_DIRTY)
+ 
+ /*
+@@ -360,7 +360,7 @@ void setup_protection_map(void);
+ #define _REGION2_INDEX	(0x7ffUL << _REGION2_SHIFT)
+ #define _REGION3_INDEX	(0x7ffUL << _REGION3_SHIFT)
+ #define _SEGMENT_INDEX	(0x7ffUL << _SEGMENT_SHIFT)
+-#define _PAGE_INDEX	(0xffUL  << PAGE_SHIFT)
++#define _PAGE_INDEX	(0xffUL  << MMUPAGE_SHIFT)
+ 
+ #define _REGION1_SIZE	(1UL << _REGION1_SHIFT)
+ #define _REGION2_SIZE	(1UL << _REGION2_SHIFT)
+@@ -1108,7 +1108,7 @@ static __always_inline void __ptep_rdp(unsigned long addr, pte_t *ptep, int loca
+ 	pto = __pa(ptep) & ~(PTRS_PER_PTE * sizeof(pte_t) - 1);
+ 	asm volatile(".insn	rrf,0xb98b0000,%[r1],%[r2],%%r0,%[m4]"
+ 		     : "+m" (*ptep)
+-		     : [r1] "a" (pto), [r2] "a" (addr & PAGE_MASK),
++		     : [r1] "a" (pto), [r2] "a" (addr & MMUPAGE_MASK),
+ 		       [m4] "i" (local));
+ }
+ 
+@@ -1323,7 +1323,7 @@ static inline int ptep_set_access_flags(struct vm_area_struct *vma,
+ #define pgprot_writecombine	pgprot_writecombine
+ pgprot_t pgprot_writecombine(pgprot_t prot);
+ 
+-#define PFN_PTE_SHIFT		PAGE_SHIFT
++#define PFN_PTE_SHIFT		MMUPAGE_SHIFT
+ 
+ /*
+  * Set multiple PTEs to consecutive pages with a single call.  All PTEs
+@@ -1340,7 +1340,7 @@ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		entry = __pte(pte_val(entry) + PAGE_SIZE);
++		entry = __pte(pte_val(entry) + MMUPAGE_SIZE);
+ 	}
+ }
+ #define set_ptes set_ptes
+diff --git a/arch/s390/include/asm/sclp.h b/arch/s390/include/asm/sclp.h
+index 0f184dbdbe5e..e53b585e8337 100644
+--- a/arch/s390/include/asm/sclp.h
++++ b/arch/s390/include/asm/sclp.h
+@@ -7,14 +7,15 @@
+ #define _ASM_S390_SCLP_H
+ 
+ #include <linux/types.h>
++#include <vdso/page.h>
+ 
+ #define SCLP_CHP_INFO_MASK_SIZE		32
+-#define EARLY_SCCB_SIZE		PAGE_SIZE
++#define EARLY_SCCB_SIZE		MMUPAGE_SIZE
+ #define SCLP_MAX_CORES		512
+ /* 144 + 16 * SCLP_MAX_CORES + 2 * (SCLP_MAX_CORES - 1) */
+-#define EXT_SCCB_READ_SCP	(3 * PAGE_SIZE)
++#define EXT_SCCB_READ_SCP	(3 * MMUPAGE_SIZE)
+ /* 24 + 16 * SCLP_MAX_CORES */
+-#define EXT_SCCB_READ_CPU	(3 * PAGE_SIZE)
++#define EXT_SCCB_READ_CPU	(3 * MMUPAGE_SIZE)
+ 
+ #define SCLP_ERRNOTIFY_AQ_RESET			0
+ #define SCLP_ERRNOTIFY_AQ_REPAIR		1
+diff --git a/arch/s390/include/asm/thread_info.h b/arch/s390/include/asm/thread_info.h
+index 6a548a819400..635b1b53aa5e 100644
+--- a/arch/s390/include/asm/thread_info.h
++++ b/arch/s390/include/asm/thread_info.h
+@@ -19,8 +19,8 @@
+ #else
+ #define THREAD_SIZE_ORDER 2
+ #endif
+-#define BOOT_STACK_SIZE (PAGE_SIZE << 2)
+-#define THREAD_SIZE (PAGE_SIZE << THREAD_SIZE_ORDER)
++#define BOOT_STACK_SIZE (MMUPAGE_SIZE << 2)
++#define THREAD_SIZE (MMUPAGE_SIZE << THREAD_SIZE_ORDER)
+ 
+ #define STACK_INIT_OFFSET (THREAD_SIZE - STACK_FRAME_OVERHEAD - __PT_SIZE)
+ 
+diff --git a/arch/s390/include/asm/tlb.h b/arch/s390/include/asm/tlb.h
+index 619fd41e710e..048e0efba7e2 100644
+--- a/arch/s390/include/asm/tlb.h
++++ b/arch/s390/include/asm/tlb.h
+@@ -82,7 +82,17 @@ static inline void pte_free_tlb(struct mmu_gather *tlb, pgtable_t pte,
+ 	tlb->mm->context.flush_mm = 1;
+ 	tlb->freed_tables = 1;
+ 	tlb->cleared_pmds = 1;
++#if PAGE_MMUSHIFT
++	/*
++	 * With PGCL, PTE tables are slab-allocated and cannot use
++	 * tlb_remove_ptdesc (which expects a per-table ptdesc).
++	 * Free directly — s390x PTEs were already invalidated via IPTE,
++	 * and flush_mm=1 ensures a full TLB flush before mm reuse.
++	 */
++	page_table_free(tlb->mm, (unsigned long *)pte);
++#else
+ 	tlb_remove_ptdesc(tlb, virt_to_ptdesc(pte));
++#endif
+ }
+ 
+ /*
+diff --git a/arch/s390/include/asm/uv.h b/arch/s390/include/asm/uv.h
+index d919e69662f5..0dad3aa8a7b6 100644
+--- a/arch/s390/include/asm/uv.h
++++ b/arch/s390/include/asm/uv.h
+@@ -429,7 +429,7 @@ struct uv_secret_list {
+ 	u64 reserved_08;
+ 	struct uv_secret_list_item secrets[85];
+ } __packed __aligned(8);
+-static_assert(sizeof(struct uv_secret_list) == PAGE_SIZE);
++static_assert(sizeof(struct uv_secret_list) == MMUPAGE_SIZE);
+ 
+ static inline int __uv_call(unsigned long r1, unsigned long r2)
+ {
+diff --git a/arch/s390/kernel/abs_lowcore.c b/arch/s390/kernel/abs_lowcore.c
+index 6252b7d115dd..6e63b46574e9 100644
+--- a/arch/s390/kernel/abs_lowcore.c
++++ b/arch/s390/kernel/abs_lowcore.c
+@@ -23,14 +23,14 @@ int abs_lowcore_map(int cpu, struct lowcore *lc, bool alloc)
+ 			 */
+ 			if (alloc) {
+ 				for (--i; i >= 0; i--) {
+-					addr -= PAGE_SIZE;
++					addr -= MMUPAGE_SIZE;
+ 					vmem_unmap_4k_page(addr);
+ 				}
+ 			}
+ 			return rc;
+ 		}
+-		addr += PAGE_SIZE;
+-		phys += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
++		phys += MMUPAGE_SIZE;
+ 	}
+ 	return 0;
+ }
+@@ -42,6 +42,6 @@ void abs_lowcore_unmap(int cpu)
+ 
+ 	for (i = 0; i < LC_PAGES; i++) {
+ 		vmem_unmap_4k_page(addr);
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 	}
+ }
+diff --git a/arch/s390/kernel/ipl.c b/arch/s390/kernel/ipl.c
+index 3c346b02ceb9..67996cfed56d 100644
+--- a/arch/s390/kernel/ipl.c
++++ b/arch/s390/kernel/ipl.c
+@@ -2345,7 +2345,7 @@ static struct notifier_block on_panic_nb = {
+ 
+ void __init setup_ipl(void)
+ {
+-	BUILD_BUG_ON(sizeof(struct ipl_parameter_block) != PAGE_SIZE);
++	BUILD_BUG_ON(sizeof(struct ipl_parameter_block) != MMUPAGE_SIZE);
+ 
+ 	ipl_info.type = get_ipl_type();
+ 	switch (ipl_info.type) {
+diff --git a/arch/s390/kernel/os_info.c b/arch/s390/kernel/os_info.c
+index 4a30c10ae63b..b67e8b0b80c1 100644
+--- a/arch/s390/kernel/os_info.c
++++ b/arch/s390/kernel/os_info.c
+@@ -73,7 +73,7 @@ void __init os_info_init(void)
+ {
+ 	struct lowcore *abs_lc;
+ 
+-	BUILD_BUG_ON(sizeof(struct os_info) != PAGE_SIZE);
++	BUILD_BUG_ON(sizeof(struct os_info) != MMUPAGE_SIZE);
+ 	os_info.version_major = OS_INFO_VERSION_MAJOR;
+ 	os_info.version_minor = OS_INFO_VERSION_MINOR;
+ 	os_info.magic = OS_INFO_MAGIC;
+diff --git a/arch/s390/kernel/relocate_kernel.S b/arch/s390/kernel/relocate_kernel.S
+index 0ae297c82afd..1c0102eef103 100644
+--- a/arch/s390/kernel/relocate_kernel.S
++++ b/arch/s390/kernel/relocate_kernel.S
+@@ -22,26 +22,26 @@
+  * %r8 holds the source address
+  * %r9 = PAGE_SIZE
+  *
+- * 0xf000 is a page_mask
++ * (PAGE_MASK & 0xffff) is the low-halfword page mask for nill
+  */
+ 
+ 	.text
+ SYM_CODE_START(relocate_kernel)
+ 	basr	%r13,0		# base address
+ .base:
+-	lghi	%r7,PAGE_SIZE	# load PAGE_SIZE in r7
+-	lghi	%r9,PAGE_SIZE	# load PAGE_SIZE in r9
++	lgfi	%r7,PAGE_SIZE	# load PAGE_SIZE in r7
++	lgfi	%r9,PAGE_SIZE	# load PAGE_SIZE in r9
+ 	lg	%r5,0(%r2)	# read another word for indirection page
+ 	aghi	%r2,8		# increment pointer
+ 	tml	%r5,0x1		# is it a destination page?
+ 	je	.indir_check	# NO, goto "indir_check"
+ 	lgr	%r6,%r5		# r6 = r5
+-	nill	%r6,0xf000	# mask it out and...
++	nill	%r6,(PAGE_MASK & 0xffff)	# mask it out and...
+ 	j	.base		# ...next iteration
+ .indir_check:
+ 	tml	%r5,0x2		# is it a indirection page?
+ 	je	.done_test	# NO, goto "done_test"
+-	nill	%r5,0xf000	# YES, mask out,
++	nill	%r5,(PAGE_MASK & 0xffff)	# YES, mask out,
+ 	lgr	%r2,%r5		# move it into the right register,
+ 	j	.base		# and read next...
+ .done_test:
+@@ -52,7 +52,7 @@ SYM_CODE_START(relocate_kernel)
+ 	tml	%r5,0x8		# it should be a source indicator...
+ 	je	.base		# NO, ignore it...
+ 	lgr	%r8,%r5		# r8 = r5
+-	nill	%r8,0xf000	# masking
++	nill	%r8,(PAGE_MASK & 0xffff)	# masking
+ 0:	mvcle	%r6,%r8,0x0	# copy PAGE_SIZE bytes from r8 to r6 - pad with 0
+ 	jo	0b
+ 	j	.base
+diff --git a/arch/s390/kernel/setup.c b/arch/s390/kernel/setup.c
+index b60284328fe3..1a625854431d 100644
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -390,7 +390,7 @@ static void __init setup_lowcore(void)
+ 	/*
+ 	 * Setup lowcore for boot cpu
+ 	 */
+-	BUILD_BUG_ON(sizeof(struct lowcore) != LC_PAGES * PAGE_SIZE);
++	BUILD_BUG_ON(sizeof(struct lowcore) != LC_PAGES * MMUPAGE_SIZE);
+ 	lc = memblock_alloc_low(sizeof(*lc), sizeof(*lc));
+ 	if (!lc)
+ 		panic("%s: Failed to allocate %zu bytes align=%zx\n",
+diff --git a/arch/s390/kernel/vdso.c b/arch/s390/kernel/vdso.c
+index 0fe616c49fcc..0a93f88a1289 100644
+--- a/arch/s390/kernel/vdso.c
++++ b/arch/s390/kernel/vdso.c
+@@ -63,14 +63,14 @@ static int map_vdso(unsigned long addr, unsigned long vdso_mapping_len)
+ 	rc = PTR_ERR(vma);
+ 	if (IS_ERR(vma))
+ 		goto out;
+-	vdso_text_start = vvar_start + VDSO_NR_PAGES * PAGE_SIZE;
++	vdso_text_start = vvar_start + VDSO_NR_PAGES * MMUPAGE_SIZE;
+ 	/* VM_MAYWRITE for COW so gdb can set breakpoints */
+ 	vma = _install_special_mapping(mm, vdso_text_start, vdso_text_len,
+ 				       VM_READ|VM_EXEC|VM_SEALED_SYSMAP|
+ 				       VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC,
+ 				       &vdso_mapping);
+ 	if (IS_ERR(vma)) {
+-		do_munmap(mm, vvar_start, PAGE_SIZE, NULL);
++		do_munmap(mm, vvar_start, VDSO_NR_PAGES * MMUPAGE_SIZE, NULL);
+ 		rc = PTR_ERR(vma);
+ 	} else {
+ 		current->mm->context.vdso_base = vdso_text_start;
+@@ -89,7 +89,7 @@ static unsigned long vdso_addr(unsigned long start, unsigned long len)
+ 	 * Round up the start address. It can start out unaligned as a result
+ 	 * of stack start randomization.
+ 	 */
+-	start = PAGE_ALIGN(start);
++	start = MMUPAGE_ALIGN(start);
+ 
+ 	/* Round the lowest possible end address up to a PMD boundary. */
+ 	end = (start + len + PMD_SIZE - 1) & PMD_MASK;
+@@ -98,8 +98,8 @@ static unsigned long vdso_addr(unsigned long start, unsigned long len)
+ 	end -= len;
+ 
+ 	if (end > start) {
+-		offset = get_random_u32_below(((end - start) >> PAGE_SHIFT) + 1);
+-		addr = start + (offset << PAGE_SHIFT);
++		offset = get_random_u32_below(((end - start) >> MMUPAGE_SHIFT) + 1);
++		addr = start + (offset << MMUPAGE_SHIFT);
+ 	} else {
+ 		addr = start;
+ 	}
+@@ -108,12 +108,12 @@ static unsigned long vdso_addr(unsigned long start, unsigned long len)
+ 
+ unsigned long vdso_text_size(void)
+ {
+-	return PAGE_ALIGN(vdso_end - vdso_start);
++	return MMUPAGE_ALIGN(vdso_end - vdso_start);
+ }
+ 
+ unsigned long vdso_size(void)
+ {
+-	return vdso_text_size() + VDSO_NR_PAGES * PAGE_SIZE;
++	return vdso_text_size() + VDSO_NR_PAGES * MMUPAGE_SIZE;
+ }
+ 
+ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+@@ -122,13 +122,13 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+ 	unsigned long size = vdso_size();
+ 
+ 	if (current->flags & PF_RANDOMIZE)
+-		addr = vdso_addr(current->mm->start_stack + PAGE_SIZE, size);
++		addr = vdso_addr(current->mm->start_stack + MMUPAGE_SIZE, size);
+ 	return map_vdso(addr, size);
+ }
+ 
+ static struct page ** __init vdso_setup_pages(void *start, void *end)
+ {
+-	int pages = (end - start) >> PAGE_SHIFT;
++	int pages = (end - start) >> MMUPAGE_SHIFT;
+ 	struct page **pagelist;
+ 	int i;
+ 
+@@ -136,7 +136,7 @@ static struct page ** __init vdso_setup_pages(void *start, void *end)
+ 	if (!pagelist)
+ 		panic("%s: Cannot allocate page list for VDSO", __func__);
+ 	for (i = 0; i < pages; i++)
+-		pagelist[i] = virt_to_page(start + i * PAGE_SIZE);
++		pagelist[i] = virt_to_page(start + i * MMUPAGE_SIZE);
+ 	return pagelist;
+ }
+ 
+diff --git a/arch/s390/kvm/dat.h b/arch/s390/kvm/dat.h
+index 873e13ac5a27..34c962277e12 100644
+--- a/arch/s390/kvm/dat.h
++++ b/arch/s390/kvm/dat.h
+@@ -347,7 +347,7 @@ struct page_table {
+ };
+ 
+ static_assert(sizeof(struct crst_table) == _CRST_TABLE_SIZE);
+-static_assert(sizeof(struct page_table) == PAGE_SIZE);
++static_assert(sizeof(struct page_table) == MMUPAGE_SIZE);
+ 
+ struct dat_walk;
+ 
+diff --git a/arch/s390/kvm/gaccess.c b/arch/s390/kvm/gaccess.c
+index 20e28b183c1a..8801a89fd4dd 100644
+--- a/arch/s390/kvm/gaccess.c
++++ b/arch/s390/kvm/gaccess.c
+@@ -381,7 +381,7 @@ static int trans_exc_ending(struct kvm_vcpu *vcpu, int code, unsigned long gva,
+ 		 * exc_access_id has to be set to 0 for some instructions. Both
+ 		 * cases have to be handled by the caller.
+ 		 */
+-		teid->addr = gva >> PAGE_SHIFT;
++		teid->addr = gva >> MMUPAGE_SHIFT;
+ 		teid->fsi = mode == GACC_STORE ? TEID_FSI_STORE : TEID_FSI_FETCH;
+ 		teid->as = psw_bits(vcpu->arch.sie_block->gpsw).as;
+ 		fallthrough;
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index ffb20a64d328..6b16a1aaf361 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -4467,7 +4467,7 @@ bool kvm_arch_setup_async_pf(struct kvm_vcpu *vcpu)
+ 	if (read_guest_real(vcpu, vcpu->arch.pfault_token, &arch.pfault_token, 8))
+ 		return false;
+ 
+-	return kvm_setup_async_pf(vcpu, current->thread.gmap_teid.addr * PAGE_SIZE, hva, &arch);
++	return kvm_setup_async_pf(vcpu, current->thread.gmap_teid.addr * MMUPAGE_SIZE, hva, &arch);
+ }
+ 
+ static int vcpu_pre_run(struct kvm_vcpu *vcpu)
+@@ -4580,7 +4580,7 @@ static int vcpu_post_run_handle_fault(struct kvm_vcpu *vcpu)
+ 	unsigned long gaddr;
+ 	int rc;
+ 
+-	gaddr = current->thread.gmap_teid.addr * PAGE_SIZE;
++	gaddr = current->thread.gmap_teid.addr * MMUPAGE_SIZE;
+ 	if (kvm_s390_cur_gmap_fault_is_write())
+ 		foll = FOLL_WRITE;
+ 
+diff --git a/arch/s390/kvm/vsie.c b/arch/s390/kvm/vsie.c
+index e5a23f1c9749..abbc0d25627e 100644
+--- a/arch/s390/kvm/vsie.c
++++ b/arch/s390/kvm/vsie.c
+@@ -67,7 +67,7 @@ struct vsie_page {
+ 	__u8 fac[S390_ARCH_FAC_LIST_SIZE_BYTE];	/* 0x0800 */
+ };
+ 
+-static_assert(sizeof(struct vsie_page) == PAGE_SIZE);
++static_assert(sizeof(struct vsie_page) == MMUPAGE_SIZE);
+ 
+ /* trigger a validity icpt for the given scb */
+ static int set_validity_icpt(struct kvm_s390_sie_block *scb,
+@@ -954,14 +954,14 @@ static int handle_fault(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page, stru
+ 	if ((current->thread.gmap_int_code & PGM_INT_CODE_MASK) == PGM_PROTECTION)
+ 		/* we can directly forward all protection exceptions */
+ 		return inject_fault(vcpu, PGM_PROTECTION,
+-				    current->thread.gmap_teid.addr * PAGE_SIZE, 1);
++				    current->thread.gmap_teid.addr * MMUPAGE_SIZE, 1);
+ 
+-	rc = gaccess_shadow_fault(vcpu, sg, current->thread.gmap_teid.addr * PAGE_SIZE, NULL, wr);
++	rc = gaccess_shadow_fault(vcpu, sg, current->thread.gmap_teid.addr * MMUPAGE_SIZE, NULL, wr);
+ 	if (rc > 0) {
+ 		rc = inject_fault(vcpu, rc,
+-				  current->thread.gmap_teid.addr * PAGE_SIZE, wr);
++				  current->thread.gmap_teid.addr * MMUPAGE_SIZE, wr);
+ 		if (rc >= 0)
+-			vsie_page->fault_addr = current->thread.gmap_teid.addr * PAGE_SIZE;
++			vsie_page->fault_addr = current->thread.gmap_teid.addr * MMUPAGE_SIZE;
+ 	}
+ 	return rc;
+ }
+@@ -1518,7 +1518,7 @@ int kvm_s390_handle_vsie(struct kvm_vcpu *vcpu)
+ 	if (vcpu->arch.sie_block->gpsw.mask & PSW_MASK_PSTATE)
+ 		return kvm_s390_inject_program_int(vcpu, PGM_PRIVILEGED_OP);
+ 
+-	BUILD_BUG_ON(sizeof(struct vsie_page) != PAGE_SIZE);
++	BUILD_BUG_ON(sizeof(struct vsie_page) != MMUPAGE_SIZE);
+ 	scb_addr = kvm_s390_get_base_disp_s(vcpu, NULL);
+ 
+ 	/* 512 byte alignment */
+diff --git a/arch/s390/mm/fault.c b/arch/s390/mm/fault.c
+index 028aeb9c48d6..e160a906308a 100644
+--- a/arch/s390/mm/fault.c
++++ b/arch/s390/mm/fault.c
+@@ -62,7 +62,7 @@ static unsigned long get_fault_address(struct pt_regs *regs)
+ {
+ 	union teid teid = { .val = regs->int_parm_long };
+ 
+-	return teid.addr * PAGE_SIZE;
++	return teid.addr * MMUPAGE_SIZE;
+ }
+ 
+ static __always_inline bool fault_is_write(struct pt_regs *regs)
+@@ -116,7 +116,7 @@ static void dump_pagetable(unsigned long asce, unsigned long address)
+ 			goto out;
+ 		table = __va(entry & _SEGMENT_ENTRY_ORIGIN);
+ 	}
+-	table += (address & _PAGE_INDEX) >> PAGE_SHIFT;
++	table += (address & _PAGE_INDEX) >> MMUPAGE_SHIFT;
+ 	if (get_kernel_nofault(entry, table))
+ 		goto bad;
+ 	pr_cont("P:%016lx ", entry);
+@@ -390,7 +390,7 @@ void do_protection_exception(struct pt_regs *regs)
+ 		return handle_fault_error_nolock(regs, 0);
+ 	}
+ 	if (unlikely(cpu_has_nx() && teid.b56)) {
+-		regs->int_parm_long = (teid.addr * PAGE_SIZE) | (regs->psw.addr & PAGE_MASK);
++		regs->int_parm_long = (teid.addr * MMUPAGE_SIZE) | (regs->psw.addr & MMUPAGE_MASK);
+ 		return handle_fault_error_nolock(regs, SEGV_ACCERR);
+ 	}
+ 	do_exception(regs, VM_WRITE);
+diff --git a/arch/s390/mm/maccess.c b/arch/s390/mm/maccess.c
+index cfd219fe495c..ea7f2eb94fbd 100644
+--- a/arch/s390/mm/maccess.c
++++ b/arch/s390/mm/maccess.c
+@@ -87,7 +87,7 @@ size_t memcpy_real_iter(struct iov_iter *iter, unsigned long src, size_t count)
+ 	void *chunk;
+ 	pte_t pte;
+ 
+-	BUILD_BUG_ON(MEMCPY_REAL_SIZE != PAGE_SIZE);
++	BUILD_BUG_ON(MEMCPY_REAL_SIZE != MMUPAGE_SIZE);
+ 	while (count) {
+ 		phys = src & MEMCPY_REAL_MASK;
+ 		offset = src & ~MEMCPY_REAL_MASK;
+diff --git a/arch/s390/mm/mmap.c b/arch/s390/mm/mmap.c
+index 2a222a7e14f4..af5a049ca8b0 100644
+--- a/arch/s390/mm/mmap.c
++++ b/arch/s390/mm/mmap.c
+@@ -23,7 +23,7 @@ static unsigned long stack_maxrandom_size(void)
+ {
+ 	if (!(current->flags & PF_RANDOMIZE))
+ 		return 0;
+-	return STACK_RND_MASK << PAGE_SHIFT;
++	return STACK_RND_MASK << MMUPAGE_SHIFT;
+ }
+ 
+ static inline int mmap_is_legacy(const struct rlimit *rlim_stack)
+@@ -37,7 +37,7 @@ static inline int mmap_is_legacy(const struct rlimit *rlim_stack)
+ 
+ unsigned long arch_mmap_rnd(void)
+ {
+-	return (get_random_u32() & MMAP_RND_MASK) << PAGE_SHIFT;
++	return (get_random_u32() & MMAP_RND_MASK) << MMUPAGE_SHIFT;
+ }
+ 
+ static unsigned long mmap_base_legacy(unsigned long rnd)
+@@ -71,7 +71,7 @@ static int get_align_mask(struct file *filp, unsigned long flags)
+ 	if (!(current->flags & PF_RANDOMIZE))
+ 		return 0;
+ 	if (filp || (flags & MAP_SHARED))
+-		return MMAP_ALIGN_MASK << PAGE_SHIFT;
++		return MMAP_ALIGN_MASK << MMUPAGE_SHIFT;
+ 	return 0;
+ }
+ 
+@@ -102,9 +102,9 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 	info.high_limit = TASK_SIZE;
+ 	info.align_mask = get_align_mask(filp, flags);
+ 	if (!(filp && is_file_hugepages(filp)))
+-		info.align_offset = pgoff << PAGE_SHIFT;
++		info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	addr = vm_unmapped_area(&info);
+-	if (offset_in_page(addr))
++	if (IS_ERR_VALUE(addr))
+ 		return addr;
+ 
+ check_asce_limit:
+@@ -137,11 +137,11 @@ unsigned long arch_get_unmapped_area_topdown(struct file *filp, unsigned long ad
+ 
+ 	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+ 	info.length = len;
+-	info.low_limit = PAGE_SIZE;
++	info.low_limit = MMUPAGE_SIZE;
+ 	info.high_limit = mm->mmap_base;
+ 	info.align_mask = get_align_mask(filp, flags);
+ 	if (!(filp && is_file_hugepages(filp)))
+-		info.align_offset = pgoff << PAGE_SHIFT;
++		info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	addr = vm_unmapped_area(&info);
+ 
+ 	/*
+@@ -150,13 +150,13 @@ unsigned long arch_get_unmapped_area_topdown(struct file *filp, unsigned long ad
+ 	 * can happen with large stack limits and large mmap()
+ 	 * allocations.
+ 	 */
+-	if (offset_in_page(addr)) {
++	if (IS_ERR_VALUE(addr)) {
+ 		VM_BUG_ON(addr != -ENOMEM);
+ 		info.flags = 0;
+ 		info.low_limit = TASK_UNMAPPED_BASE;
+ 		info.high_limit = TASK_SIZE;
+ 		addr = vm_unmapped_area(&info);
+-		if (offset_in_page(addr))
++		if (IS_ERR_VALUE(addr))
+ 			return addr;
+ 	}
+ 
+diff --git a/arch/s390/mm/pageattr.c b/arch/s390/mm/pageattr.c
+index bb29c38ae624..8117d4fcfa44 100644
+--- a/arch/s390/mm/pageattr.c
++++ b/arch/s390/mm/pageattr.c
+@@ -33,7 +33,7 @@ void __storage_key_init_range(unsigned long start, unsigned long end)
+ 			}
+ 		}
+ 		page_set_storage_key(start, PAGE_DEFAULT_KEY, 1);
+-		start += PAGE_SIZE;
++		start += MMUPAGE_SIZE;
+ 	}
+ }
+ 
+@@ -99,12 +99,12 @@ static int walk_pte_level(pmd_t *pmdp, unsigned long addr, unsigned long end,
+ 		if (flags & SET_MEMORY_INV) {
+ 			new = set_pte_bit(new, __pgprot(_PAGE_INVALID));
+ 		} else if (flags & SET_MEMORY_DEF) {
+-			new = __pte(pte_val(new) & PAGE_MASK);
++			new = __pte(pte_val(new) & MMUPAGE_MASK);
+ 			new = set_pte_bit(new, PAGE_KERNEL);
+ 		}
+ 		pgt_set((unsigned long *)ptep, pte_val(new), addr, CRDTE_DTT_PAGE);
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 		cond_resched();
+ 	} while (addr < end);
+ 	return 0;
+@@ -129,7 +129,7 @@ static int split_pmd_page(pmd_t *pmdp, unsigned long addr)
+ 	ptep = pt_dir;
+ 	for (i = 0; i < PTRS_PER_PTE; i++) {
+ 		set_pte(ptep, __pte(pte_addr | prot));
+-		pte_addr += PAGE_SIZE;
++		pte_addr += MMUPAGE_SIZE;
+ 		ptep++;
+ 	}
+ 	new = __pmd(__pa(pt_dir) | _SEGMENT_ENTRY);
+diff --git a/arch/s390/mm/pgalloc.c b/arch/s390/mm/pgalloc.c
+index 7ac44543e051..d54974245af6 100644
+--- a/arch/s390/mm/pgalloc.c
++++ b/arch/s390/mm/pgalloc.c
+@@ -114,6 +114,47 @@ int crst_table_upgrade(struct mm_struct *mm, unsigned long end)
+ 	return -ENOMEM;
+ }
+ 
++#if PAGE_MMUSHIFT
++/*
++ * With PGCL, PAGE_SIZE >> _PAGE_TABLE_SIZE, so allocating order-0 pages
++ * for PTE tables wastes enormous memory (e.g. 64KB for a 4KB table).
++ * Use a slab cache instead.  The cache object is _PAGE_TABLE_SIZE * 2
++ * (PTE entries + software entries), aligned to _PAGE_TABLE_SIZE * 2.
++ *
++ * Since multiple PTE tables share the same underlying struct page/ptdesc,
++ * we cannot use per-ptdesc split PTE locks.  All PTE operations use the
++ * per-mm page_table_lock instead (coarser but correct).
++ */
++static struct kmem_cache *pte_table_cache;
++
++void __init pgtable_cache_init(void)
++{
++	unsigned long sz = _PAGE_TABLE_SIZE * 2;
++
++	pte_table_cache = kmem_cache_create("pte_table", sz, sz,
++					    SLAB_PANIC, NULL);
++}
++
++unsigned long *page_table_alloc_noprof(struct mm_struct *mm)
++{
++	gfp_t gfp = GFP_KERNEL_ACCOUNT;
++	unsigned long *table;
++
++	if (mm == &init_mm)
++		gfp &= ~__GFP_ACCOUNT;
++	table = kmem_cache_alloc(pte_table_cache, gfp);
++	if (!table)
++		return NULL;
++	memset64((u64 *)table, _PAGE_INVALID, PTRS_PER_PTE);
++	memset64((u64 *)table + PTRS_PER_PTE, 0, PTRS_PER_PTE);
++	return table;
++}
++
++void page_table_free(struct mm_struct *mm, unsigned long *table)
++{
++	kmem_cache_free(pte_table_cache, table);
++}
++#else
+ unsigned long *page_table_alloc_noprof(struct mm_struct *mm)
+ {
+ 	gfp_t gfp = GFP_KERNEL_ACCOUNT;
+@@ -144,8 +185,34 @@ void page_table_free(struct mm_struct *mm, unsigned long *table)
+ 		return free_reserved_ptdesc(ptdesc);
+ 	pagetable_dtor_free(ptdesc);
+ }
++#endif
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
++#if PAGE_MMUSHIFT
++/*
++ * With PGCL slab-based PTE tables, we cannot use ptdesc->pt_rcu_head
++ * since multiple PTE tables share one page.  Just free directly —
++ * the caller holds the mm lock and has already invalidated PTEs.
++ */
++static void pte_free_now(struct rcu_head *head)
++{
++	unsigned long *table = (unsigned long *)head;
++
++	kmem_cache_free(pte_table_cache, table);
++}
++
++void pte_free_defer(struct mm_struct *mm, pgtable_t pgtable)
++{
++	/*
++	 * Embed rcu_head at the start of the PTE table (which is being
++	 * freed, so the PTE entries are no longer referenced).  The table
++	 * is _PAGE_TABLE_SIZE * 2 = 4096 bytes, plenty for rcu_head.
++	 */
++	struct rcu_head *head = (struct rcu_head *)pgtable;
++
++	call_rcu(head, pte_free_now);
++}
++#else
+ static void pte_free_now(struct rcu_head *head)
+ {
+ 	struct ptdesc *ptdesc = container_of(head, struct ptdesc, pt_rcu_head);
+@@ -159,6 +226,7 @@ void pte_free_defer(struct mm_struct *mm, pgtable_t pgtable)
+ 
+ 	call_rcu(&ptdesc->pt_rcu_head, pte_free_now);
+ }
++#endif
+ #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+ 
+ /*
+@@ -236,7 +304,7 @@ static int base_page_walk(unsigned long *origin, unsigned long addr,
+ 	if (!alloc)
+ 		return 0;
+ 	pte = origin;
+-	pte += (addr & _PAGE_INDEX) >> PAGE_SHIFT;
++	pte += (addr & _PAGE_INDEX) >> MMUPAGE_SHIFT;
+ 	do {
+ 		next = base_page_addr_end(addr, end);
+ 		*pte = base_lra(addr);
+diff --git a/arch/s390/mm/vmem.c b/arch/s390/mm/vmem.c
+index eeadff45e0e1..cf89d8a2c5f7 100644
+--- a/arch/s390/mm/vmem.c
++++ b/arch/s390/mm/vmem.c
+@@ -175,16 +175,16 @@ static int __ref modify_pte_table(pmd_t *pmd, unsigned long addr,
+ 
+ 	prot = pgprot_val(PAGE_KERNEL);
+ 	pte = pte_offset_kernel(pmd, addr);
+-	for (; addr < end; addr += PAGE_SIZE, pte++) {
++	for (; addr < end; addr += MMUPAGE_SIZE, pte++) {
+ 		if (!add) {
+ 			if (pte_none(*pte))
+ 				continue;
+ 			if (!direct)
+-				vmem_free_pages((unsigned long)pfn_to_virt(pte_pfn(*pte)), get_order(PAGE_SIZE), altmap);
++				vmem_free_pages((unsigned long)pfn_to_virt(pte_pfn(*pte)), get_order(MMUPAGE_SIZE), altmap);
+ 			pte_clear(&init_mm, addr, pte);
+ 		} else if (pte_none(*pte)) {
+ 			if (!direct) {
+-				void *new_page = vmemmap_alloc_block_buf(PAGE_SIZE, NUMA_NO_NODE, altmap);
++				void *new_page = vmemmap_alloc_block_buf(MMUPAGE_SIZE, NUMA_NO_NODE, altmap);
+ 
+ 				if (!new_page)
+ 					goto out;
+@@ -435,7 +435,15 @@ static int modify_pagetable(unsigned long start, unsigned long end, bool add,
+ 	pgd_t *pgd;
+ 	p4d_t *p4d;
+ 
+-	if (WARN_ON_ONCE(!PAGE_ALIGNED(start | end)))
++	/*
++	 * vmemmap chunk size = PAGES_PER_SECTION * sizeof(struct page).
++	 * Under page-clustering with high MMUSHIFT (PAGE_SIZE up to 1MB at
++	 * PGCL=6) PAGES_PER_SECTION shrinks faster than struct page grows,
++	 * making the chunk smaller than PAGE_SIZE and not PAGE_ALIGNED at
++	 * its end.  modify_pagetable iterates at MMUPAGE granularity, so
++	 * MMUPAGE alignment is sufficient.
++	 */
++	if (WARN_ON_ONCE(!IS_ALIGNED(start | end, MMUPAGE_SIZE)))
+ 		return -EINVAL;
+ 	/* Don't mess with any tables not fully in 1:1 mapping, vmemmap & kasan area */
+ #ifdef CONFIG_KASAN
+@@ -630,7 +638,7 @@ int __vmem_map_4k_page(unsigned long addr, unsigned long phys, pgprot_t prot, bo
+ {
+ 	pte_t *ptep, pte;
+ 
+-	if (!IS_ALIGNED(addr, PAGE_SIZE))
++	if (!IS_ALIGNED(addr, MMUPAGE_SIZE))
+ 		return -EINVAL;
+ 	ptep = vmem_get_alloc_pte(addr, alloc);
+ 	if (!ptep)
+-- 
+2.54.0
+

@@ -1,0 +1,828 @@
+From 52c327ffd8cb3756ca5b2e2c6f42e7ef34ede44e Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:38 +0200
+Subject: [RFC PATCH 20/28] microblaze: support page clustering (PAGE_MMUSHIFT)
+
+---
+ arch/microblaze/include/asm/fixmap.h          |  4 +-
+ arch/microblaze/include/asm/highmem.h         |  6 +-
+ arch/microblaze/include/asm/page.h            |  2 +-
+ arch/microblaze/include/asm/pgtable.h         | 18 ++--
+ arch/microblaze/include/asm/thread_info.h     | 21 ++++-
+ arch/microblaze/include/uapi/asm/elf.h        |  2 +-
+ arch/microblaze/kernel/entry.S                | 94 +++++++++++++++----
+ arch/microblaze/kernel/exceptions.c           |  2 -
+ arch/microblaze/kernel/head.S                 |  8 +-
+ arch/microblaze/kernel/hw_exception_handler.S | 32 +++----
+ arch/microblaze/kernel/signal.c               |  3 +-
+ arch/microblaze/kernel/sys_microblaze.c       |  8 +-
+ arch/microblaze/mm/pgtable.c                  | 39 ++++----
+ 13 files changed, 166 insertions(+), 73 deletions(-)
+
+diff --git a/arch/microblaze/include/asm/fixmap.h b/arch/microblaze/include/asm/fixmap.h
+index f9797849e4d4..45403bcafee8 100644
+--- a/arch/microblaze/include/asm/fixmap.h
++++ b/arch/microblaze/include/asm/fixmap.h
+@@ -23,7 +23,7 @@
+ #include <asm/kmap_size.h>
+ #endif
+ 
+-#define FIXADDR_TOP	((unsigned long)(-PAGE_SIZE))
++#define FIXADDR_TOP	((unsigned long)(-MMUPAGE_SIZE))
+ 
+ /*
+  * Here we define all the compile-time 'special' virtual
+@@ -55,7 +55,7 @@ enum fixed_addresses {
+ extern void __set_fixmap(enum fixed_addresses idx,
+ 					phys_addr_t phys, pgprot_t flags);
+ 
+-#define __FIXADDR_SIZE	(__end_of_fixed_addresses << PAGE_SHIFT)
++#define __FIXADDR_SIZE	(__end_of_fixed_addresses << MMUPAGE_SHIFT)
+ #define FIXADDR_START		(FIXADDR_TOP - __FIXADDR_SIZE)
+ 
+ #define FIXMAP_PAGE_NOCACHE PAGE_KERNEL_CI
+diff --git a/arch/microblaze/include/asm/highmem.h b/arch/microblaze/include/asm/highmem.h
+index 4418633fb163..078c0f71f535 100644
+--- a/arch/microblaze/include/asm/highmem.h
++++ b/arch/microblaze/include/asm/highmem.h
+@@ -42,12 +42,12 @@ extern pte_t *pkmap_page_table;
+ #define PKMAP_ORDER	PTE_SHIFT
+ #define LAST_PKMAP	(1 << PKMAP_ORDER)
+ 
+-#define PKMAP_BASE	((FIXADDR_START - PAGE_SIZE * (LAST_PKMAP + 1)) \
++#define PKMAP_BASE	((FIXADDR_START - MMUPAGE_SIZE * (LAST_PKMAP + 1)) \
+ 								& PMD_MASK)
+ 
+ #define LAST_PKMAP_MASK	(LAST_PKMAP - 1)
+-#define PKMAP_NR(virt)  ((virt - PKMAP_BASE) >> PAGE_SHIFT)
+-#define PKMAP_ADDR(nr)  (PKMAP_BASE + ((nr) << PAGE_SHIFT))
++#define PKMAP_NR(virt)  ((virt - PKMAP_BASE) >> MMUPAGE_SHIFT)
++#define PKMAP_ADDR(nr)  (PKMAP_BASE + ((nr) << MMUPAGE_SHIFT))
+ 
+ #define flush_cache_kmaps()	{ flush_icache(); flush_dcache(); }
+ 
+diff --git a/arch/microblaze/include/asm/page.h b/arch/microblaze/include/asm/page.h
+index e1e396367ba7..63ed27f038f8 100644
+--- a/arch/microblaze/include/asm/page.h
++++ b/arch/microblaze/include/asm/page.h
+@@ -23,7 +23,7 @@
+ 
+ #define LOAD_OFFSET	ASM_CONST((CONFIG_KERNEL_START-CONFIG_KERNEL_BASE_ADDR))
+ 
+-#define PTE_SHIFT	(PAGE_SHIFT - 2)	/* 1024 ptes per page */
++#define PTE_SHIFT	(MMUPAGE_SHIFT - 2)	/* 1024 ptes per MMUPAGE */
+ 
+ #ifndef __ASSEMBLER__
+ 
+diff --git a/arch/microblaze/include/asm/pgtable.h b/arch/microblaze/include/asm/pgtable.h
+index 7678c040a2fd..d72c639e7d76 100644
+--- a/arch/microblaze/include/asm/pgtable.h
++++ b/arch/microblaze/include/asm/pgtable.h
+@@ -86,7 +86,7 @@ extern pte_t *va_to_pte(unsigned long address);
+  */
+ 
+ /* PGDIR_SHIFT determines what a top-level page table entry can map */
+-#define PGDIR_SHIFT	(PAGE_SHIFT + PTE_SHIFT)
++#define PGDIR_SHIFT	(MMUPAGE_SHIFT + PTE_SHIFT)
+ #define PGDIR_SIZE	(1UL << PGDIR_SHIFT)
+ #define PGDIR_MASK	(~(PGDIR_SIZE-1))
+ 
+@@ -152,7 +152,7 @@ extern pte_t *va_to_pte(unsigned long address);
+ #define _PAGE_HWWRITE	0x100	/* hardware: Dirty & RW, set in exception */
+ #define _PAGE_HWEXEC	0x200	/* hardware: EX permission */
+ #define _PAGE_ACCESSED	0x400	/* software: R: page referenced */
+-#define _PMD_PRESENT	PAGE_MASK
++#define _PMD_PRESENT	MMUPAGE_MASK
+ 
+ /* We borrow bit 24 to store the exclusive marker in swap PTEs. */
+ #define _PAGE_SWP_EXCLUSIVE	_PAGE_DIRTY
+@@ -173,7 +173,7 @@ extern pte_t *va_to_pte(unsigned long address);
+ #define _PAGE_EXEC	0
+ #endif
+ 
+-#define _PAGE_CHG_MASK	(PAGE_MASK | _PAGE_ACCESSED | _PAGE_DIRTY)
++#define _PAGE_CHG_MASK	(MMUPAGE_MASK | _PAGE_ACCESSED | _PAGE_DIRTY)
+ 
+ /*
+  * Note: the _PAGE_COHERENT bit automatically gets set in the hardware
+@@ -217,9 +217,14 @@ extern pte_t *va_to_pte(unsigned long address);
+ #define	pmd_present(pmd)	((pmd_val(pmd) & _PMD_PRESENT) != 0)
+ #define	pmd_clear(pmdp)		do { pmd_val(*(pmdp)) = 0; } while (0)
+ 
++/*
++ * pte_page returns the kernel page (struct page) containing the
++ * hardware page described by this PTE. Multiple MMU pages within one
++ * kernel page map to the same struct page.
++ */
+ #define pte_page(x)		(mem_map + (unsigned long) \
+-				((pte_val(x) - memory_start) >> PAGE_SHIFT))
+-#define PFN_PTE_SHIFT		PAGE_SHIFT
++				(((pte_val(x) & MMUPAGE_MASK) - memory_start) >> PAGE_SHIFT))
++#define PFN_PTE_SHIFT		MMUPAGE_SHIFT
+ 
+ #define pte_pfn(x)		(pte_val(x) >> PFN_PTE_SHIFT)
+ 
+@@ -357,10 +362,11 @@ static inline void ptep_mkdirty(struct mm_struct *mm,
+ /* returns effective address of the pmd entry*/
+ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
+ {
+-	return ((unsigned long) (pmd_val(pmd) & PAGE_MASK));
++	return ((unsigned long) (pmd_val(pmd) & MMUPAGE_MASK));
+ }
+ 
+ /* returns pfn of the pmd entry*/
++/* PTE tables are MMUPAGE-sized; return the kernel-page PFN they reside in */
+ #define pmd_pfn(pmd)	(__pa(pmd_val(pmd)) >> PAGE_SHIFT)
+ 
+ /* returns struct *page of the pmd entry*/
+diff --git a/arch/microblaze/include/asm/thread_info.h b/arch/microblaze/include/asm/thread_info.h
+index 0153f7c2717c..5e326eae05c2 100644
+--- a/arch/microblaze/include/asm/thread_info.h
++++ b/arch/microblaze/include/asm/thread_info.h
+@@ -8,10 +8,29 @@
+ 
+ #ifdef __KERNEL__
+ 
+-/* we have 8k stack */
++#include <vdso/page.h>
++
++/*
++ * Thread stack is allocated as (1 << THREAD_SIZE_ORDER) PAGE_SIZE pages,
++ * but THREAD_SIZE is the mask used to find thread_info from any stack
++ * pointer.  These must agree, otherwise current_thread_info() returns
++ * a stale boundary that is not the start of the allocation.
++ *
++ * For PGCL kernels (PAGE_MMUSHIFT > 0) PAGE_SIZE is larger than the
++ * MMUPAGE, and a single PAGE already exceeds the 8K stack we want.
++ * Use PAGE_SIZE for both so the mask matches the allocation; the small
++ * waste is harmless on a 128MB target.  Without PGCL keep the
++ * traditional 8K stack out of two 4K pages.
++ */
++#if PAGE_MMUSHIFT > 0
++#define THREAD_SHIFT		PAGE_SHIFT
++#define THREAD_SIZE		PAGE_SIZE
++#define THREAD_SIZE_ORDER	0
++#else
+ #define THREAD_SHIFT		13
+ #define THREAD_SIZE		(1 << THREAD_SHIFT)
+ #define THREAD_SIZE_ORDER	1
++#endif
+ 
+ #ifndef __ASSEMBLER__
+ # include <linux/types.h>
+diff --git a/arch/microblaze/include/uapi/asm/elf.h b/arch/microblaze/include/uapi/asm/elf.h
+index 6b656de29f00..ad8d8bb7d8c0 100644
+--- a/arch/microblaze/include/uapi/asm/elf.h
++++ b/arch/microblaze/include/uapi/asm/elf.h
+@@ -81,7 +81,7 @@ typedef elf_fpreg_t elf_fpregset_t[ELF_NFPREG];
+ #define ELF_DATA	ELFDATA2MSB
+ #endif
+ 
+-#define ELF_EXEC_PAGESIZE	PAGE_SIZE
++#define ELF_EXEC_PAGESIZE	4096
+ 
+ 
+ #define ELF_CORE_COPY_REGS(_dest, _regs)			\
+diff --git a/arch/microblaze/kernel/entry.S b/arch/microblaze/kernel/entry.S
+index 582d7256d815..8468ae9be5eb 100644
+--- a/arch/microblaze/kernel/entry.S
++++ b/arch/microblaze/kernel/entry.S
+@@ -18,6 +18,14 @@
+ #include <linux/sys.h>
+ #include <linux/linkage.h>
+ 
++/*
++ * Microblaze C ABI: the callee may spill arguments into the caller's
++ * outgoing parameter save area at [caller_sp + 0 .. caller_sp + 23].
++ * Assembly entry points must reserve this space below pt_regs before
++ * calling any C function, otherwise the spills corrupt saved registers.
++ */
++#define C_ABI_SAVE_AREA	28
++
+ #include <asm/entry.h>
+ #include <asm/current.h>
+ #include <asm/processor.h>
+@@ -381,8 +389,10 @@ C_ENTRY(_user_exception):
+ 
+ 	addik	r3, r0, -ENOSYS
+ 	swi	r3, r1, PT_R3
++	addik	r1, r1, -C_ABI_SAVE_AREA
+ 	brlid	r15, do_syscall_trace_enter
+-	addik	r5, r1, PT_R0
++	addik	r5, r1, C_ABI_SAVE_AREA	/* PT_R0 = 0, so +PT_R0 is implicit */
++	addik	r1, r1, C_ABI_SAVE_AREA
+ 
+ 	# do_syscall_trace_enter returns the new syscall nr.
+ 	addk	r12, r0, r3
+@@ -420,8 +430,11 @@ C_ENTRY(_user_exception):
+ 
+ 	# Find and jump into the syscall handler.
+ 	lwi	r12, r12, sys_call_table
++
++	addik	r1, r1, -C_ABI_SAVE_AREA
++
+ 	/* where the trap should return need -8 to adjust for rtsd r15, 8 */
+-	addi	r15, r0, ret_from_trap-8
++	addi	r15, r0, ret_from_trap_syscall-8
+ 	bra	r12
+ 
+ 	/* The syscall number is invalid, return an error.  */
+@@ -429,6 +442,9 @@ C_ENTRY(_user_exception):
+ 	braid	ret_from_trap
+ 	addi	r3, r0, -ENOSYS;
+ 
++ret_from_trap_syscall:
++	addik	r1, r1, C_ABI_SAVE_AREA
++
+ /* Entry point used to return from a syscall/trap */
+ /* We re-enable BIP bit before state restore */
+ C_ENTRY(ret_from_trap):
+@@ -438,6 +454,7 @@ C_ENTRY(ret_from_trap):
+ 	lwi	r11, r1, PT_MODE;
+ /* See if returning to kernel mode, if so, skip resched &c.  */
+ 	bnei	r11, 2f;
++
+ 	/* We're returning to user mode, so check for various conditions that
+ 	 * trigger rescheduling. */
+ 	/* FIXME: Restructure all these flag checks. */
+@@ -446,8 +463,10 @@ C_ENTRY(ret_from_trap):
+ 	andi	r11, r11, _TIF_WORK_SYSCALL_MASK
+ 	beqi	r11, 1f
+ 
++	addik	r1, r1, -C_ABI_SAVE_AREA
+ 	brlid	r15, do_syscall_trace_leave
+-	addik	r5, r1, PT_R0
++	addik	r5, r1, C_ABI_SAVE_AREA	/* PT_R0 = 0, so +PT_R0 is implicit */
++	addik	r1, r1, C_ABI_SAVE_AREA
+ 1:
+ 	/* We're returning to user mode, so check for various conditions that
+ 	 * trigger rescheduling. */
+@@ -457,8 +476,10 @@ C_ENTRY(ret_from_trap):
+ 	andi	r11, r19, _TIF_NEED_RESCHED;
+ 	beqi	r11, 5f;
+ 
++	addik	r1, r1, -C_ABI_SAVE_AREA
+ 	bralid	r15, schedule;	/* Call scheduler */
+ 	nop;				/* delay slot */
++	addik	r1, r1, C_ABI_SAVE_AREA
+ 	bri	1b
+ 
+ 	/* Maybe handle a signal */
+@@ -466,9 +487,11 @@ C_ENTRY(ret_from_trap):
+ 	andi	r11, r19, _TIF_SIGPENDING | _TIF_NOTIFY_RESUME;
+ 	beqi	r11, 4f;		/* Signals to handle, handle them */
+ 
+-	addik	r5, r1, 0;		/* Arg 1: struct pt_regs *regs */
++	addik	r1, r1, -C_ABI_SAVE_AREA
++	addik	r5, r1, C_ABI_SAVE_AREA;	/* Arg 1: struct pt_regs *regs */
+ 	bralid	r15, do_notify_resume;	/* Handle any signals */
+ 	add	r6, r30, r0;		/* Arg 2: int in_syscall */
++	addik	r1, r1, C_ABI_SAVE_AREA
+ 	add	r30, r0, r0		/* no more restarts */
+ 	bri	1b
+ 
+@@ -501,18 +524,22 @@ TRAP_return:		/* Make global symbol for debugging */
+    (copy_thread makes ret_from_fork the return address in each new thread's
+    saved context).  */
+ C_ENTRY(ret_from_fork):
++	addik	r1, r1, -C_ABI_SAVE_AREA
+ 	bralid	r15, schedule_tail; /* ...which is schedule_tail's arg */
+ 	add	r5, r3, r0;	/* switch_thread returns the prev task */
+ 				/* ( in the delay slot ) */
++	addik	r1, r1, C_ABI_SAVE_AREA
+ 	brid	ret_from_trap;	/* Do normal trap return */
+ 	add	r3, r0, r0;	/* Child's fork call should return 0. */
+ 
+ C_ENTRY(ret_from_kernel_thread):
++	addik	r1, r1, -C_ABI_SAVE_AREA
+ 	bralid	r15, schedule_tail; /* ...which is schedule_tail's arg */
+ 	add	r5, r3, r0;	/* switch_thread returns the prev task */
+ 				/* ( in the delay slot ) */
+ 	brald	r15, r20	/* fn was left in r20 */
+ 	addk	r5, r0, r19	/* ... and argument - in r19 */
++	addik	r1, r1, C_ABI_SAVE_AREA
+ 	brid	ret_from_trap
+ 	add	r3, r0, r0
+ 
+@@ -535,12 +562,13 @@ C_ENTRY(full_exception_trap):
+ 	/* FIXME this can be store directly in PT_ESR reg.
+ 	 * I tested it but there is a fault */
+ 	/* where the trap should return need -8 to adjust for rtsd r15, 8 */
+-	addik	r15, r0, ret_from_exc - 8
++	addik	r15, r0, ret_from_exc_c - 8
+ 	mfs	r6, resr
+ 	mfs	r7, rfsr;		/* save FSR */
+ 	mts	rfsr, r0;	/* Clear sticky fsr */
++	addik	r1, r1, -C_ABI_SAVE_AREA
+ 	rted	r0, full_exception
+-	addik	r5, r1, 0		 /* parameter struct pt_regs * regs */
++	addik	r5, r1, C_ABI_SAVE_AREA	 /* parameter struct pt_regs * regs */
+ 
+ /*
+  * Unaligned data trap.
+@@ -569,11 +597,12 @@ C_ENTRY(unaligned_data_trap):
+ 	swi	r17, r1, PT_PC;
+ 	tovirt(r1,r1)
+ 	/* where the trap should return need -8 to adjust for rtsd r15, 8 */
+-	addik	r15, r0, ret_from_exc-8
++	addik	r15, r0, ret_from_exc_c-8
+ 	mfs	r3, resr		/* ESR */
+ 	mfs	r4, rear		/* EAR */
++	addik	r1, r1, -C_ABI_SAVE_AREA
+ 	rtbd	r0, _unaligned_data_exception
+-	addik	r7, r1, 0		/* parameter struct pt_regs * regs */
++	addik	r7, r1, C_ABI_SAVE_AREA	/* parameter struct pt_regs * regs */
+ 
+ /*
+  * Page fault traps.
+@@ -599,11 +628,12 @@ C_ENTRY(page_fault_data_trap):
+ 	swi	r17, r1, PT_PC;
+ 	tovirt(r1,r1)
+ 	/* where the trap should return need -8 to adjust for rtsd r15, 8 */
+-	addik	r15, r0, ret_from_exc-8
++	addik	r15, r0, ret_from_exc_c-8
+ 	mfs	r6, rear		/* parameter unsigned long address */
+ 	mfs	r7, resr		/* parameter unsigned long error_code */
++	addik	r1, r1, -C_ABI_SAVE_AREA
+ 	rted	r0, do_page_fault
+-	addik	r5, r1, 0		/* parameter struct pt_regs * regs */
++	addik	r5, r1, C_ABI_SAVE_AREA	/* parameter struct pt_regs * regs */
+ 
+ C_ENTRY(page_fault_instr_trap):
+ 	SAVE_STATE		/* Save registers.*/
+@@ -611,12 +641,16 @@ C_ENTRY(page_fault_instr_trap):
+ 	swi	r17, r1, PT_PC;
+ 	tovirt(r1,r1)
+ 	/* where the trap should return need -8 to adjust for rtsd r15, 8 */
+-	addik	r15, r0, ret_from_exc-8
++	addik	r15, r0, ret_from_exc_c-8
+ 	mfs	r6, rear		/* parameter unsigned long address */
+ 	ori	r7, r0, 0		/* parameter unsigned long error_code */
++	addik	r1, r1, -C_ABI_SAVE_AREA
+ 	rted	r0, do_page_fault
+-	addik	r5, r1, 0		/* parameter struct pt_regs * regs */
++	addik	r5, r1, C_ABI_SAVE_AREA	/* parameter struct pt_regs * regs */
+ 
++/* Return from C exception handler — restore C ABI save area offset. */
++ret_from_exc_c:
++	addik	r1, r1, C_ABI_SAVE_AREA
+ /* Entry point used to return from an exception.  */
+ C_ENTRY(ret_from_exc):
+ 	lwi	r11, r1, PT_MODE;
+@@ -632,8 +666,10 @@ C_ENTRY(ret_from_exc):
+ 	beqi	r11, 5f;
+ 
+ /* Call the scheduler before returning from a syscall/trap. */
++	addik	r1, r1, -C_ABI_SAVE_AREA
+ 	bralid	r15, schedule;	/* Call scheduler */
+ 	nop;				/* delay slot */
++	addik	r1, r1, C_ABI_SAVE_AREA
+ 	bri	1b
+ 
+ 	/* Maybe handle a signal */
+@@ -651,9 +687,11 @@ C_ENTRY(ret_from_exc):
+ 	 * complete register state.  Here we save anything not saved by
+ 	 * the normal entry sequence, so that it may be safely restored
+ 	 * (in a possibly modified form) after do_notify_resume returns. */
+-	addik	r5, r1, 0;		/* Arg 1: struct pt_regs *regs */
++	addik	r1, r1, -C_ABI_SAVE_AREA
++	addik	r5, r1, C_ABI_SAVE_AREA;	/* Arg 1: struct pt_regs *regs */
+ 	bralid	r15, do_notify_resume;	/* Handle any signals */
+ 	addi	r6, r0, 0;		/* Arg 2: int in_syscall */
++	addik	r1, r1, C_ABI_SAVE_AREA
+ 	bri	1b
+ 
+ /* Finally, return to user state.  */
+@@ -728,12 +766,14 @@ C_ENTRY(_interrupt):
+ 2:
+ 	lwi	CURRENT_TASK, r0, TOPHYS(PER_CPU(CURRENT_SAVE));
+ 	tovirt(r1,r1)
++	addik	r1, r1, -C_ABI_SAVE_AREA
+ 	addik	r15, r0, irq_call;
+ irq_call:rtbd	r0, do_IRQ;
+-	addik	r5, r1, 0;
++	addik	r5, r1, C_ABI_SAVE_AREA;
+ 
+ /* MS: we are in virtual mode */
+ ret_from_irq:
++	addik	r1, r1, C_ABI_SAVE_AREA
+ 	lwi	r11, r1, PT_MODE;
+ 	bnei	r11, 2f;
+ 
+@@ -742,17 +782,22 @@ ret_from_irq:
+ 	lwi	r19, r11, TI_FLAGS; /* MS: get flags from thread info */
+ 	andi	r11, r19, _TIF_NEED_RESCHED;
+ 	beqi	r11, 5f
++	addik	r1, r1, -C_ABI_SAVE_AREA
+ 	bralid	r15, schedule;
+ 	nop; /* delay slot */
++	addik	r1, r1, C_ABI_SAVE_AREA
+ 	bri	1b
+ 
+     /* Maybe handle a signal */
+ 5:	andi	r11, r19, _TIF_SIGPENDING | _TIF_NOTIFY_RESUME;
+ 	beqid	r11, no_intr_resched
+ /* Handle a signal return; Pending signals should be in r18. */
+-	addik	r5, r1, 0; /* Arg 1: struct pt_regs *regs */
++	nop
++	addik	r1, r1, -C_ABI_SAVE_AREA
++	addik	r5, r1, C_ABI_SAVE_AREA; /* Arg 1: struct pt_regs *regs */
+ 	bralid	r15, do_notify_resume;	/* Handle any signals */
+ 	addi	r6, r0, 0; /* Arg 2: int in_syscall */
++	addik	r1, r1, C_ABI_SAVE_AREA
+ 	bri	1b
+ 
+ /* Finally, return to user state. */
+@@ -779,8 +824,10 @@ no_intr_resched:
+ 	beqi	r5, restore /* if zero jump over */
+ 
+ 	/* interrupts are off that's why I am calling preempt_chedule_irq */
++	addik	r1, r1, -C_ABI_SAVE_AREA
+ 	bralid	r15, preempt_schedule_irq
+ 	nop
++	addik	r1, r1, C_ABI_SAVE_AREA
+ restore:
+ #endif
+ 	VM_OFF /* MS: turn off MMU */
+@@ -843,12 +890,14 @@ restore_tlb:
+ 	lwi  	r5, r0, TOPHYS(xmb_manager_dev)
+ 	lwi	r8, r0, TOPHYS(xmb_manager_reset_callback)
+ 	set_vms
++	addik	r1, r1, -C_ABI_SAVE_AREA
+ 	/* return from reset need -8 to adjust for rtsd r15, 8 */
+ 	addik   r15, r0, ret_from_reset - 8
+ 	rtbd	r8, 0
+ 	nop
+ 
+ ret_from_reset:
++	addik	r1, r1, C_ABI_SAVE_AREA
+ 	set_bip /* Ints masked for state restore */
+ 	VM_OFF
+ 	/* MS: Restore all regs */
+@@ -921,12 +970,14 @@ save_tlb:
+ 
+ 	lwi  	r5, r0, TOPHYS(xmb_manager_dev)
+ 	lwi	r8, r0, TOPHYS(xmb_manager_callback)
++	addik	r1, r1, -C_ABI_SAVE_AREA
+ 	/* return from break need -8 to adjust for rtsd r15, 8 */
+ 	addik   r15, r0, ret_from_break - 8
+ 	rtbd	r8, 0
+ 	nop
+ 
+ ret_from_break:
++	addik	r1, r1, C_ABI_SAVE_AREA
+ 	/* flush the d-cache */
+ 	bralid	r15, mb_flush_dcache
+ 	nop
+@@ -984,7 +1035,8 @@ C_ENTRY(_debug_exception):
+ 	/* MS: r31 - current pointer isn't changed */
+ 	tovirt(r1,r1)
+ #ifdef CONFIG_KGDB
+-	addi	r5, r1, 0 /* pass pt_reg address as the first arg */
++	addik	r1, r1, -C_ABI_SAVE_AREA
++	addi	r5, r1, C_ABI_SAVE_AREA /* pass pt_reg address as the first arg */
+ 	addik	r15, r0, dbtrap_call; /* return address */
+ 	rtbd	r0, microblaze_kgdb_break
+ 	nop;
+@@ -1009,11 +1061,13 @@ C_ENTRY(_debug_exception):
+ 	lwi	CURRENT_TASK, r0, TOPHYS(PER_CPU(CURRENT_SAVE));
+ 	tovirt(r1,r1)
+ 	set_vms;
+-	addik	r5, r1, 0;
++	addik	r1, r1, -C_ABI_SAVE_AREA
++	addik	r5, r1, C_ABI_SAVE_AREA;
+ 	addik	r15, r0, dbtrap_call;
+ dbtrap_call: /* Return point for kernel/user entry + 8 because of rtsd r15, 8 */
+ 	rtbd	r0, sw_exception
+ 	nop
++	addik	r1, r1, C_ABI_SAVE_AREA
+ 
+ 	/* MS: The first instruction for the second part of the gdb/kgdb */
+ 	set_bip; /* Ints masked for state restore */
+@@ -1028,17 +1082,21 @@ dbtrap_call: /* Return point for kernel/user entry + 8 because of rtsd r15, 8 */
+ 	beqi	r11, 5f;
+ 
+ 	/* Call the scheduler before returning from a syscall/trap. */
++	addik	r1, r1, -C_ABI_SAVE_AREA
+ 	bralid	r15, schedule;	/* Call scheduler */
+ 	nop;				/* delay slot */
++	addik	r1, r1, C_ABI_SAVE_AREA
+ 	bri	1b
+ 
+ 	/* Maybe handle a signal */
+ 5:	andi	r11, r19, _TIF_SIGPENDING | _TIF_NOTIFY_RESUME;
+ 	beqi	r11, 4f;		/* Signals to handle, handle them */
+ 
+-	addik	r5, r1, 0;		/* Arg 1: struct pt_regs *regs */
++	addik	r1, r1, -C_ABI_SAVE_AREA
++	addik	r5, r1, C_ABI_SAVE_AREA;	/* Arg 1: struct pt_regs *regs */
+ 	bralid	r15, do_notify_resume;	/* Handle any signals */
+ 	addi  r6, r0, 0;	/* Arg 2: int in_syscall */
++	addik	r1, r1, C_ABI_SAVE_AREA
+ 	bri	1b
+ 
+ /* Finally, return to user state.  */
+diff --git a/arch/microblaze/kernel/exceptions.c b/arch/microblaze/kernel/exceptions.c
+index fd153d5fab98..032752c4dbab 100644
+--- a/arch/microblaze/kernel/exceptions.c
++++ b/arch/microblaze/kernel/exceptions.c
+@@ -71,11 +71,9 @@ asmlinkage void full_exception(struct pt_regs *regs, unsigned int type,
+ {
+ 	addr = regs->pc;
+ 
+-#if 0
+ 	pr_warn("Exception %02x in %s mode, FSR=%08x PC=%08x ESR=%08x\n",
+ 			type, user_mode(regs) ? "user" : "kernel", fsr,
+ 			(unsigned int) regs->pc, (unsigned int) regs->esr);
+-#endif
+ 
+ 	switch (type & 0x1F) {
+ 	case MICROBLAZE_ILL_OPCODE_EXCEPTION:
+diff --git a/arch/microblaze/kernel/head.S b/arch/microblaze/kernel/head.S
+index 808019c3b7ac..8398b40766a3 100644
+--- a/arch/microblaze/kernel/head.S
++++ b/arch/microblaze/kernel/head.S
+@@ -39,9 +39,15 @@
+ #include <asm/processor.h>
+ 
+ .section .data
++# swapper_pg_dir must be MMUPAGE-aligned: the TLB miss handler in
++# hw_exception_handler.S computes the PGD entry address with an
++# "or r4, r4, r5" of pg_dir base and offset, which is correct only
++# when the base is MMUPAGE-aligned so the low offset bits do not
++# collide with the base.
++.balign MMUPAGE_SIZE
+ .global swapper_pg_dir
+ swapper_pg_dir:
+-	.space	PAGE_SIZE
++	.space	MMUPAGE_SIZE
+ 
+ .section .rodata
+ .align 4
+diff --git a/arch/microblaze/kernel/hw_exception_handler.S b/arch/microblaze/kernel/hw_exception_handler.S
+index 07ea23965f81..9f82f66e3521 100644
+--- a/arch/microblaze/kernel/hw_exception_handler.S
++++ b/arch/microblaze/kernel/hw_exception_handler.S
+@@ -518,16 +518,16 @@ ex_handler_done:
+ 		tophys(r4,r4)
+ 		/* Create L1 (pgdir/pmd) address */
+ 		bsrli	r5, r3, PGDIR_SHIFT - 2
+-		andi	r5, r5, PAGE_SIZE - 4
+-/* Assume pgdir aligned on 4K boundary, no need for "andi r4,r4,0xfffff003" */
++		andi	r5, r5, MMUPAGE_SIZE - 4
++/* Assume pgdir aligned on MMUPAGE boundary */
+ 		or	r4, r4, r5
+ 		lwi	r4, r4, 0		/* Get L1 entry */
+-		andi	r5, r4, PAGE_MASK /* Extract L2 (pte) base address */
++		andi	r5, r4, MMUPAGE_MASK /* Extract L2 (pte) base address */
+ 		beqi	r5, ex2			/* Bail if no table */
+ 
+ 		tophys(r5,r5)
+ 		bsrli	r6, r3, PTE_SHIFT /* Compute PTE address */
+-		andi	r6, r6, PAGE_SIZE - 4
++		andi	r6, r6, MMUPAGE_SIZE - 4
+ 		or	r5, r5, r6
+ 		lwi	r4, r5, 0		/* Get Linux PTE */
+ 
+@@ -547,7 +547,7 @@ ex_handler_done:
+ 		 * here we (properly should) assume have the appropriate value.
+ 		 */
+ /* Ignore memory coherent, just LSB on ZSEL is used + EX/WR */
+-		andi	r4, r4, PAGE_MASK | TLB_EX | TLB_WR | \
++		andi	r4, r4, MMUPAGE_MASK | TLB_EX | TLB_WR | \
+ 						TLB_ZSEL(1) | TLB_ATTR_MASK
+ 		ori	r4, r4, _PAGE_HWEXEC	/* make it executable */
+ 
+@@ -619,16 +619,16 @@ ex_handler_done:
+ 		tophys(r4,r4)
+ 		/* Create L1 (pgdir/pmd) address */
+ 		bsrli	r5, r3, PGDIR_SHIFT - 2
+-		andi	r5, r5, PAGE_SIZE - 4
+-/* Assume pgdir aligned on 4K boundary, no need for "andi r4,r4,0xfffff003" */
++		andi	r5, r5, MMUPAGE_SIZE - 4
++/* Assume pgdir aligned on MMUPAGE boundary */
+ 		or	r4, r4, r5
+ 		lwi	r4, r4, 0		/* Get L1 entry */
+-		andi	r5, r4, PAGE_MASK /* Extract L2 (pte) base address */
++		andi	r5, r4, MMUPAGE_MASK /* Extract L2 (pte) base address */
+ 		beqi	r5, ex7			/* Bail if no table */
+ 
+ 		tophys(r5,r5)
+ 		bsrli	r6, r3, PTE_SHIFT /* Compute PTE address */
+-		andi	r6, r6, PAGE_SIZE - 4
++		andi	r6, r6, MMUPAGE_SIZE - 4
+ 		or	r5, r5, r6
+ 		lwi	r4, r5, 0		/* Get Linux PTE */
+ 
+@@ -647,7 +647,7 @@ ex_handler_done:
+ 		 * here we (properly should) assume have the appropriate value.
+ 		 */
+ 		brid	finish_tlb_load
+-		andi	r4, r4, PAGE_MASK | TLB_EX | TLB_WR | \
++		andi	r4, r4, MMUPAGE_MASK | TLB_EX | TLB_WR | \
+ 						TLB_ZSEL(1) | TLB_ATTR_MASK
+ 	ex7:
+ 		/* The bailout. Restore registers to pre-exception conditions
+@@ -690,16 +690,16 @@ ex_handler_done:
+ 		tophys(r4,r4)
+ 		/* Create L1 (pgdir/pmd) address */
+ 		bsrli	r5, r3, PGDIR_SHIFT - 2
+-		andi	r5, r5, PAGE_SIZE - 4
+-/* Assume pgdir aligned on 4K boundary, no need for "andi r4,r4,0xfffff003" */
++		andi	r5, r5, MMUPAGE_SIZE - 4
++/* Assume pgdir aligned on MMUPAGE boundary */
+ 		or	r4, r4, r5
+ 		lwi	r4, r4, 0		/* Get L1 entry */
+-		andi	r5, r4, PAGE_MASK /* Extract L2 (pte) base address */
++		andi	r5, r4, MMUPAGE_MASK /* Extract L2 (pte) base address */
+ 		beqi	r5, ex10		/* Bail if no table */
+ 
+ 		tophys(r5,r5)
+ 		bsrli	r6, r3, PTE_SHIFT /* Compute PTE address */
+-		andi	r6, r6, PAGE_SIZE - 4
++		andi	r6, r6, MMUPAGE_SIZE - 4
+ 		or	r5, r5, r6
+ 		lwi	r4, r5, 0		/* Get Linux PTE */
+ 
+@@ -718,7 +718,7 @@ ex_handler_done:
+ 		 * here we (properly should) assume have the appropriate value.
+ 		 */
+ 		brid	finish_tlb_load
+-		andi	r4, r4, PAGE_MASK | TLB_EX | TLB_WR | \
++		andi	r4, r4, MMUPAGE_MASK | TLB_EX | TLB_WR | \
+ 						TLB_ZSEL(1) | TLB_ATTR_MASK
+ 	ex10:
+ 		/* The bailout. Restore registers to pre-exception conditions
+@@ -772,7 +772,7 @@ ex_handler_done:
+ 		 * set of bits. These are size, valid, E, U0, and ensure
+ 		 * bits 20 and 21 are zero.
+ 		 */
+-		andi	r3, r3, PAGE_MASK
++		andi	r3, r3, MMUPAGE_MASK
+ 		ori	r3, r3, TLB_VALID | TLB_PAGESZ(PAGESZ_4K)
+ 		mts	rtlbhi,	r3		/* Load TLB HI */
+ 		nop
+diff --git a/arch/microblaze/kernel/signal.c b/arch/microblaze/kernel/signal.c
+index c78a0ff48066..bb7443581d81 100644
+--- a/arch/microblaze/kernel/signal.c
++++ b/arch/microblaze/kernel/signal.c
+@@ -197,7 +197,7 @@ static int setup_rt_frame(struct ksignal *ksig, sigset_t *set,
+ 	if (ptep && pte_present(*ptep)) {
+ 		address = (unsigned long) page_address(pte_page(*ptep));
+ 		/* MS: I need add offset in page */
+-		address += ((unsigned long)frame->tramp) & ~PAGE_MASK;
++		address += ((unsigned long)frame->tramp) & ~MMUPAGE_MASK;
+ 		/* MS address is virtual */
+ 		address = __virt_to_phys(address);
+ 		invalidate_icache_range(address, address + 8);
+@@ -314,3 +314,4 @@ asmlinkage void do_notify_resume(struct pt_regs *regs, int in_syscall)
+ 	if (test_thread_flag(TIF_NOTIFY_RESUME))
+ 		resume_user_mode_work(regs);
+ }
++
+diff --git a/arch/microblaze/kernel/sys_microblaze.c b/arch/microblaze/kernel/sys_microblaze.c
+index 0850b099f300..bca258b69727 100644
+--- a/arch/microblaze/kernel/sys_microblaze.c
++++ b/arch/microblaze/kernel/sys_microblaze.c
+@@ -37,19 +37,19 @@ SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
+ 		unsigned long, prot, unsigned long, flags, unsigned long, fd,
+ 		unsigned long, pgoff)
+ {
+-	if (pgoff & ~PAGE_MASK)
++	if (pgoff & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 
+-	return ksys_mmap_pgoff(addr, len, prot, flags, fd, pgoff >> PAGE_SHIFT);
++	return ksys_mmap_pgoff(addr, len, prot, flags, fd, pgoff >> MMUPAGE_SHIFT);
+ }
+ 
+ SYSCALL_DEFINE6(mmap2, unsigned long, addr, unsigned long, len,
+ 		unsigned long, prot, unsigned long, flags, unsigned long, fd,
+ 		unsigned long, pgoff)
+ {
+-	if (pgoff & (~PAGE_MASK >> 12))
++	if (pgoff & (~MMUPAGE_MASK >> 12))
+ 		return -EINVAL;
+ 
+ 	return ksys_mmap_pgoff(addr, len, prot, flags, fd,
+-			       pgoff >> (PAGE_SHIFT - 12));
++			       pgoff >> (MMUPAGE_SHIFT - 12));
+ }
+diff --git a/arch/microblaze/mm/pgtable.c b/arch/microblaze/mm/pgtable.c
+index e96dd1b7aba4..2e0451ddf791 100644
+--- a/arch/microblaze/mm/pgtable.c
++++ b/arch/microblaze/mm/pgtable.c
+@@ -59,8 +59,8 @@ static void __iomem *__ioremap(phys_addr_t addr, unsigned long size,
+ 	 * Before then, we use space going down from ioremap_base
+ 	 * (ioremap_bot records where we're up to).
+ 	 */
+-	p = addr & PAGE_MASK;
+-	size = PAGE_ALIGN(addr + size) - p;
++	p = addr & MMUPAGE_MASK;
++	size = ALIGN(addr + size, MMUPAGE_SIZE) - p;
+ 
+ 	/*
+ 	 * Don't allow anybody to remap normal RAM that we're using.
+@@ -108,7 +108,7 @@ static void __iomem *__ioremap(phys_addr_t addr, unsigned long size,
+ 		flags |= _PAGE_GUARDED;
+ 
+ 	err = 0;
+-	for (i = 0; i < size && err == 0; i += PAGE_SIZE)
++	for (i = 0; i < size && err == 0; i += MMUPAGE_SIZE)
+ 		err = map_page(v + i, p + i, flags);
+ 	if (err) {
+ 		if (mem_init_done)
+@@ -116,7 +116,7 @@ static void __iomem *__ioremap(phys_addr_t addr, unsigned long size,
+ 		return NULL;
+ 	}
+ 
+-	return (void __iomem *) (v + ((unsigned long)addr & ~PAGE_MASK));
++	return (void __iomem *) (v + ((unsigned long)addr & ~MMUPAGE_MASK));
+ }
+ 
+ void __iomem *ioremap(phys_addr_t addr, unsigned long size)
+@@ -129,7 +129,7 @@ void iounmap(volatile void __iomem *addr)
+ {
+ 	if ((__force void *)addr > high_memory &&
+ 					(unsigned long) addr < ioremap_bot)
+-		vfree((void *) (PAGE_MASK & (unsigned long) addr));
++		vfree((void *) (MMUPAGE_MASK & (unsigned long) addr));
+ }
+ EXPORT_SYMBOL(iounmap);
+ 
+@@ -152,8 +152,13 @@ int map_page(unsigned long va, phys_addr_t pa, int flags)
+ 
+ 	if (pg != NULL) {
+ 		err = 0;
+-		set_pte_at(&init_mm, va, pg, pfn_pte(pa >> PAGE_SHIFT,
+-				__pgprot(flags)));
++		/*
++		 * map_page() maps a single MMUPAGE-sized page. Bypass pfn_pte
++		 * (which uses PAGE-granular PFNs) and construct the PTE
++		 * directly with the MMUPAGE-aligned physical address.
++		 */
++		set_pte_at(&init_mm, va, pg,
++			   __pte((pa & MMUPAGE_MASK) | flags));
+ 		if (unlikely(mem_init_done))
+ 			_tlbie(va);
+ 	}
+@@ -169,7 +174,7 @@ void __init mapin_ram(void)
+ 
+ 	v = CONFIG_KERNEL_START;
+ 	p = memory_start;
+-	for (s = 0; s < lowmem_size; s += PAGE_SIZE) {
++	for (s = 0; s < lowmem_size; s += MMUPAGE_SIZE) {
+ 		f = _PAGE_PRESENT | _PAGE_ACCESSED |
+ 				_PAGE_SHARED | _PAGE_HWEXEC;
+ 		if (!is_kernel_text(v))
+@@ -179,8 +184,8 @@ void __init mapin_ram(void)
+ 			   forces R/W kernel access */
+ 			f |= _PAGE_USER;
+ 		map_page(v, p, f);
+-		v += PAGE_SIZE;
+-		p += PAGE_SIZE;
++		v += MMUPAGE_SIZE;
++		p += MMUPAGE_SIZE;
+ 	}
+ }
+ 
+@@ -201,13 +206,13 @@ static int get_pteptr(struct mm_struct *mm, unsigned long addr, pte_t **ptep)
+ 	pte_t	*pte;
+ 	int     retval = 0;
+ 
+-	pgd = pgd_offset(mm, addr & PAGE_MASK);
++	pgd = pgd_offset(mm, addr & MMUPAGE_MASK);
+ 	if (pgd) {
+-		p4d = p4d_offset(pgd, addr & PAGE_MASK);
+-		pud = pud_offset(p4d, addr & PAGE_MASK);
+-		pmd = pmd_offset(pud, addr & PAGE_MASK);
++		p4d = p4d_offset(pgd, addr & MMUPAGE_MASK);
++		pud = pud_offset(p4d, addr & MMUPAGE_MASK);
++		pmd = pmd_offset(pud, addr & MMUPAGE_MASK);
+ 		if (pmd_present(*pmd)) {
+-			pte = pte_offset_kernel(pmd, addr & PAGE_MASK);
++			pte = pte_offset_kernel(pmd, addr & MMUPAGE_MASK);
+ 			if (pte) {
+ 				retval = 1;
+ 				*ptep = pte;
+@@ -237,7 +242,7 @@ unsigned long iopa(unsigned long addr)
+ 
+ 	pa = 0;
+ 	if (get_pteptr(mm, addr, &pte))
+-		pa = (pte_val(*pte) & PAGE_MASK) | (addr & ~PAGE_MASK);
++		pa = (pte_val(*pte) & MMUPAGE_MASK) | (addr & ~MMUPAGE_MASK);
+ 
+ 	return pa;
+ }
+@@ -247,7 +252,7 @@ __ref pte_t *pte_alloc_one_kernel(struct mm_struct *mm)
+ 	if (mem_init_done)
+ 		return __pte_alloc_one_kernel(mm);
+ 	else
+-		return memblock_alloc_try_nid(PAGE_SIZE, PAGE_SIZE,
++		return memblock_alloc_try_nid(MMUPAGE_SIZE, MMUPAGE_SIZE,
+ 					      MEMBLOCK_LOW_LIMIT,
+ 					      memory_start + kernel_tlb,
+ 					      NUMA_NO_NODE);
+-- 
+2.54.0
+

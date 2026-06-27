@@ -1,0 +1,914 @@
+From 00bc5b689aac586feeb9ffda5f6ba12e33d407b5 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:57:50 +0200
+Subject: [RFC PATCH 00/28] mm: page clustering — decouple kernel allocation granularity from MMU page size
+
+This series forward-ports and modernises *page clustering* ("larpage"),
+originally written by Hugh Dickins in 2001, onto current mainline. Page
+clustering lets the kernel manage memory in units larger than the hardware MMU
+page while keeping the userspace-visible page size unchanged.
+
+## TL;DR
+
+A new config knob, `CONFIG_PAGE_MMUSHIFT` (default 0 = today's behaviour),
+makes the kernel's `PAGE_SIZE` a power-of-two multiple of the hardware MMU page:
+
+```
+    PAGE_SIZE  = MMUPAGE_SIZE << PAGE_MMUSHIFT
+    PAGE_SHIFT = MMUPAGE_SHIFT + PAGE_MMUSHIFT
+```
+
+`MMUPAGE_SIZE` is the architecture's real hardware page (what the MMU and
+userspace see; e.g. 4 KiB on x86). `PAGE_SIZE` becomes the kernel's *allocation
+and bookkeeping* granularity — one `struct page`, one folio entry, one buddy
+unit per cluster. The kernel maps a cluster to userspace as `PAGE_MMUCOUNT =
+1 << PAGE_MMUSHIFT` consecutive hardware PTEs, so the userspace ABI (mmap
+granularity, `getpagesize()`, `AT_PAGESZ`) is unchanged at the MMU page size.
+
+At `PAGE_MMUSHIFT == 0` every change in this series is a compile-time no-op:
+`MMUPAGE_* == PAGE_*`, `PAGE_MMUCOUNT == 1`, and the tree is byte-for-byte
+equivalent to mainline behaviour. The knob is opt-in and per-arch.
+
+## Why
+
+Page clustering is a *software* technique, distinct from (and complementary to)
+hardware superpages/THP:
+
+- **Superpages/THP** install large hardware TLB entries — a hardware
+  optimisation that reduces TLB misses but is constrained by MMU-supported
+  sizes (e.g. x86's 4 KiB → 2 MiB gap, a factor of 512).
+- **Page clustering** raises the *kernel's* allocation/management granularity
+  above the MMU page — a software optimisation. Userspace still sees the small
+  hardware page.
+
+The two compose, and the composition is the point. Clustering shrinks per-page
+management overhead (one `struct page` per cluster rather than per hardware page,
+shorter LRU/rmap walks, less buddy/slab churn, a memmap smaller by
+`PAGE_MMUCOUNT`). More fundamentally, raising the allocation quantum changes the
+*reliability* of superpage formation — and how it changes depends on the
+hardware's superpage-size spectrum:
+
+- **Dense spectra** (arm64's 4 KiB → 64 KiB contiguous-PTE → 2 MiB; mips's TLB
+  ladder): every superpage size at or below `PAGE_SIZE` is contained within one
+  allocation unit and so succeeds *by construction* — external fragmentation can
+  no longer starve it, only true exhaustion can. THP/mTHP alone cannot offer
+  this guarantee.
+- **Sparse spectra** (x86's 4 KiB → 2 MiB, a factor of 512): the first hardware
+  superpage is far above any sane allocation unit, so there is no guarantee — but
+  raising the base order collapses the *assembly ratio* (contiguous aligned
+  pieces needed to build the larger page) from 512 to 8 at a 256 KiB unit,
+  sharply improving the odds the buddy allocator can form the 2 MiB page at all.
+
+So the allocation unit is best understood not as "bigger pages" but as the
+control on the internal-vs-external fragmentation frontier: it spends a bounded
+amount of internal fragmentation to buy down external fragmentation, and in the
+dense-spectrum case that purchase is a hard superpage-success guarantee — a
+property no amount of 4 KiB-page optimisation can provide. The internal
+fragmentation is itself a managed, reclaimable cost (small-file page-cache tail
+packing; incremental/adaptive anonymous population; background zeroing of large
+clusters — partly implemented, partly roadmap), not an unpriced overhead. It is
+also a useful vehicle for large-page experimentation on architectures whose only
+"big page" is far larger than is convenient to demand-fault.
+
+This is an RFC: the goal is to get the design and the core-mm conventions in
+front of linux-mm before polishing for merge. Concrete questions are at the end.
+
+## Design
+
+The central invariant: **one `struct page` per kernel `PAGE_SIZE`, never per
+hardware page.** There are no sub-pages in the memmap.
+
+- `PFN = phys >> PAGE_SHIFT`. `pte_pfn()` drops the intra-cluster bits;
+  `pte_page()` returns the *same* `struct page` for all `PAGE_MMUCOUNT` PTEs of
+  a cluster; `page_folio()` therefore needs no special-casing.
+- A populated cluster installs `PAGE_MMUCOUNT` hardware PTEs that differ only in
+  their sub-page physical offset. PTE sub-page arithmetic goes through
+  `__phys_to_pte_val()`/`__pte_val_to_phys()` (identity on most arches; defined
+  where the PTE PFN field does not start at `MMUPAGE_SHIFT`, e.g. riscv, mips).
+- **Userspace-facing units are MMUPAGE-granular**: `vm_pgoff`, `total_vm`/
+  `locked_vm`/`data_vm`, rlimit→page conversions, and the mmap/mremap/mprotect/
+  mincore/madvise/mlock/msync syscall layers all count in hardware pages.
+- **rmap / PVMW convention**: the page-table walker yields one kernel page per
+  step (a run of same-cluster present PTEs, or same-encoded migration entries);
+  PTE-level operations (cache+TLB flush, get/clear/set_ptes, RSS, ref/mapcount)
+  consume the run, and there is exactly **one** rmap event per yield. This keeps
+  folio mapcount/refcount semantics intact at cluster granularity.
+- Fault paths (`do_anonymous_page`, `wp_page_copy`, swap-in, file fault) install
+  the whole cluster and seed the arch MMU cache per sub-PTE.
+
+The bulk of the work is making each `PAGE_SIZE`-vs-`MMUPAGE_SIZE` decision
+explicitly throughout mm/, the arch page-table/asm layers, and the boot-path
+drivers/filesystems — choosing kernel-page units for allocation/bookkeeping and
+hardware-page units for anything the MMU or userspace observes.
+
+## What this series is *not*
+
+- Not a change to the userspace ABI: page size as seen by applications is
+  unchanged (it is the hardware MMU page).
+- Not THP and not a TLB optimisation by itself; it is orthogonal and
+  complementary.
+- Not enabled by default anywhere: `PAGE_MMUSHIFT` defaults to 0.
+
+## Patch organisation
+
+The series is built so that at `PAGE_MMUSHIFT == 0` it is bisectable and a
+no-op at every step, and so that at `PAGE_MMUSHIFT > 0` the story is
+incrementally correct — all generic code an arch's clustered boot exercises
+(core mm, plumbing, boot drivers, rootfs filesystems) lands *before* the
+per-arch commit that turns the knob on for that arch.
+
+```
+  A.  Core mm foundation
+      - PAGE_MMUSHIFT Kconfig + MMUPAGE_* definitions (page.h, vdso, mm.h)
+      - generic MMUPAGE pte/pgoff/fixmap helpers
+      - folio_pte_batch_flags() classified-batch return + callers
+      - fault / COW / PTE-install clustering (+ pte_cluster.h)
+      - fork copy + zap clustering
+      - swap-in clustering
+      - rmap: one-kernel-page-per-PVMW-step convention
+      - THP split + PMD accounting under clustering
+      - filemap MMUPAGE file fault + fault-around clamp
+      - mmap-family syscalls MMUPAGE-aligned (mincore/madvise/mmap/mremap/
+        mprotect/mlock/msync/vma)
+      - gup/shmem/swap/util MMUPAGE helpers
+      - vmalloc/ioremap/page_table_check/mm_init/pagewalk
+      - kernel/ (fork, futex, uprobes, perf ring_buffer) + lib/iov_iter
+      - misc mm (vmscan, mempolicy, ksm, nommu, hmm, migrate_device, msync)
+  (B. generic arch plumbing — folded into A's final foundation patch:
+      asm-generic tlb stride, vmlinux.lds helpers, shmparam, blk_types,
+      percpu-defs, lib/vdso, zlib)
+  D.  Drivers: drm/i915 MMUPAGE audit, drm GEM/TTM, fbdev, misc generic drivers
+  E.  fs / misc: 9p, exec, fat, slub oo cap
+  C.  Per-arch enablement — one self-contained "<arch>: support page
+      clustering (PAGE_MMUSHIFT)" patch per arch:
+        x86, arm64, arm, s390, powerpc, sparc, mips, loongarch, riscv,
+        parisc, alpha, microblaze, m68k, arc, csky, sh, xtensa
+      (each no-op at PAGE_MMUSHIFT==0; arch-coupled drivers — parisc IOMMU,
+       s390 sclp, sbus — travel with their arch patch)
+  F.  selftests/mm + Documentation/mm
+```
+
+A handful of strictly-independent pre-fixes (upstream-API and pre-existing-bug
+fixes surfaced during the port — riscv ptrace CFI regset, microblaze/alpha
+entry.S save-area, parisc PDC result buffer) lead the series and stand on their
+own.
+
+The series as posted, and the full development tree it was distilled from (all
+architectures, complete history, and the `PAGE_MMUSHIFT` matrix configuration),
+are browsable at:
+
+- posted series — https://github.com/NadiaYvette/linux branch `pgcl-rfc-v1`
+- full development tree — https://github.com/NadiaYvette/linux branch `nadia.chambers/page-clustering-001`
+- SourceHut mirror — https://git.sr.ht/~nadiayvette/linux-pgcl
+
+## Testing
+
+Validated with a per-arch QEMU matrix (`PAGE_MMUSHIFT` ∈ {0, 2, 4, 6}) running,
+per arch: a clustering unit test, a clustering stress test, the kernel
+`selftests/mm` suite, and the LTP mm suite. Highlights:
+
+- **16 architectures boot and pass at `PAGE_MMUSHIFT = 4`** (64 KiB kernel page
+  on a 4 KiB MMU; 16 hardware PTEs per cluster), with full LTP mm runs and zero
+  clustering-specific failures: x86_64, arm64, arm(+lpae), riscv(32/64), s390x,
+  ppc64, sparc64, mips64, loongarch64, alpha, parisc(32/64), m68k, microblaze.
+- **Four further architectures boot and pass the clustering smoke test at
+  `PAGE_MMUSHIFT = 4`** (anonymous mmap + per-MMUPAGE touch over a cluster,
+  fork + COW; userspace page size confirmed unchanged at the 4–8 KiB hardware
+  page): **sh4, csky, openrisc (or1k), and xtensa** (the last verified with
+  highmem both disabled and active). Full LTP for these four awaits libc
+  cross-toolchains; they are exercised today with a nolibc clustering smoke test.
+  **arc** is build-tested only — no system emulator (`qemu-system-arc`) exists.
+- **`PAGE_MMUSHIFT = 6`** (256 KiB kernel page; 1 MiB on 16 KiB-MMU loongarch)
+  additionally verified on x86_64, aarch64, parisc(32/64), s390x, arm-lpae,
+  mips64, m68k, loongarch64, alpha — including full PTE-table sub-page packing
+  on mips.
+- **`PAGE_MMUSHIFT = 2`** (e.g. 32 KiB page on sparc64's 8 KiB MMU) exercised on
+  sparc64 to validate small-cluster TLB-refill corner cases.
+- `PAGE_MMUSHIFT = 0` boots and passes on all arches and is equivalent to
+  mainline (the series tree is identical to the development branch; see the
+  regression gate below).
+
+The few residual selftest/LTP deltas are architecture-specific and reproduce at
+`PAGE_MMUSHIFT == 0` / on mainline (HW SHMLBA, musl libc stubs, missing optional
+Kconfig); they are not introduced by clustering. (Per-arch result tables to be
+appended.)
+
+The complete test harness — the per-architecture QEMU matrix driver, the
+boot/run configurations, the clustering unit and stress tests, the nolibc smoke
+test, and the result logs — is maintained in a companion repository:
+
+- https://github.com/NadiaYvette/pgcl-testscripts
+- https://git.sr.ht/~nadiayvette/pgcl-testscripts (mirror)
+
+Separately, an early formal-verification effort — *tessera* — is under way: a
+Lean 4 formalisation of the core clustering algorithms (the cluster/MMUPAGE
+coordinate model and the sharing and atomicity properties that the rmap and
+refcount accounting rely on), accompanied by concurrency litmus tests, and
+intended in time to span elements of the Linux C API surface for clustering. It
+is work in progress and not a dependency of this series.
+
+- https://github.com/NadiaYvette/tessera
+- https://git.sr.ht/~nadiayvette/tessera (mirror)
+
+## Known issues / RFC questions
+
+1. **Core-mm conventions** — does the "one `struct page` per kernel page + one
+   rmap event per PVMW yield + MMUPAGE-granular userspace units" split match how
+   maintainers would want clustering expressed? This is the crux of the RFC.
+2. **`folio_pte_batch_flags()` returning a classified struct** (`{nr, kind}`) —
+   acceptable, or preferred as an out-param / separate helper?
+3. **Per-arch surface** — each arch needs a small, mechanical set of MMUPAGE
+   conversions (page table asm, syscall offset/coloring, lds alignment). Is the
+   per-arch-patch-per-arch shape the right granularity for review?
+4. **PTE-table sub-page packing** (sparc32/m68k/mips) requires disabling
+   `SPLIT_PTE_PTLOCKS` (sub-tables sharing a ptdesc share a ptlock). Is the
+   `PACK_PTE_PTLOCKS` per-sub-table-ptlock approach the right long-term answer?
+5. Naming: `MMUPAGE` vs alternatives (`HWPAGE`, `BASEPAGE`) — bikeshed welcome
+   now rather than after merge.
+
+## Lineage and prior art
+
+Page clustering has a long pedigree, and the core idea — decoupling the kernel's
+allocation unit from the MMU page — has been independently rediscovered several
+times, including in the last two years. The through-line, for the record:
+
+- **Academic roots.** Clustering descends from Babaoğlu and Joy's paging work
+  (SOSP 1981, doi:10.1145/800217.806663); its use as a substrate for *superpage
+  promotion* follows Navarro, Iyer, Druschel and Cox, "Practical, transparent
+  operating system support for superpages" (OSDI 2002).
+- **Linux origin, 2001.** Hugh Dickins proposed a larger kernel `PAGE_SIZE`
+  decoupled from the MMU page in "Large PAGE_SIZE" on linux-mm [1]. That thread
+  already carries this series' core formula — *"2\*\*N adjacent subpages may be
+  clustered to make up one kernel page; PAGE_SHIFT = PAGE_SUBSHIFT +
+  SUBPAGE_SHIFT"* — and its ABI invariant: *"one subpage … corresponds to one
+  page at the user process level: its size is the same as EXEC_PAGESIZE (for
+  getpagesize(2) and mmap(2))."* Linus Torvalds' reply states the userspace
+  contract the series still rests on: *"you should never care about PAGE_SHIFT,
+  except in the case of an mmap()."*
+- **The 2.4/2.5 forward-port.** I forward-ported and extended Hugh's larpage
+  through the 2.4/2.5 era, including booting Linux on a 64 GiB NUMA-Q on 32-bit
+  x86 (PAE) in 2003 — feasible precisely because clustering shrinks the `struct page`
+  array enough to fit a 64 GiB memmap in 32-bit lowmem. Clustering was chosen there
+over full kernel/user address-space switching — the XKVA approach, from the
+DYNIX/ptx and AIX lineage I came from — precisely because address-space switching
+is a terminal 32-bit expedient, whereas raising the allocation unit carries
+forward to 64-bit, and, as it turned out, to superpages. The signed patch series
+  and the boot logs themselves are still archived [2]. (That work was published
+  under my former byline; it is cited here as historical attribution.)
+- **Software PAGE_SIZE, 2007.** Andrea Arcangeli's "CONFIG_PAGE_SHIFT (aka
+  software PAGE_SIZE)" thread [3] revisited the same decoupling; the discussion
+  there already anticipated the small-file page-cache tail-packing used to bound
+  internal fragmentation.
+
+## Relationship to current upstream work
+
+The same decoupling is being rediscovered, one architecture at a time, right now:
+
+- Kirill A. Shutemov's "64k (or 16k) base page size on x86" (LSF/MM 2026) splits
+  `PAGE_SIZE` into a hardware `PTE_SIZE` and a kernel `PG_SIZE` with a sub-page
+  offset on the PTE accessors — the split this series calls
+  `MMUPAGE_SIZE`/`PAGE_SIZE` and `pte_mksub()`.
+- Xu Lu's "riscv: Introduce 64K base page" (RFC, 2024) makes `pte_t` an array of
+  16 contiguous hardware PTEs — the same cluster-of-PTEs representation. (Hugh's
+  2001 thread was noted there as prior art.)
+- Ryan Roberts and Dev Jain's per-process page size (LSF/MM 2026) takes the
+  alternative route of varying the page size per process behind an ABI adaptor.
+
+These converge on the design implemented here, but each is tied to one
+architecture and stops short of the full userspace-ABI surface (e.g.
+`/proc/<pid>/pagemap`, the syscall granularity layer). What this series adds is
+the *generic, all-architecture, ABI-complete* form, with a `PAGE_MMUSHIFT == 0`
+identity guarantee that makes it safe to carry in-tree disabled. One shared
+mechanism seems better than N per-arch ones, and folding these efforts together
+would be welcome.
+
+[1] https://lore.kernel.org/linux-mm/Pine.LNX.4.21.0107051737340.1577-100000@localhost.localdomain/
+[2] "64GB NUMA-Q after pgcl" / "64GB NUMA-Q before pgcl", linux-kernel,
+    28 Mar 2003:
+    https://lore.kernel.org/all/20030328040038.GO1350@holomorphy.com/
+    https://lore.kernel.org/all/20030328040036.GA13178@holomorphy.com/
+    Code and boot logs: https://www.kernel.org/pub/linux/kernel/people/wli/vm/pgcl/
+    (signed pgcl-2.5.54 … pgcl-2.5.60; dmesg.64G.32K = 64 GiB x86-32 PAE boot at a
+    32 KiB clustered page, Linux 2.5.66; dmesg.64G.4K the stock-4 KiB baseline on
+    the same NUMA-Q)
+[3] https://lore.kernel.org/all/20070717193308.GD25301@v2.random/ (CONFIG_PAGE_SHIFT thread)
+
+## A note on AI assistance
+
+This series was prepared with substantial assistance from an AI coding assistant
+(Anthropic's Claude). I take responsibility for the patches and have reviewed
+them; I disclose this both because kernel practice increasingly expects it and
+because the connection is, here, substantive rather than incidental. The central
+move of this work — drawing a new distinction between the kernel's allocation unit
+and the hardware's minimum TLB/MMU mapping granularity — is a conceptual cut not
+present in the existing vocabulary, and I had long assumed it was exactly the kind
+of thing a language model would handle poorly: such a model's notion of meaning is
+something like a set of nearby directions in a vector space, inferred rather than
+anchored to a referent, and a genuinely new distinction has no such neighbourhood
+to inherit. For some months I cited this very problem as an example of what these
+models would find hard. Then I tried it, and it held — well enough that a project
+I had shelved as one I never secured the team-lead role or the headcount to
+finish became, instead, this submission.
+
+That assistance extended to the writing itself, this cover letter included. The
+prose began from the assistant's preliminary draft — which I judged a better
+armature than my own first attempt — and I worked my own voice into it, rather
+than the reverse, hand-writing the bulk and correcting toward it. I note it
+because the disclosure should cover the words as much as the code: the choices of
+what to claim, what to cite, and what to stand behind are mine, but the
+composition is substantially collaborative.
+
+---
+
+
+Nadia Yvette Chambers (28):
+  mm: page clustering definitions and Kconfig (CONFIG_PAGE_MMUSHIFT)
+  mm: page clustering fault/COW/PTE-install and THP split
+  mm: page clustering rmap and migration
+  mm: page clustering mmap-family syscalls (MMUPAGE-granular)
+  mm: page clustering swap/shmem/filemap/vmscan and remaining core
+  kernel, lib, block: page clustering plumbing
+  drivers: MMUPAGE audit under page clustering
+  fs: page clustering support under PGCL
+  arm64: support page clustering (PAGE_MMUSHIFT)
+  x86: support page clustering (PAGE_MMUSHIFT)
+  arm: support page clustering (PAGE_MMUSHIFT)
+  s390: support page clustering (PAGE_MMUSHIFT)
+  powerpc: support page clustering (PAGE_MMUSHIFT)
+  sparc: support page clustering (PAGE_MMUSHIFT)
+  mips: support page clustering (PAGE_MMUSHIFT)
+  loongarch: support page clustering (PAGE_MMUSHIFT)
+  riscv: support page clustering (PAGE_MMUSHIFT)
+  parisc: support page clustering (PAGE_MMUSHIFT)
+  alpha: support page clustering (PAGE_MMUSHIFT)
+  microblaze: support page clustering (PAGE_MMUSHIFT)
+  m68k: support page clustering (PAGE_MMUSHIFT)
+  arc: support page clustering (PAGE_MMUSHIFT)
+  csky: support page clustering (PAGE_MMUSHIFT)
+  sh: support page clustering (PAGE_MMUSHIFT)
+  xtensa: support page clustering (PAGE_MMUSHIFT)
+  openrisc: support page clustering (PAGE_MMUSHIFT)
+  selftests/mm, Documentation: page clustering
+  misc: remaining page-clustering changes
+
+ .../mm/sub-pmd-superpages-walkers.rst         |  253 ++++
+ Documentation/mm/sub-pmd-superpages.rst       |  278 +++++
+ arch/Kconfig                                  |   23 +
+ arch/alpha/include/asm/elf.h                  |    3 +-
+ arch/alpha/include/asm/mmu_context.h          |    4 +-
+ arch/alpha/include/asm/pgtable.h              |   75 +-
+ arch/alpha/include/asm/shmparam.h             |    2 +-
+ arch/alpha/kernel/core_cia.c                  |    4 +-
+ arch/alpha/kernel/entry.S                     |   54 +-
+ arch/alpha/kernel/head.S                      |   18 +-
+ arch/alpha/kernel/osf_sys.c                   |    8 +-
+ arch/alpha/kernel/pci-sysfs.c                 |    8 +-
+ arch/alpha/kernel/setup.c                     |   13 +-
+ arch/alpha/lib/clear_page.S                   |    3 +-
+ arch/alpha/lib/copy_page.S                    |    3 +-
+ arch/alpha/lib/ev6-clear_page.S               |    5 +-
+ arch/alpha/lib/ev6-copy_page.S                |    3 +-
+ arch/alpha/mm/fault.c                         |    2 +-
+ arch/alpha/mm/init.c                          |   69 +-
+ arch/arc/include/asm/elf.h                    |    2 +-
+ arch/arc/include/asm/pgtable-levels.h         |    2 +-
+ arch/arc/include/asm/shmparam.h               |    2 +-
+ arch/arm/include/asm/elf.h                    |    3 +-
+ arch/arm/include/asm/fixmap.h                 |    2 +-
+ arch/arm/include/asm/highmem.h                |    4 +-
+ arch/arm/include/asm/kfence.h                 |    9 +-
+ arch/arm/include/asm/pgalloc.h                |    2 +-
+ arch/arm/include/asm/pgtable-3level.h         |    2 +-
+ arch/arm/include/asm/pgtable.h                |   12 +-
+ arch/arm/include/asm/shmparam.h               |    2 +-
+ arch/arm/include/asm/thread_info.h            |    2 +-
+ arch/arm/include/asm/tlbflush.h               |   12 +-
+ arch/arm/kernel/asm-offsets.c                 |    1 +
+ arch/arm/kernel/entry-header.S                |    8 +-
+ arch/arm/kernel/irq.c                         |   10 +-
+ arch/arm/kernel/setup.c                       |    3 +-
+ arch/arm/kernel/traps.c                       |    4 +-
+ arch/arm/kernel/vdso.c                        |    8 +-
+ arch/arm/kernel/vmlinux.lds.S                 |    6 +-
+ arch/arm/mm/dma-mapping.c                     |   21 +-
+ arch/arm/mm/fault-armv.c                      |    4 +-
+ arch/arm/mm/fault.c                           |    2 +-
+ arch/arm/mm/init.c                            |  110 +-
+ arch/arm/mm/ioremap.c                         |    4 +-
+ arch/arm/mm/mmap.c                            |   22 +-
+ arch/arm/mm/mmu.c                             |  123 +-
+ arch/arm/mm/pageattr.c                        |    8 +-
+ arch/arm/mm/pgd.c                             |    2 +-
+ arch/arm/mm/tlb-fa.S                          |    4 +-
+ arch/arm/mm/tlb-v4.S                          |    2 +-
+ arch/arm/mm/tlb-v4wb.S                        |    4 +-
+ arch/arm/mm/tlb-v4wbi.S                       |    4 +-
+ arch/arm/mm/tlb-v6.S                          |   20 +-
+ arch/arm/mm/tlb-v7.S                          |   20 +-
+ arch/arm64/Kconfig                            |    5 +
+ arch/arm64/include/asm/elf.h                  |    2 +-
+ arch/arm64/include/asm/fixmap.h               |    8 +-
+ arch/arm64/include/asm/hugetlb.h              |    4 +-
+ arch/arm64/include/asm/kernel-pgtable.h       |    8 +-
+ arch/arm64/include/asm/memory.h               |   10 +-
+ arch/arm64/include/asm/pgtable-hwdef.h        |   29 +-
+ arch/arm64/include/asm/pgtable.h              |   48 +-
+ arch/arm64/include/asm/shmparam.h             |    2 +-
+ arch/arm64/include/asm/tlbflush.h             |   26 +-
+ arch/arm64/include/asm/vmalloc.h              |   12 +-
+ arch/arm64/kernel/pi/map_kernel.c             |    6 +-
+ arch/arm64/kernel/pi/map_range.c              |   12 +-
+ arch/arm64/kernel/sys.c                       |    4 +-
+ arch/arm64/kernel/sys32.c                     |    4 +-
+ arch/arm64/kernel/vdso.c                      |   22 +-
+ arch/arm64/kernel/vmlinux.lds.S               |    8 +-
+ arch/arm64/kvm/mmu.c                          |   20 +-
+ arch/arm64/mm/contpte.c                       |   75 +-
+ arch/arm64/mm/fixmap.c                        |   12 +-
+ arch/arm64/mm/hugetlbpage.c                   |    7 +-
+ arch/arm64/mm/init.c                          |   25 +-
+ arch/arm64/mm/mmu.c                           |   71 +-
+ arch/arm64/mm/proc.S                          |    4 +-
+ arch/arm64/mm/ptdump.c                        |    4 +-
+ arch/csky/abiv1/mmap.c                        |   13 +-
+ arch/csky/abiv2/inc/abi/entry.h               |    8 +-
+ arch/csky/include/asm/pgtable.h               |   18 +-
+ arch/csky/include/asm/shmparam.h              |    2 +-
+ arch/csky/kernel/syscall.c                    |    4 +-
+ arch/csky/mm/fault.c                          |   10 +-
+ arch/csky/mm/init.c                           |   25 +-
+ arch/csky/mm/tlb.c                            |   18 +-
+ arch/hexagon/include/asm/elf.h                |    4 +-
+ arch/loongarch/Kconfig                        |    9 +
+ arch/loongarch/include/asm/addrspace.h        |    2 +-
+ arch/loongarch/include/asm/elf.h              |    2 +-
+ arch/loongarch/include/asm/fixmap.h           |    2 +-
+ arch/loongarch/include/asm/kvm_mmu.h          |    4 +-
+ arch/loongarch/include/asm/page.h             |    9 +-
+ arch/loongarch/include/asm/pgtable-bits.h     |    2 +-
+ arch/loongarch/include/asm/pgtable.h          |   69 +-
+ arch/loongarch/include/asm/thread_info.h      |    2 +-
+ arch/loongarch/include/asm/vdso/vdso.h        |    2 +-
+ arch/loongarch/kernel/asm-offsets.c           |    1 +
+ arch/loongarch/kernel/process.c               |    6 +-
+ arch/loongarch/kernel/relocate.c              |    6 +-
+ arch/loongarch/kernel/syscall.c               |    8 +-
+ arch/loongarch/kernel/traps.c                 |    2 +-
+ arch/loongarch/kernel/vdso.c                  |   35 +-
+ arch/loongarch/kernel/vmlinux.lds.S           |   15 +-
+ arch/loongarch/mm/init.c                      |   18 +-
+ arch/loongarch/mm/kasan_init.c                |    2 +-
+ arch/loongarch/mm/mmap.c                      |   14 +-
+ arch/loongarch/mm/tlb.c                       |   36 +-
+ arch/loongarch/mm/tlbex.S                     |   17 +-
+ arch/loongarch/vdso/vdso.S                    |    4 +-
+ arch/m68k/include/asm/mcf_pgtable.h           |    2 +-
+ arch/m68k/include/asm/motorola_pgtable.h      |    4 +-
+ arch/m68k/kernel/relocate_kernel.S            |    8 +-
+ arch/m68k/mm/motorola.c                       |   41 +-
+ arch/microblaze/include/asm/fixmap.h          |    4 +-
+ arch/microblaze/include/asm/highmem.h         |    6 +-
+ arch/microblaze/include/asm/page.h            |    2 +-
+ arch/microblaze/include/asm/pgtable.h         |   18 +-
+ arch/microblaze/include/asm/thread_info.h     |   21 +-
+ arch/microblaze/include/uapi/asm/elf.h        |    2 +-
+ arch/microblaze/kernel/entry.S                |   94 +-
+ arch/microblaze/kernel/exceptions.c           |    2 -
+ arch/microblaze/kernel/head.S                 |    8 +-
+ arch/microblaze/kernel/hw_exception_handler.S |   32 +-
+ arch/microblaze/kernel/signal.c               |    3 +-
+ arch/microblaze/kernel/sys_microblaze.c       |    8 +-
+ arch/microblaze/mm/pgtable.c                  |   39 +-
+ arch/mips/Kconfig                             |   13 +
+ arch/mips/include/asm/elf.h                   |    2 +-
+ arch/mips/include/asm/mipsregs.h              |   28 +-
+ arch/mips/include/asm/page.h                  |   31 +-
+ arch/mips/include/asm/pgalloc.h               |   67 +-
+ arch/mips/include/asm/pgtable-32.h            |   27 +-
+ arch/mips/include/asm/pgtable-64.h            |   56 +-
+ arch/mips/include/asm/pgtable-bits.h          |   24 +-
+ arch/mips/include/asm/pgtable.h               |   33 +-
+ arch/mips/include/asm/stackframe.h            |    5 +
+ arch/mips/include/asm/vdso/vdso.h             |    2 +-
+ arch/mips/kernel/asm-offsets.c                |    2 +
+ arch/mips/kernel/genex.S                      |   14 +-
+ arch/mips/kernel/process.c                    |   23 +-
+ arch/mips/kernel/setup.c                      |    4 +-
+ arch/mips/kernel/syscall.c                    |    8 +-
+ arch/mips/kernel/vdso.c                       |   19 +-
+ arch/mips/kernel/vmlinux.lds.S                |    1 +
+ arch/mips/mm/Makefile                         |    1 +
+ arch/mips/mm/c-octeon.c                       |    2 +-
+ arch/mips/mm/c-r4k.c                          |   10 +-
+ arch/mips/mm/mmap.c                           |   20 +-
+ arch/mips/mm/pgtable.c                        |   18 +-
+ arch/mips/mm/pgtable_pte.c                    |  169 +++
+ arch/mips/mm/tlb-r4k.c                        |   26 +-
+ arch/mips/mm/tlbex.c                          |   30 +-
+ arch/openrisc/include/asm/pgtable.h           |   30 +-
+ arch/openrisc/kernel/head.S                   |   10 +-
+ arch/openrisc/mm/init.c                       |   31 +-
+ arch/openrisc/mm/tlb.c                        |   17 +-
+ arch/parisc/include/asm/fixmap.h              |    4 +-
+ arch/parisc/include/asm/pgtable.h             |   46 +-
+ arch/parisc/include/asm/ropes.h               |   11 +-
+ arch/parisc/include/asm/shmparam.h            |    2 +-
+ arch/parisc/include/asm/sparsemem.h           |    9 +-
+ arch/parisc/include/uapi/asm/pdc.h            |    2 +-
+ arch/parisc/kernel/asm-offsets.c              |    1 +
+ arch/parisc/kernel/cache.c                    |   43 +-
+ arch/parisc/kernel/entry.S                    |   24 +-
+ arch/parisc/kernel/head.S                     |    6 +-
+ arch/parisc/kernel/inventory.c                |    3 +-
+ arch/parisc/kernel/pci-dma.c                  |   10 +-
+ arch/parisc/kernel/sys_parisc.c               |   22 +-
+ arch/parisc/mm/fixmap.c                       |    4 +-
+ arch/parisc/mm/init.c                         |   15 +-
+ arch/powerpc/Kconfig                          |    2 +-
+ arch/powerpc/include/asm/book3s/64/hash.h     |    2 +-
+ arch/powerpc/include/asm/book3s/64/pgtable.h  |   10 +-
+ arch/powerpc/include/asm/book3s/64/radix.h    |    2 +-
+ arch/powerpc/include/asm/elf.h                |    2 +-
+ arch/powerpc/include/asm/shmparam.h           |    2 +-
+ arch/powerpc/include/asm/sparsemem.h          |    2 +-
+ arch/powerpc/include/asm/thread_info.h        |    2 +-
+ arch/powerpc/kernel/head_book3s_32.S          |    9 +-
+ arch/powerpc/kernel/irq.c                     |   15 +-
+ arch/powerpc/kernel/misc_32.S                 |    4 +-
+ arch/powerpc/kernel/misc_64.S                 |    4 +-
+ arch/powerpc/kernel/switch.S                  |    3 +-
+ arch/powerpc/kernel/syscalls.c                |    6 +-
+ arch/powerpc/kernel/vdso.c                    |    6 +-
+ arch/powerpc/kernel/vmlinux.lds.S             |    4 +-
+ arch/powerpc/kvm/book3s_hv_rmhandlers.S       |    3 +-
+ arch/powerpc/lib/code-patching.c              |   58 +-
+ arch/powerpc/mm/book3s64/radix_pgtable.c      |   22 +-
+ arch/powerpc/mm/book3s64/radix_tlb.c          |    8 +-
+ arch/powerpc/mm/nohash/tlb.c                  |    2 +-
+ arch/powerpc/mm/pgtable.c                     |   29 +-
+ arch/powerpc/mm/ptdump/hashpagetable.c        |    2 +-
+ arch/powerpc/mm/ptdump/ptdump.c               |    2 +-
+ arch/powerpc/platforms/cell/spufs/spufs.h     |    2 +-
+ arch/powerpc/platforms/powernv/opal-prd.c     |    2 +-
+ arch/riscv/Kconfig                            |    9 +
+ arch/riscv/include/asm/elf.h                  |    2 +-
+ arch/riscv/include/asm/fixmap.h               |    4 +-
+ arch/riscv/include/asm/kfence.h               |    2 +-
+ arch/riscv/include/asm/pgalloc.h              |   40 +-
+ arch/riscv/include/asm/pgtable-64.h           |   20 +-
+ arch/riscv/include/asm/pgtable.h              |   33 +-
+ arch/riscv/kernel/head.S                      |    4 +-
+ arch/riscv/kernel/hibernate.c                 |    2 +-
+ arch/riscv/kernel/patch.c                     |   30 +-
+ arch/riscv/kernel/sys_riscv.c                 |    4 +-
+ arch/riscv/kernel/vdso.c                      |   17 +-
+ arch/riscv/mm/context.c                       |    4 +-
+ arch/riscv/mm/fault.c                         |    2 +-
+ arch/riscv/mm/hugetlbpage.c                   |   10 +-
+ arch/riscv/mm/init.c                          |   76 +-
+ arch/riscv/mm/kasan_init.c                    |    4 +-
+ arch/riscv/mm/pageattr.c                      |    8 +-
+ arch/riscv/mm/ptdump.c                        |    2 +-
+ arch/riscv/mm/tlbflush.c                      |   14 +-
+ arch/s390/Kconfig                             |    9 +
+ arch/s390/boot/decompressor.c                 |    2 +-
+ arch/s390/boot/startup.c                      |    2 +-
+ arch/s390/boot/vmem.c                         |   12 +-
+ arch/s390/include/asm/elf.h                   |    2 +-
+ arch/s390/include/asm/ipl.h                   |    6 +-
+ arch/s390/include/asm/maccess.h               |    4 +-
+ arch/s390/include/asm/page.h                  |    4 +-
+ arch/s390/include/asm/pgtable.h               |   10 +-
+ arch/s390/include/asm/sclp.h                  |    7 +-
+ arch/s390/include/asm/thread_info.h           |    4 +-
+ arch/s390/include/asm/tlb.h                   |   10 +
+ arch/s390/include/asm/uv.h                    |    2 +-
+ arch/s390/kernel/abs_lowcore.c                |    8 +-
+ arch/s390/kernel/ipl.c                        |    2 +-
+ arch/s390/kernel/os_info.c                    |    2 +-
+ arch/s390/kernel/relocate_kernel.S            |   12 +-
+ arch/s390/kernel/setup.c                      |    2 +-
+ arch/s390/kernel/vdso.c                       |   20 +-
+ arch/s390/kvm/dat.h                           |    2 +-
+ arch/s390/kvm/gaccess.c                       |    2 +-
+ arch/s390/kvm/kvm-s390.c                      |    4 +-
+ arch/s390/kvm/vsie.c                          |   12 +-
+ arch/s390/mm/fault.c                          |    6 +-
+ arch/s390/mm/maccess.c                        |    2 +-
+ arch/s390/mm/mmap.c                           |   18 +-
+ arch/s390/mm/pageattr.c                       |    8 +-
+ arch/s390/mm/pgalloc.c                        |   70 +-
+ arch/s390/mm/vmem.c                           |   18 +-
+ arch/sh/include/asm/elf.h                     |    2 +-
+ arch/sh/include/asm/page.h                    |   11 +-
+ arch/sh/include/asm/pgtable-2level.h          |    4 +-
+ arch/sh/include/asm/pgtable-3level.h          |    2 +-
+ arch/sh/include/asm/pgtable.h                 |   12 +-
+ arch/sh/include/asm/pgtable_32.h              |    2 +-
+ arch/sh/kernel/sys_sh.c                       |    8 +-
+ arch/sh/mm/mmap.c                             |   16 +-
+ arch/sh/mm/tlbflush_32.c                      |   33 +-
+ arch/sparc/Kconfig                            |   10 +
+ arch/sparc/include/asm/elf_64.h               |    2 +-
+ arch/sparc/include/asm/page_64.h              |   11 +-
+ arch/sparc/include/asm/pgtable_32.h           |    2 +-
+ arch/sparc/include/asm/pgtable_64.h           |   50 +-
+ arch/sparc/include/asm/processor_64.h         |   12 +-
+ arch/sparc/include/asm/shmparam_32.h          |    2 +-
+ arch/sparc/include/asm/shmparam_64.h          |    2 +-
+ arch/sparc/include/asm/tsb.h                  |   18 +-
+ arch/sparc/include/asm/vdso.h                 |    2 +-
+ arch/sparc/kernel/dtlb_prot.S                 |    4 +-
+ arch/sparc/kernel/sun4v_tlb_miss.S            |    6 +-
+ arch/sparc/kernel/sys_sparc_32.c              |   13 +-
+ arch/sparc/kernel/sys_sparc_64.c              |   32 +-
+ arch/sparc/kernel/tsb.S                       |   12 +-
+ arch/sparc/lib/copy_page.S                    |   16 +-
+ arch/sparc/mm/fault_64.c                      |    2 +-
+ arch/sparc/mm/hugetlbpage.c                   |    4 +-
+ arch/sparc/mm/hypersparc.S                    |   20 +-
+ arch/sparc/mm/init_64.c                       |   78 +-
+ arch/sparc/mm/swift.S                         |    6 +-
+ arch/sparc/mm/tlb.c                           |    6 +-
+ arch/sparc/mm/tsb.c                           |   22 +-
+ arch/sparc/mm/tsunami.S                       |    4 +-
+ arch/sparc/mm/ultra.S                         |   36 +-
+ arch/sparc/mm/viking.S                        |   10 +-
+ arch/sparc/vdso/vma.c                         |   42 +-
+ arch/x86/Kconfig                              |   14 +
+ arch/x86/boot/compressed/head_64.S            |    2 +-
+ arch/x86/boot/compressed/ident_map_64.c       |   10 +-
+ arch/x86/boot/compressed/pgtable_64.c         |    6 +-
+ arch/x86/boot/startup/sev-shared.c            |    2 +-
+ arch/x86/entry/vdso/common/vdso-layout.lds.S  |    4 +-
+ arch/x86/entry/vdso/vma.c                     |   19 +-
+ arch/x86/include/asm/boot.h                   |    6 +-
+ arch/x86/include/asm/elf.h                    |    2 +-
+ arch/x86/include/asm/fixmap.h                 |   10 +-
+ arch/x86/include/asm/intel_ds.h               |   26 +-
+ arch/x86/include/asm/page_32_types.h          |    2 +-
+ arch/x86/include/asm/page_64_types.h          |    8 +-
+ arch/x86/include/asm/page_types.h             |    2 +-
+ arch/x86/include/asm/pgtable.h                |   15 +-
+ arch/x86/include/asm/pgtable_64.h             |    2 +-
+ arch/x86/include/asm/pgtable_64_types.h       |    2 +-
+ arch/x86/include/asm/processor.h              |    6 +-
+ arch/x86/include/asm/realmode.h               |   10 +-
+ arch/x86/include/asm/shmparam.h               |    2 +-
+ arch/x86/include/asm/svm.h                    |    2 +-
+ arch/x86/include/asm/tlbflush.h               |    4 +-
+ arch/x86/include/asm/vdso/vsyscall.h          |    2 +-
+ arch/x86/kernel/alternative.c                 |   40 +-
+ arch/x86/kernel/apic/vector.c                 |    3 +
+ arch/x86/kernel/cpu/sgx/encl.c                |    8 +-
+ arch/x86/kernel/cpu/sgx/virt.c                |    3 +-
+ arch/x86/kernel/dumpstack_64.c                |    2 +-
+ arch/x86/kernel/e820.c                        |   27 +
+ arch/x86/kernel/espfix_64.c                   |   10 +-
+ arch/x86/kernel/head64.c                      |    7 +-
+ arch/x86/kernel/head_64.S                     |    4 +-
+ arch/x86/kernel/irq_64.c                      |    7 +-
+ arch/x86/kernel/irqinit.c                     |    7 +-
+ arch/x86/kernel/ldt.c                         |   20 +-
+ arch/x86/kernel/mpparse.c                     |   10 +-
+ arch/x86/kernel/sys_x86_64.c                  |   23 +-
+ arch/x86/lib/clear_page_64.S                  |    1 +
+ arch/x86/lib/copy_page_64.S                   |    5 +-
+ arch/x86/mm/cpu_entry_area.c                  |   32 +-
+ arch/x86/mm/dump_pagetables.c                 |   33 +-
+ arch/x86/mm/init.c                            |   55 +-
+ arch/x86/mm/init_64.c                         |   47 +-
+ arch/x86/mm/ioremap.c                         |   37 +-
+ arch/x86/mm/pat/set_memory.c                  |  140 ++-
+ arch/x86/mm/pgtable.c                         |    2 +-
+ arch/x86/mm/pti.c                             |    2 +-
+ arch/x86/mm/tlb.c                             |    2 +-
+ arch/x86/platform/efi/efi_32.c                |    5 +-
+ arch/x86/platform/efi/efi_64.c                |   43 +-
+ arch/x86/platform/efi/quirks.c                |   15 +-
+ arch/x86/realmode/init.c                      |   62 +-
+ arch/x86/realmode/rm/realmode.lds.S           |    4 +-
+ arch/x86/realmode/rm/trampoline_32.S          |    2 +-
+ arch/x86/realmode/rm/trampoline_64.S          |    6 +-
+ arch/x86/xen/mmu_pv.c                         |    2 +-
+ arch/xtensa/include/asm/elf.h                 |    2 +-
+ arch/xtensa/include/asm/fixmap.h              |   22 +-
+ arch/xtensa/include/asm/highmem.h             |   33 +
+ arch/xtensa/include/asm/pgtable.h             |   16 +-
+ arch/xtensa/kernel/entry.S                    |   11 +-
+ arch/xtensa/kernel/syscall.c                  |    9 +-
+ arch/xtensa/mm/cache.c                        |   10 +-
+ arch/xtensa/mm/tlb.c                          |   41 +-
+ block/blk-settings.c                          |    6 +-
+ drivers/accel/habanalabs/common/memory_mgr.c  |    2 +-
+ drivers/acpi/osl.c                            |   32 +-
+ drivers/acpi/tables.c                         |   13 +-
+ drivers/block/ublk_drv.c                      |    2 +-
+ drivers/char/mem.c                            |   27 +-
+ drivers/comedi/comedi_fops.c                  |    2 +-
+ drivers/firmware/efi/libstub/loongarch.c      |   12 +-
+ .../firmware/efi/libstub/unaccepted_memory.c  |    2 +-
+ drivers/firmware/efi/libstub/x86-stub.c       |    4 +-
+ drivers/firmware/efi/mokvar-table.c           |   10 +-
+ drivers/fpga/dfl-afu-main.c                   |    2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c      |    2 +-
+ drivers/gpu/drm/drm_gem.c                     |   23 +-
+ drivers/gpu/drm/drm_gem_shmem_helper.c        |   35 +-
+ drivers/gpu/drm/gma500/fbdev.c                |   10 +-
+ drivers/gpu/drm/i915/display/intel_fb.c       |    2 +-
+ .../gpu/drm/i915/gem/i915_gem_execbuffer.c    |   10 +-
+ drivers/gpu/drm/i915/gem/i915_gem_internal.c  |    2 +-
+ drivers/gpu/drm/i915/gem/i915_gem_mman.c      |   32 +-
+ drivers/gpu/drm/i915/gem/i915_gem_object.c    |   10 +-
+ drivers/gpu/drm/i915/gem/i915_gem_pages.c     |   10 +-
+ drivers/gpu/drm/i915/gem/i915_gem_stolen.c    |   14 +-
+ drivers/gpu/drm/i915/gem/i915_gem_ttm.c       |   22 +-
+ drivers/gpu/drm/i915/gt/gen8_ppgtt.c          |   16 +-
+ drivers/gpu/drm/i915/gt/intel_engine_cs.c     |    2 +-
+ drivers/gpu/drm/i915/gt/intel_ggtt.c          |    2 +-
+ drivers/gpu/drm/i915/gt/intel_ggtt_fencing.c  |    2 +-
+ drivers/gpu/drm/i915/gt/intel_gtt.c           |    2 +-
+ drivers/gpu/drm/i915/gt/intel_gtt.h           |    2 +-
+ drivers/gpu/drm/i915/gt/intel_migrate.c       |   36 +-
+ drivers/gpu/drm/i915/gvt/dmabuf.c             |   14 +-
+ drivers/gpu/drm/i915/gvt/gtt.c                |   68 +-
+ drivers/gpu/drm/i915/gvt/kvmgt.c              |   34 +-
+ drivers/gpu/drm/i915/gvt/opregion.c           |    6 +-
+ drivers/gpu/drm/i915/gvt/scheduler.c          |    4 +-
+ drivers/gpu/drm/i915/i915_gem.c               |   22 +-
+ drivers/gpu/drm/i915/i915_gpu_error.c         |   26 +-
+ drivers/gpu/drm/i915/i915_mm.c                |   16 +-
+ drivers/gpu/drm/i915/i915_scatterlist.c       |    8 +-
+ drivers/gpu/drm/i915/i915_scatterlist.h       |    8 +-
+ drivers/gpu/drm/i915/i915_ttm_buddy_manager.c |   38 +-
+ drivers/gpu/drm/i915/i915_vma.c               |   20 +-
+ drivers/gpu/drm/i915/intel_memory_region.c    |   18 +-
+ drivers/gpu/drm/i915/intel_region_ttm.c       |   12 +-
+ drivers/gpu/drm/imagination/pvr_mmu.h         |   15 +-
+ drivers/gpu/drm/panthor/panthor_device.c      |    4 +-
+ drivers/gpu/drm/panthor/panthor_drv.c         |    4 +-
+ drivers/gpu/drm/sysfb/ofdrm.c                 |    4 +-
+ drivers/gpu/drm/ttm/ttm_bo.c                  |    2 +-
+ drivers/gpu/drm/ttm/ttm_bo_vm.c               |   30 +-
+ drivers/gpu/drm/virtio/virtgpu_vram.c         |    2 +-
+ drivers/gpu/drm/xe/xe_bo.c                    |   10 +-
+ drivers/gpu/drm/xe/xe_device.c                |    9 +-
+ drivers/gpu/drm/xe/xe_mmio_gem.c              |   10 +-
+ drivers/hv/mshv_vtl_main.c                    |    4 +-
+ drivers/hv/ring_buffer.c                      |    2 +-
+ drivers/infiniband/hw/cxgb4/provider.c        |    2 +-
+ drivers/infiniband/hw/hfi1/file_ops.c         |    4 +-
+ .../infiniband/hw/ionic/ionic_controlpath.c   |    2 +-
+ drivers/infiniband/hw/ocrdma/ocrdma_verbs.c   |    4 +-
+ .../infiniband/hw/vmw_pvrdma/pvrdma_verbs.c   |    2 +-
+ drivers/infiniband/sw/rdmavt/mmap.c           |    2 +-
+ drivers/infiniband/sw/rxe/rxe_mmap.c          |    2 +-
+ drivers/iommu/iommufd/main.c                  |    2 +-
+ .../media/common/videobuf2/videobuf2-core.c   |    2 +-
+ .../media/platform/samsung/s5p-mfc/s5p_mfc.c  |    2 +-
+ drivers/media/v4l2-core/v4l2-mem2mem.c        |    2 +-
+ drivers/misc/genwqe/card_dev.c                |    2 +-
+ drivers/misc/ocxl/context.c                   |    6 +-
+ drivers/parisc/ccio-dma.c                     |    9 +-
+ drivers/parisc/sba_iommu.c                    |   12 +-
+ drivers/rapidio/devices/rio_mport_cdev.c      |    2 +-
+ drivers/s390/char/sclp.h                      |    6 +-
+ drivers/s390/char/sclp_cmd.c                  |    2 +-
+ drivers/s390/char/sclp_early.c                |    2 +-
+ drivers/s390/char/sclp_early_core.c           |    2 +-
+ drivers/sbus/char/flash.c                     |    6 +-
+ drivers/scsi/sg.c                             |    2 +-
+ drivers/staging/vme_user/vme.c                |    2 +-
+ drivers/usb/mon/mon_bin.c                     |    2 +-
+ drivers/vdpa/vdpa_user/iova_domain.c          |    2 +-
+ drivers/vfio/cdx/main.c                       |    4 +-
+ drivers/vfio/fsl-mc/vfio_fsl_mc.c             |    4 +-
+ .../vfio/pci/hisilicon/hisi_acc_vfio_pci.c    |    2 +-
+ drivers/vfio/pci/nvgrace-gpu/main.c           |    4 +-
+ drivers/vfio/pci/vfio_pci_core.c              |    4 +-
+ drivers/vfio/platform/vfio_platform_common.c  |    4 +-
+ drivers/vhost/vdpa.c                          |    2 +-
+ drivers/video/fbdev/aty/atyfb_base.c          |    2 +-
+ drivers/video/fbdev/core/fb_defio.c           |    4 +-
+ drivers/video/fbdev/efifb.c                   |    4 +-
+ drivers/video/fbdev/ep93xx-fb.c               |    2 +-
+ drivers/video/fbdev/gbefb.c                   |    2 +-
+ .../video/fbdev/omap2/omapfb/omapfb-main.c    |    2 +-
+ drivers/video/fbdev/ps3fb.c                   |    2 +-
+ drivers/video/fbdev/sa1100fb.c                |    2 +-
+ drivers/video/fbdev/sbuslib.c                 |    2 +-
+ drivers/video/fbdev/smscufx.c                 |    2 +-
+ drivers/video/fbdev/udlfb.c                   |    2 +-
+ drivers/xen/balloon.c                         |    4 +-
+ drivers/xen/gntalloc.c                        |    2 +-
+ drivers/xen/mem-reservation.c                 |    4 +-
+ fs/9p/vfs_file.c                              |    4 +-
+ fs/binfmt_elf.c                               |   22 +-
+ fs/btrfs/compression.h                        |    4 +-
+ fs/btrfs/defrag.c                             |    4 +-
+ fs/exec.c                                     |    4 +-
+ fs/exfat/file.c                               |    2 +-
+ fs/fat/dir.c                                  |   25 +-
+ fs/fat/fatent.c                               |   22 +-
+ fs/netfs/iterator.c                           |   25 +-
+ fs/proc/meminfo.c                             |    3 +
+ fs/proc/task_mmu.c                            |   96 +-
+ fs/proc/task_nommu.c                          |    2 +-
+ fs/proc/vmcore.c                              |    2 +-
+ fs/splice.c                                   |   34 +-
+ fs/userfaultfd.c                              |   13 +-
+ include/asm-generic/fixmap.h                  |   12 +-
+ include/asm-generic/shmparam.h                |    2 +-
+ include/asm-generic/tlb.h                     |   10 +-
+ include/asm-generic/vmlinux.lds.h             |   23 +-
+ include/drm/drm_vma_manager.h                 |    4 +-
+ include/linux/blk_types.h                     |    2 +
+ include/linux/huge_mm.h                       |    3 +
+ include/linux/hyperv.h                        |    4 +-
+ include/linux/mm.h                            |  101 +-
+ include/linux/mm_types_task.h                 |   11 +
+ include/linux/pagemap.h                       |   23 +-
+ include/linux/percpu-defs.h                   |   13 +-
+ include/linux/pgtable.h                       |  115 +-
+ include/linux/pte_cluster.h                   |  532 ++++++++
+ include/linux/rmap.h                          |   32 +-
+ include/vdso/datapage.h                       |   10 +-
+ include/vdso/page.h                           |   32 +-
+ init/initramfs.c                              |    9 +-
+ init/main.c                                   |    8 +-
+ io_uring/memmap.c                             |    2 +-
+ ipc/shm.c                                     |   10 +-
+ kernel/bpf/stackmap.c                         |    2 +-
+ kernel/events/core.c                          |    6 +-
+ kernel/events/ring_buffer.c                   |   10 +-
+ kernel/events/uprobes.c                       |    8 +-
+ kernel/fork.c                                 |   13 +-
+ kernel/futex/core.c                           |    7 +-
+ kernel/relay.c                                |    2 +-
+ lib/iov_iter.c                                |   44 +-
+ lib/vdso/datastore.c                          |    4 +-
+ lib/zlib_inflate/infutil.h                    |    2 +-
+ mm/Kconfig                                    |   15 +
+ mm/early_ioremap.c                            |   29 +-
+ mm/filemap.c                                  |  248 +++-
+ mm/gup.c                                      |   67 +-
+ mm/hmm.c                                      |   54 +-
+ mm/huge_memory.c                              |  154 ++-
+ mm/internal.h                                 |  201 ++-
+ mm/ioremap.c                                  |   15 +-
+ mm/khugepaged.c                               |   37 +-
+ mm/ksm.c                                      |    6 +-
+ mm/madvise.c                                  |   43 +-
+ mm/mapping_dirty_helpers.c                    |    9 +-
+ mm/memory-failure.c                           |    4 +-
+ mm/memory.c                                   | 1088 +++++++++++++++--
+ mm/mempolicy.c                                |    6 +-
+ mm/migrate.c                                  |  142 ++-
+ mm/migrate_device.c                           |    7 +-
+ mm/mincore.c                                  |   44 +-
+ mm/mlock.c                                    |   41 +-
+ mm/mm_init.c                                  |   27 +
+ mm/mmap.c                                     |   68 +-
+ mm/mmu_gather.c                               |    5 +-
+ mm/mprotect.c                                 |   44 +-
+ mm/mremap.c                                   |   67 +-
+ mm/msync.c                                    |    6 +-
+ mm/nommu.c                                    |    6 +-
+ mm/page_table_check.c                         |   16 +-
+ mm/page_vma_mapped.c                          |   82 +-
+ mm/pagewalk.c                                 |   10 +-
+ mm/rmap.c                                     |  372 +++++-
+ mm/secretmem.c                                |    2 +-
+ mm/shmem.c                                    |   44 +-
+ mm/slub.c                                     |   20 +-
+ mm/swap_state.c                               |   25 +-
+ mm/swapfile.c                                 |   37 +-
+ mm/userfaultfd.c                              |   31 +-
+ mm/util.c                                     |   47 +-
+ mm/vma.c                                      |   61 +-
+ mm/vma.h                                      |    2 +-
+ mm/vmalloc.c                                  |  110 +-
+ mm/vmscan.c                                   |   10 +-
+ net/9p/trans_virtio.c                         |   54 +-
+ net/xdp/xsk.c                                 |    2 +-
+ security/selinux/selinuxfs.c                  |   12 +-
+ sound/core/pcm_native.c                       |    4 +-
+ sound/soc/qcom/lpass-platform.c               |    2 +-
+ sound/soc/samsung/idma.c                      |    2 +-
+ sound/usb/usx2y/us122l.c                      |    2 +-
+ tools/include/nolibc/arch-csky.h              |  156 +++
+ tools/include/nolibc/arch.h                   |    2 +
+ tools/testing/selftests/mm/cow.c              |   41 +-
+ tools/testing/selftests/mm/mlock2-tests.c     |   11 +
+ tools/testing/selftests/mm/vm_util.c          |   21 +-
+ virt/kvm/guest_memfd.c                        |    2 +-
+ 551 files changed, 8609 insertions(+), 2729 deletions(-)
+ create mode 100644 Documentation/mm/sub-pmd-superpages-walkers.rst
+ create mode 100644 Documentation/mm/sub-pmd-superpages.rst
+ create mode 100644 arch/mips/mm/pgtable_pte.c
+ create mode 100644 include/linux/pte_cluster.h
+ create mode 100644 tools/include/nolibc/arch-csky.h
+
+-- 
+2.54.0
+

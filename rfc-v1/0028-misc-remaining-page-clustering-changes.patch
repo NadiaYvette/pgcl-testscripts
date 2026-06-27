@@ -1,0 +1,309 @@
+From 00bc5b689aac586feeb9ffda5f6ba12e33d407b5 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:44 +0200
+Subject: [RFC PATCH 28/28] misc: remaining page-clustering changes
+
+---
+ arch/Kconfig                    | 23 ++++++++++++++
+ arch/hexagon/include/asm/elf.h  |  4 +--
+ io_uring/memmap.c               |  2 +-
+ net/9p/trans_virtio.c           | 54 +++++++++++++++++++++++----------
+ net/xdp/xsk.c                   |  2 +-
+ sound/core/pcm_native.c         |  4 +--
+ sound/soc/qcom/lpass-platform.c |  2 +-
+ sound/soc/samsung/idma.c        |  2 +-
+ sound/usb/usx2y/us122l.c        |  2 +-
+ 9 files changed, 70 insertions(+), 25 deletions(-)
+
+diff --git a/arch/Kconfig b/arch/Kconfig
+index e86880045158..04c069dc2f93 100644
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -1369,6 +1369,29 @@ config PAGE_SHIFT
+ 	default	16 if PAGE_SIZE_64KB
+ 	default	18 if PAGE_SIZE_256KB
+ 
++config PAGE_MMUSHIFT
++	int "Extra PAGE_SIZE shift over MMU page size (page clustering)"
++	default 0
++	help
++	  This specifies the additional shift of the kernel's internal
++	  PAGE_SIZE over the hardware MMU page size (MMUPAGE_SIZE).
++	  The kernel allocates physical memory in PAGE_SIZE chunks
++	  (= 2^PAGE_MMUSHIFT * MMUPAGE_SIZE) but maps individual
++	  MMUPAGE_SIZE PTEs to userspace, preserving the standard
++	  TLB/MMU base page ABI.
++
++	  When set to 0 (the default), PAGE_SIZE equals MMUPAGE_SIZE
++	  and the kernel behaves identically to a stock configuration.
++
++	  When set to N > 0, the kernel page size is 2^N times the
++	  hardware page size. For example, on x86 with PAGE_MMUSHIFT=2,
++	  the kernel uses 16KB pages internally while userspace still
++	  sees 4KB pages via the MMU.
++
++	  This is based on Hugh Dickins' "larpage" work (2001).
++
++	  If unsure, leave this at 0.
++
+ # This allows to use a set of generic functions to determine mmap base
+ # address by giving priority to top-down scheme only if the process
+ # is not in legacy mode (compat task, unlimited stack size or
+diff --git a/arch/hexagon/include/asm/elf.h b/arch/hexagon/include/asm/elf.h
+index 5bfdd9b147fd..0339989c8c37 100644
+--- a/arch/hexagon/include/asm/elf.h
++++ b/arch/hexagon/include/asm/elf.h
+@@ -183,8 +183,8 @@ do {					\
+ 
+ #define CORE_DUMP_USE_REGSET
+ 
+-/* Hrm is this going to cause problems for changing PAGE_SIZE?  */
+-#define ELF_EXEC_PAGESIZE	PAGE_SIZE
++/* AT_PAGESZ is the hardware page userspace sees: MMUPAGE_SIZE under PGCL. */
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ 
+ /*
+  * This is the location that an ET_DYN program is loaded if exec'ed.  Typical
+diff --git a/io_uring/memmap.c b/io_uring/memmap.c
+index 4f9b439319c4..fe9cc810f217 100644
+--- a/io_uring/memmap.c
++++ b/io_uring/memmap.c
+@@ -296,7 +296,7 @@ __cold int io_uring_mmap(struct file *file, struct vm_area_struct *vma)
+ {
+ 	struct io_ring_ctx *ctx = file->private_data;
+ 	size_t sz = vma->vm_end - vma->vm_start;
+-	long offset = vma->vm_pgoff << PAGE_SHIFT;
++	long offset = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	unsigned int page_limit = UINT_MAX;
+ 	struct io_mapped_region *region;
+ 	void *ptr;
+diff --git a/net/9p/trans_virtio.c b/net/9p/trans_virtio.c
+index 4cdab7094b27..80dd8f189934 100644
+--- a/net/9p/trans_virtio.c
++++ b/net/9p/trans_virtio.c
+@@ -210,31 +210,34 @@ static int p9_virtio_cancelled(struct p9_client *client, struct p9_req_t *req)
+  * @limit: maximum number of pages in sg list.
+  * @pdata: a list of pages to add into sg.
+  * @nr_pages: number of pages to pack into the scatter/gather list
+- * @offs: amount of data in the beginning of first page _not_ to pack
++ * @offs: offset in first page where data starts
+  * @count: amount of data to pack into the scatter/gather list
++ * @pstep: page step size — MMUPAGE_SIZE for GUP user pages,
++ *         PAGE_SIZE for kernel/bvec pages.
++ *
++ * With PGCL, GUP returns one page pointer per MMUPAGE.  Multiple
++ * consecutive entries may reference the same struct page at different
++ * kernel-page offsets.  @pstep controls the stride per entry.
+  */
+ static int
+ pack_sg_list_p(struct scatterlist *sg, int start, int limit,
+-	       struct page **pdata, int nr_pages, size_t offs, int count)
++	       struct page **pdata, int nr_pages, size_t offs, int count,
++	       size_t pstep)
+ {
+ 	int i = 0, s;
+ 	int data_off = offs;
+ 	int index = start;
+ 
+ 	BUG_ON(nr_pages > (limit - start));
+-	/*
+-	 * if the first page doesn't start at
+-	 * page boundary find the offset
+-	 */
+ 	while (nr_pages) {
+-		s = PAGE_SIZE - data_off;
++		s = pstep - (data_off & (pstep - 1));
+ 		if (s > count)
+ 			s = count;
+ 		BUG_ON(index >= limit);
+ 		/* Make sure we don't terminate early. */
+ 		sg_unmark_end(&sg[index]);
+ 		sg_set_page(&sg[index++], pdata[i++], s, data_off);
+-		data_off = 0;
++		data_off = (data_off + s) & (PAGE_SIZE - 1);
+ 		count -= s;
+ 		nr_pages--;
+ 	}
+@@ -310,7 +313,8 @@ static int p9_get_mapped_pages(struct virtio_chan *chan,
+ 			       struct iov_iter *data,
+ 			       int count,
+ 			       size_t *offs,
+-			       int *need_drop)
++			       int *need_drop,
++			       size_t *pstep)
+ {
+ 	int nr_pages;
+ 	int err;
+@@ -320,6 +324,7 @@ static int p9_get_mapped_pages(struct virtio_chan *chan,
+ 
+ 	if (!iov_iter_is_kvec(data)) {
+ 		int n;
++		bool is_user = user_backed_iter(data);
+ 		/*
+ 		 * We allow only p9_max_pages pinned. We wait for the
+ 		 * Other zc request to finish here
+@@ -334,7 +339,18 @@ static int p9_get_mapped_pages(struct virtio_chan *chan,
+ 		if (n < 0)
+ 			return n;
+ 		*need_drop = 1;
+-		nr_pages = DIV_ROUND_UP(n + *offs, PAGE_SIZE);
++		/*
++		 * GUP (user-backed) returns MMUPAGE-count entries;
++		 * bvec/folioq/xarray paths return PAGE-count entries.
++		 */
++		if (is_user) {
++			*pstep = MMUPAGE_SIZE;
++			nr_pages = DIV_ROUND_UP(n + (*offs & ~MMUPAGE_MASK),
++						MMUPAGE_SIZE);
++		} else {
++			*pstep = PAGE_SIZE;
++			nr_pages = DIV_ROUND_UP(n + *offs, PAGE_SIZE);
++		}
+ 		atomic_add(nr_pages, &vp_pinned);
+ 		return n;
+ 	} else {
+@@ -363,6 +379,7 @@ static int p9_get_mapped_pages(struct virtio_chan *chan,
+ 			return -ENOMEM;
+ 
+ 		*need_drop = 0;
++		*pstep = PAGE_SIZE;
+ 		p -= (*offs = offset_in_page(p));
+ 		for (index = 0; index < nr_pages; index++) {
+ 			if (is_vmalloc_addr(p))
+@@ -428,6 +445,7 @@ p9_virtio_zc_request(struct p9_client *client, struct p9_req_t *req,
+ 	struct virtio_chan *chan = client->trans;
+ 	struct scatterlist *sgs[4];
+ 	size_t offs = 0;
++	size_t pstep = PAGE_SIZE;
+ 	int need_drop = 0;
+ 	int kicked = 0;
+ 
+@@ -436,12 +454,13 @@ p9_virtio_zc_request(struct p9_client *client, struct p9_req_t *req,
+ 	if (uodata) {
+ 		__le32 sz;
+ 		int n = p9_get_mapped_pages(chan, &out_pages, uodata,
+-					    outlen, &offs, &need_drop);
++					    outlen, &offs, &need_drop,
++					    &pstep);
+ 		if (n < 0) {
+ 			err = n;
+ 			goto err_out;
+ 		}
+-		out_nr_pages = DIV_ROUND_UP(n + offs, PAGE_SIZE);
++		out_nr_pages = DIV_ROUND_UP(n + (offs & (pstep - 1)), pstep);
+ 		if (n != outlen) {
+ 			__le32 v = cpu_to_le32(n);
+ 			memcpy(&req->tc.sdata[req->tc.size - 4], &v, 4);
+@@ -455,12 +474,13 @@ p9_virtio_zc_request(struct p9_client *client, struct p9_req_t *req,
+ 		memcpy(&req->tc.sdata[0], &sz, sizeof(sz));
+ 	} else if (uidata) {
+ 		int n = p9_get_mapped_pages(chan, &in_pages, uidata,
+-					    inlen, &offs, &need_drop);
++					    inlen, &offs, &need_drop,
++					    &pstep);
+ 		if (n < 0) {
+ 			err = n;
+ 			goto err_out;
+ 		}
+-		in_nr_pages = DIV_ROUND_UP(n + offs, PAGE_SIZE);
++		in_nr_pages = DIV_ROUND_UP(n + (offs & (pstep - 1)), pstep);
+ 		if (n != inlen) {
+ 			__le32 v = cpu_to_le32(n);
+ 			memcpy(&req->tc.sdata[req->tc.size - 4], &v, 4);
+@@ -483,7 +503,8 @@ p9_virtio_zc_request(struct p9_client *client, struct p9_req_t *req,
+ 	if (out_pages) {
+ 		sgs[out_sgs++] = chan->sg + out;
+ 		out += pack_sg_list_p(chan->sg, out, VIRTQUEUE_NUM,
+-				      out_pages, out_nr_pages, offs, outlen);
++				      out_pages, out_nr_pages, offs, outlen,
++				      pstep);
+ 	}
+ 
+ 	/*
+@@ -501,7 +522,8 @@ p9_virtio_zc_request(struct p9_client *client, struct p9_req_t *req,
+ 	if (in_pages) {
+ 		sgs[out_sgs + in_sgs++] = chan->sg + out + in;
+ 		pack_sg_list_p(chan->sg, out + in, VIRTQUEUE_NUM,
+-			       in_pages, in_nr_pages, offs, inlen);
++			       in_pages, in_nr_pages, offs, inlen,
++			       pstep);
+ 	}
+ 
+ 	BUG_ON(out_sgs + in_sgs > ARRAY_SIZE(sgs));
+diff --git a/net/xdp/xsk.c b/net/xdp/xsk.c
+index f8c8a8c9dfba..34ddc4128122 100644
+--- a/net/xdp/xsk.c
++++ b/net/xdp/xsk.c
+@@ -1865,7 +1865,7 @@ static int xsk_getsockopt(struct socket *sock, int level, int optname,
+ static int xsk_mmap(struct file *file, struct socket *sock,
+ 		    struct vm_area_struct *vma)
+ {
+-	loff_t offset = (loff_t)vma->vm_pgoff << PAGE_SHIFT;
++	loff_t offset = (loff_t)vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	unsigned long size = vma->vm_end - vma->vm_start;
+ 	struct xdp_sock *xs = xdp_sk(sock->sk);
+ 	int state = READ_ONCE(xs->state);
+diff --git a/sound/core/pcm_native.c b/sound/core/pcm_native.c
+index 302643c1c192..d3b52e4185b5 100644
+--- a/sound/core/pcm_native.c
++++ b/sound/core/pcm_native.c
+@@ -4013,7 +4013,7 @@ int snd_pcm_mmap_data(struct snd_pcm_substream *substream, struct file *file,
+ 	    runtime->access == SNDRV_PCM_ACCESS_RW_NONINTERLEAVED)
+ 		return -EINVAL;
+ 	size = area->vm_end - area->vm_start;
+-	offset = area->vm_pgoff << PAGE_SHIFT;
++	offset = area->vm_pgoff << MMUPAGE_SHIFT;
+ 	dma_bytes = PAGE_ALIGN(runtime->dma_bytes);
+ 	if ((size_t)size > dma_bytes)
+ 		return -EINVAL;
+@@ -4045,7 +4045,7 @@ static int snd_pcm_mmap(struct file *file, struct vm_area_struct *area)
+ 	if (substream->runtime->state == SNDRV_PCM_STATE_DISCONNECTED)
+ 		return -EBADFD;
+ 
+-	offset = area->vm_pgoff << PAGE_SHIFT;
++	offset = area->vm_pgoff << MMUPAGE_SHIFT;
+ 	switch (offset) {
+ 	case SNDRV_PCM_MMAP_OFFSET_STATUS_OLD:
+ 		if (pcm_file->no_compat_mmap || !IS_ENABLED(CONFIG_64BIT))
+diff --git a/sound/soc/qcom/lpass-platform.c b/sound/soc/qcom/lpass-platform.c
+index e162627d6f86..82a302bbbd99 100644
+--- a/sound/soc/qcom/lpass-platform.c
++++ b/sound/soc/qcom/lpass-platform.c
+@@ -900,7 +900,7 @@ static int lpass_platform_cdc_dma_mmap(struct snd_pcm_substream *substream,
+ 
+ 	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+ 	size = vma->vm_end - vma->vm_start;
+-	offset = vma->vm_pgoff << PAGE_SHIFT;
++	offset = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	return io_remap_pfn_range(vma, vma->vm_start,
+ 			(runtime->dma_addr + offset) >> PAGE_SHIFT,
+ 			size, vma->vm_page_prot);
+diff --git a/sound/soc/samsung/idma.c b/sound/soc/samsung/idma.c
+index cb455ddce253..1cd6288fa04a 100644
+--- a/sound/soc/samsung/idma.c
++++ b/sound/soc/samsung/idma.c
+@@ -248,7 +248,7 @@ static int idma_mmap(struct snd_soc_component *component,
+ 	/* From snd_pcm_lib_mmap_iomem */
+ 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+ 	size = vma->vm_end - vma->vm_start;
+-	offset = vma->vm_pgoff << PAGE_SHIFT;
++	offset = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	return io_remap_pfn_range(vma, vma->vm_start,
+ 			(runtime->dma_addr + offset) >> PAGE_SHIFT,
+ 			size, vma->vm_page_prot);
+diff --git a/sound/usb/usx2y/us122l.c b/sound/usb/usx2y/us122l.c
+index f00b53346abd..3d91cec29f84 100644
+--- a/sound/usb/usx2y/us122l.c
++++ b/sound/usb/usx2y/us122l.c
+@@ -176,7 +176,7 @@ static int usb_stream_hwdep_mmap(struct snd_hwdep *hw,
+ 	struct usb_stream *s;
+ 	bool read;
+ 
+-	offset = area->vm_pgoff << PAGE_SHIFT;
++	offset = area->vm_pgoff << MMUPAGE_SHIFT;
+ 	guard(mutex)(&us122l->mutex);
+ 	s = us122l->sk.s;
+ 	read = offset < s->read_size;
+-- 
+2.54.0
+

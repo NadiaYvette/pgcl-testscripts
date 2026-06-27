@@ -1,0 +1,53 @@
+From a02807c44e7afba9a63281f8653b3b40882f113b Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:39 +0200
+Subject: [RFC PATCH 22/28] arc: support page clustering (PAGE_MMUSHIFT)
+
+---
+ arch/arc/include/asm/elf.h            | 2 +-
+ arch/arc/include/asm/pgtable-levels.h | 2 +-
+ arch/arc/include/asm/shmparam.h       | 2 +-
+ 3 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arc/include/asm/elf.h b/arch/arc/include/asm/elf.h
+index 0284ace0e1ab..292185f276ef 100644
+--- a/arch/arc/include/asm/elf.h
++++ b/arch/arc/include/asm/elf.h
+@@ -39,7 +39,7 @@ extern int elf_check_arch(const struct elf32_hdr *);
+ 
+ #define CORE_DUMP_USE_REGSET
+ 
+-#define ELF_EXEC_PAGESIZE	PAGE_SIZE
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ 
+ /*
+  * This is the location that an ET_DYN program is loaded if exec'ed.  Typical
+diff --git a/arch/arc/include/asm/pgtable-levels.h b/arch/arc/include/asm/pgtable-levels.h
+index c8f9273372c0..9123adcc7b83 100644
+--- a/arch/arc/include/asm/pgtable-levels.h
++++ b/arch/arc/include/asm/pgtable-levels.h
+@@ -168,7 +168,7 @@
+ #define pte_ERROR(e) \
+ 	pr_crit("%s:%d: bad pte %08lx.\n", __FILE__, __LINE__, pte_val(e))
+ 
+-#define PFN_PTE_SHIFT		PAGE_SHIFT
++#define PFN_PTE_SHIFT		MMUPAGE_SHIFT
+ #define pte_none(x)		(!pte_val(x))
+ #define pte_present(x)		(pte_val(x) & _PAGE_PRESENT)
+ #define pte_clear(mm,addr,ptep)	set_pte_at(mm, addr, ptep, __pte(0))
+diff --git a/arch/arc/include/asm/shmparam.h b/arch/arc/include/asm/shmparam.h
+index 719112af0f41..a4350c318921 100644
+--- a/arch/arc/include/asm/shmparam.h
++++ b/arch/arc/include/asm/shmparam.h
+@@ -7,7 +7,7 @@
+ #define __ARC_ASM_SHMPARAM_H
+ 
+ /* Handle up to 2 cache bins */
+-#define	SHMLBA	(2 * PAGE_SIZE)
++#define	SHMLBA	(2 * MMUPAGE_SIZE)
+ 
+ /* Enforce SHMLBA in shmat */
+ #define __ARCH_FORCE_SHMLBA
+-- 
+2.54.0
+

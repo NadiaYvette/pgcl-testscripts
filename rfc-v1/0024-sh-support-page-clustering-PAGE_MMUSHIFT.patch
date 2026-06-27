@@ -1,0 +1,291 @@
+From b74c5fc808b3605391835424581decd2a7c6a5c6 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:41 +0200
+Subject: [RFC PATCH 24/28] sh: support page clustering (PAGE_MMUSHIFT)
+
+---
+ arch/sh/include/asm/elf.h            |  2 +-
+ arch/sh/include/asm/page.h           | 11 +++++++++-
+ arch/sh/include/asm/pgtable-2level.h |  4 ++--
+ arch/sh/include/asm/pgtable-3level.h |  2 +-
+ arch/sh/include/asm/pgtable.h        | 12 +++++++---
+ arch/sh/include/asm/pgtable_32.h     |  2 +-
+ arch/sh/kernel/sys_sh.c              |  8 +++----
+ arch/sh/mm/mmap.c                    | 16 +++++++-------
+ arch/sh/mm/tlbflush_32.c             | 33 ++++++++++++++++++----------
+ 9 files changed, 58 insertions(+), 32 deletions(-)
+
+diff --git a/arch/sh/include/asm/elf.h b/arch/sh/include/asm/elf.h
+index 2862d6d1cb64..fb45a442ae4c 100644
+--- a/arch/sh/include/asm/elf.h
++++ b/arch/sh/include/asm/elf.h
+@@ -104,7 +104,7 @@ typedef struct user_fpu_struct elf_fpregset_t;
+ #define CORE_DUMP_USE_REGSET
+ 
+ #define ELF_FDPIC_CORE_EFLAGS	EF_SH_FDPIC
+-#define ELF_EXEC_PAGESIZE	PAGE_SIZE
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ 
+ /* This is the location that an ET_DYN program is loaded if exec'ed.  Typical
+    use of this is to invoke "./ld.so someprog" to test out a new version of
+diff --git a/arch/sh/include/asm/page.h b/arch/sh/include/asm/page.h
+index def4205491ec..e138d06feae7 100644
+--- a/arch/sh/include/asm/page.h
++++ b/arch/sh/include/asm/page.h
+@@ -10,7 +10,16 @@
+ 
+ #include <vdso/page.h>
+ 
+-#define PTE_MASK	PAGE_MASK
++/*
++ * Mask of the physical-frame bits in a PTE.  These are MMU-page granular,
++ * not PAGE granular: under page clustering a PAGE spans PAGE_MMUCOUNT MMU
++ * pages and a sub-PTE's frame number carries the sub-page offset in bits
++ * [PAGE_SHIFT-1 : MMUPAGE_SHIFT].  Using PAGE_MASK here would drop that
++ * offset across a pte_modify() (e.g. mprotect), collapsing every sub-PTE
++ * in a cluster onto the cluster base.  Collapses to PAGE_MASK at
++ * PAGE_MMUSHIFT=0.
++ */
++#define PTE_MASK	MMUPAGE_MASK
+ 
+ #if defined(CONFIG_HUGETLB_PAGE_SIZE_64K)
+ #define HPAGE_SHIFT	16
+diff --git a/arch/sh/include/asm/pgtable-2level.h b/arch/sh/include/asm/pgtable-2level.h
+index 08bff93927ff..edda1c9b2cee 100644
+--- a/arch/sh/include/asm/pgtable-2level.h
++++ b/arch/sh/include/asm/pgtable-2level.h
+@@ -12,8 +12,8 @@
+ /* PTE bits */
+ #define PTE_MAGNITUDE		2	/* 32-bit PTEs */
+ 
+-#define PTE_SHIFT		PAGE_SHIFT
+-#define PTE_BITS		(PTE_SHIFT - PTE_MAGNITUDE)
++#define PTE_SHIFT		MMUPAGE_SHIFT
++#define PTE_BITS		(PAGE_SHIFT - PTE_MAGNITUDE)
+ 
+ /* PGD bits */
+ #define PGDIR_SHIFT		(PTE_SHIFT + PTE_BITS)
+diff --git a/arch/sh/include/asm/pgtable-3level.h b/arch/sh/include/asm/pgtable-3level.h
+index d1ce73f3bd85..549480a093cf 100644
+--- a/arch/sh/include/asm/pgtable-3level.h
++++ b/arch/sh/include/asm/pgtable-3level.h
+@@ -19,7 +19,7 @@
+ #define USER_PTRS_PER_PGD	2
+ 
+ /* PMD bits */
+-#define PMD_SHIFT	(PAGE_SHIFT + (PAGE_SHIFT - PTE_MAGNITUDE))
++#define PMD_SHIFT	(MMUPAGE_SHIFT + (PAGE_SHIFT - PTE_MAGNITUDE))
+ #define PMD_SIZE	(1UL << PMD_SHIFT)
+ #define PMD_MASK	(~(PMD_SIZE-1))
+ 
+diff --git a/arch/sh/include/asm/pgtable.h b/arch/sh/include/asm/pgtable.h
+index d5ce0950a323..a2ab5f26fbc8 100644
+--- a/arch/sh/include/asm/pgtable.h
++++ b/arch/sh/include/asm/pgtable.h
+@@ -98,9 +98,15 @@ static inline void update_mmu_cache_range(struct vm_fault *vmf,
+ 		struct vm_area_struct *vma, unsigned long address,
+ 		pte_t *ptep, unsigned int nr)
+ {
+-	pte_t pte = *ptep;
+-	__update_cache(vma, address, pte);
+-	__update_tlb(vma, address, pte);
++	for (;;) {
++		pte_t pte = *ptep;
++		__update_cache(vma, address, pte);
++		__update_tlb(vma, address, pte);
++		if (--nr == 0)
++			break;
++		ptep++;
++		address += MMUPAGE_SIZE;
++	}
+ }
+ #define update_mmu_cache(vma, addr, ptep) \
+ 	update_mmu_cache_range(NULL, vma, addr, ptep, 1)
+diff --git a/arch/sh/include/asm/pgtable_32.h b/arch/sh/include/asm/pgtable_32.h
+index 5f51af18997b..b2c0e15f53f3 100644
+--- a/arch/sh/include/asm/pgtable_32.h
++++ b/arch/sh/include/asm/pgtable_32.h
+@@ -313,7 +313,7 @@ static inline void set_pte(pte_t *ptep, pte_t pte)
+  */
+ #define set_pmd(pmdptr, pmdval) (*(pmdptr) = pmdval)
+ 
+-#define PFN_PTE_SHIFT	PAGE_SHIFT
++#define PFN_PTE_SHIFT	MMUPAGE_SHIFT
+ #define pfn_pte(pfn, prot) \
+ 	__pte(((unsigned long long)(pfn) << PAGE_SHIFT) | pgprot_val(prot))
+ #define pfn_pmd(pfn, prot) \
+diff --git a/arch/sh/kernel/sys_sh.c b/arch/sh/kernel/sys_sh.c
+index a5a7b33ed81a..98068d71789c 100644
+--- a/arch/sh/kernel/sys_sh.c
++++ b/arch/sh/kernel/sys_sh.c
+@@ -33,9 +33,9 @@ asmlinkage int old_mmap(unsigned long addr, unsigned long len,
+ 	unsigned long prot, unsigned long flags,
+ 	int fd, unsigned long off)
+ {
+-	if (off & ~PAGE_MASK)
++	if (off & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+-	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off>>PAGE_SHIFT);
++	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off>>MMUPAGE_SHIFT);
+ }
+ 
+ asmlinkage long sys_mmap2(unsigned long addr, unsigned long len,
+@@ -46,10 +46,10 @@ asmlinkage long sys_mmap2(unsigned long addr, unsigned long len,
+ 	 * The shift for mmap2 is constant, regardless of PAGE_SIZE
+ 	 * setting.
+ 	 */
+-	if (pgoff & ((1 << (PAGE_SHIFT - 12)) - 1))
++	if (pgoff & ((1 << (MMUPAGE_SHIFT - 12)) - 1))
+ 		return -EINVAL;
+ 
+-	pgoff >>= PAGE_SHIFT - 12;
++	pgoff >>= MMUPAGE_SHIFT - 12;
+ 
+ 	return ksys_mmap_pgoff(addr, len, prot, flags, fd, pgoff);
+ }
+diff --git a/arch/sh/mm/mmap.c b/arch/sh/mm/mmap.c
+index c442734d9b0c..ccdfb5db68da 100644
+--- a/arch/sh/mm/mmap.c
++++ b/arch/sh/mm/mmap.c
+@@ -46,7 +46,7 @@ static inline unsigned long COLOUR_ALIGN(unsigned long addr,
+ 					 unsigned long pgoff)
+ {
+ 	unsigned long base = (addr + shm_align_mask) & ~shm_align_mask;
+-	unsigned long off = (pgoff << PAGE_SHIFT) & shm_align_mask;
++	unsigned long off = (pgoff << MMUPAGE_SHIFT) & shm_align_mask;
+ 
+ 	return base + off;
+ }
+@@ -65,7 +65,7 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 		 * cache aliasing constraints.
+ 		 */
+ 		if ((flags & MAP_SHARED) &&
+-		    ((addr - (pgoff << PAGE_SHIFT)) & shm_align_mask))
++		    ((addr - (pgoff << MMUPAGE_SHIFT)) & shm_align_mask))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -92,8 +92,8 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 	info.length = len;
+ 	info.low_limit = TASK_UNMAPPED_BASE;
+ 	info.high_limit = TASK_SIZE;
+-	info.align_mask = do_colour_align ? (PAGE_MASK & shm_align_mask) : 0;
+-	info.align_offset = pgoff << PAGE_SHIFT;
++	info.align_mask = do_colour_align ? (MMUPAGE_MASK & shm_align_mask) : 0;
++	info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	return vm_unmapped_area(&info);
+ }
+ 
+@@ -113,7 +113,7 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
+ 		 * cache aliasing constraints.
+ 		 */
+ 		if ((flags & MAP_SHARED) &&
+-		    ((addr - (pgoff << PAGE_SHIFT)) & shm_align_mask))
++		    ((addr - (pgoff << MMUPAGE_SHIFT)) & shm_align_mask))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -142,8 +142,8 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
+ 	info.length = len;
+ 	info.low_limit = PAGE_SIZE;
+ 	info.high_limit = mm->mmap_base;
+-	info.align_mask = do_colour_align ? (PAGE_MASK & shm_align_mask) : 0;
+-	info.align_offset = pgoff << PAGE_SHIFT;
++	info.align_mask = do_colour_align ? (MMUPAGE_MASK & shm_align_mask) : 0;
++	info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	addr = vm_unmapped_area(&info);
+ 
+ 	/*
+@@ -152,7 +152,7 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
+ 	 * can happen with large stack limits and large mmap()
+ 	 * allocations.
+ 	 */
+-	if (addr & ~PAGE_MASK) {
++	if (addr & ~MMUPAGE_MASK) {
+ 		VM_BUG_ON(addr != -ENOMEM);
+ 		info.flags = 0;
+ 		info.low_limit = TASK_UNMAPPED_BASE;
+diff --git a/arch/sh/mm/tlbflush_32.c b/arch/sh/mm/tlbflush_32.c
+index a6a20d6de4c0..f3fee254791c 100644
+--- a/arch/sh/mm/tlbflush_32.c
++++ b/arch/sh/mm/tlbflush_32.c
+@@ -22,7 +22,16 @@ void local_flush_tlb_page(struct vm_area_struct *vma, unsigned long page)
+ 		unsigned long saved_asid = MMU_NO_ASID;
+ 
+ 		asid = cpu_asid(cpu, vma->vm_mm);
+-		page &= PAGE_MASK;
++		/*
++		 * Each SH-4 UTLB entry maps one MMU page, so mask to
++		 * MMUPAGE_MASK rather than PAGE_MASK: under page clustering a
++		 * PAGE spans PAGE_MMUCOUNT MMU pages, and rounding down to the
++		 * cluster base would flush a sibling sub-page's entry instead
++		 * of this one.  The stale entry would then alias a freshly
++		 * loaded entry for the same VPN and trip a TLB multiple-hit (a
++		 * reset-class exception on SH-4).
++		 */
++		page &= MMUPAGE_MASK;
+ 
+ 		local_irq_save(flags);
+ 		if (vma->vm_mm != current->mm) {
+@@ -47,7 +56,8 @@ void local_flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 		int size;
+ 
+ 		local_irq_save(flags);
+-		size = (end - start + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
++		/* Count/iterate in MMU pages: one UTLB entry per MMU page. */
++		size = (end - start + (MMUPAGE_SIZE - 1)) >> MMUPAGE_SHIFT;
+ 		if (size > (MMU_NTLB_ENTRIES/4)) { /* Too many TLB to flush */
+ 			cpu_context(cpu, mm) = NO_CONTEXT;
+ 			if (mm == current->mm)
+@@ -57,16 +67,16 @@ void local_flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 			unsigned long saved_asid = MMU_NO_ASID;
+ 
+ 			asid = cpu_asid(cpu, mm);
+-			start &= PAGE_MASK;
+-			end += (PAGE_SIZE - 1);
+-			end &= PAGE_MASK;
++			start &= MMUPAGE_MASK;
++			end += (MMUPAGE_SIZE - 1);
++			end &= MMUPAGE_MASK;
+ 			if (mm != current->mm) {
+ 				saved_asid = get_asid();
+ 				set_asid(asid);
+ 			}
+ 			while (start < end) {
+ 				local_flush_tlb_one(asid, start);
+-				start += PAGE_SIZE;
++				start += MMUPAGE_SIZE;
+ 			}
+ 			if (saved_asid != MMU_NO_ASID)
+ 				set_asid(saved_asid);
+@@ -82,7 +92,8 @@ void local_flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ 	int size;
+ 
+ 	local_irq_save(flags);
+-	size = (end - start + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
++	/* Count/iterate in MMU pages: one UTLB entry per MMU page. */
++	size = (end - start + (MMUPAGE_SIZE - 1)) >> MMUPAGE_SHIFT;
+ 	if (size > (MMU_NTLB_ENTRIES/4)) { /* Too many TLB to flush */
+ 		local_flush_tlb_all();
+ 	} else {
+@@ -90,13 +101,13 @@ void local_flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ 		unsigned long saved_asid = get_asid();
+ 
+ 		asid = cpu_asid(cpu, &init_mm);
+-		start &= PAGE_MASK;
+-		end += (PAGE_SIZE - 1);
+-		end &= PAGE_MASK;
++		start &= MMUPAGE_MASK;
++		end += (MMUPAGE_SIZE - 1);
++		end &= MMUPAGE_MASK;
+ 		set_asid(asid);
+ 		while (start < end) {
+ 			local_flush_tlb_one(asid, start);
+-			start += PAGE_SIZE;
++			start += MMUPAGE_SIZE;
+ 		}
+ 		set_asid(saved_asid);
+ 	}
+-- 
+2.54.0
+

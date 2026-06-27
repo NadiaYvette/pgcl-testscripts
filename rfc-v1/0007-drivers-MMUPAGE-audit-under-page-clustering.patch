@@ -1,0 +1,3343 @@
+From bea206313ad2f0222caa094ed3ad5a28a574a553 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:27 +0200
+Subject: [RFC PATCH 07/28] drivers: MMUPAGE audit under page clustering
+
+---
+ drivers/accel/habanalabs/common/memory_mgr.c  |  2 +-
+ drivers/acpi/osl.c                            | 32 ++++++---
+ drivers/acpi/tables.c                         | 13 +++-
+ drivers/block/ublk_drv.c                      |  2 +-
+ drivers/char/mem.c                            | 27 ++++++--
+ drivers/comedi/comedi_fops.c                  |  2 +-
+ drivers/firmware/efi/libstub/loongarch.c      | 12 +++-
+ .../firmware/efi/libstub/unaccepted_memory.c  |  2 +-
+ drivers/firmware/efi/libstub/x86-stub.c       |  4 +-
+ drivers/firmware/efi/mokvar-table.c           | 10 ++-
+ drivers/fpga/dfl-afu-main.c                   |  2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c      |  2 +-
+ drivers/gpu/drm/drm_gem.c                     | 23 +++++--
+ drivers/gpu/drm/drm_gem_shmem_helper.c        | 35 +++++++---
+ drivers/gpu/drm/gma500/fbdev.c                | 10 +--
+ drivers/gpu/drm/i915/display/intel_fb.c       |  2 +-
+ .../gpu/drm/i915/gem/i915_gem_execbuffer.c    | 10 +--
+ drivers/gpu/drm/i915/gem/i915_gem_internal.c  |  2 +-
+ drivers/gpu/drm/i915/gem/i915_gem_mman.c      | 32 ++++-----
+ drivers/gpu/drm/i915/gem/i915_gem_object.c    | 10 +--
+ drivers/gpu/drm/i915/gem/i915_gem_pages.c     | 10 +--
+ drivers/gpu/drm/i915/gem/i915_gem_stolen.c    | 14 ++--
+ drivers/gpu/drm/i915/gem/i915_gem_ttm.c       | 22 +++---
+ drivers/gpu/drm/i915/gt/gen8_ppgtt.c          | 16 ++---
+ drivers/gpu/drm/i915/gt/intel_engine_cs.c     |  2 +-
+ drivers/gpu/drm/i915/gt/intel_ggtt.c          |  2 +-
+ drivers/gpu/drm/i915/gt/intel_ggtt_fencing.c  |  2 +-
+ drivers/gpu/drm/i915/gt/intel_gtt.c           |  2 +-
+ drivers/gpu/drm/i915/gt/intel_gtt.h           |  2 +-
+ drivers/gpu/drm/i915/gt/intel_migrate.c       | 36 +++++-----
+ drivers/gpu/drm/i915/gvt/dmabuf.c             | 14 ++--
+ drivers/gpu/drm/i915/gvt/gtt.c                | 68 +++++++++----------
+ drivers/gpu/drm/i915/gvt/kvmgt.c              | 34 +++++-----
+ drivers/gpu/drm/i915/gvt/opregion.c           |  6 +-
+ drivers/gpu/drm/i915/gvt/scheduler.c          |  4 +-
+ drivers/gpu/drm/i915/i915_gem.c               | 22 +++---
+ drivers/gpu/drm/i915/i915_gpu_error.c         | 26 +++----
+ drivers/gpu/drm/i915/i915_mm.c                | 16 ++---
+ drivers/gpu/drm/i915/i915_scatterlist.c       |  8 +--
+ drivers/gpu/drm/i915/i915_scatterlist.h       |  8 +--
+ drivers/gpu/drm/i915/i915_ttm_buddy_manager.c | 38 +++++------
+ drivers/gpu/drm/i915/i915_vma.c               | 20 +++---
+ drivers/gpu/drm/i915/intel_memory_region.c    | 18 ++---
+ drivers/gpu/drm/i915/intel_region_ttm.c       | 12 ++--
+ drivers/gpu/drm/imagination/pvr_mmu.h         | 15 ++--
+ drivers/gpu/drm/panthor/panthor_device.c      |  4 +-
+ drivers/gpu/drm/panthor/panthor_drv.c         |  4 +-
+ drivers/gpu/drm/sysfb/ofdrm.c                 |  4 +-
+ drivers/gpu/drm/ttm/ttm_bo.c                  |  2 +-
+ drivers/gpu/drm/ttm/ttm_bo_vm.c               | 30 +++++---
+ drivers/gpu/drm/virtio/virtgpu_vram.c         |  2 +-
+ drivers/gpu/drm/xe/xe_bo.c                    | 10 ++-
+ drivers/gpu/drm/xe/xe_device.c                |  9 ++-
+ drivers/gpu/drm/xe/xe_mmio_gem.c              | 10 +--
+ drivers/hv/mshv_vtl_main.c                    |  4 +-
+ drivers/hv/ring_buffer.c                      |  2 +-
+ drivers/infiniband/hw/cxgb4/provider.c        |  2 +-
+ drivers/infiniband/hw/hfi1/file_ops.c         |  4 +-
+ .../infiniband/hw/ionic/ionic_controlpath.c   |  2 +-
+ drivers/infiniband/hw/ocrdma/ocrdma_verbs.c   |  4 +-
+ .../infiniband/hw/vmw_pvrdma/pvrdma_verbs.c   |  2 +-
+ drivers/infiniband/sw/rdmavt/mmap.c           |  2 +-
+ drivers/infiniband/sw/rxe/rxe_mmap.c          |  2 +-
+ drivers/iommu/iommufd/main.c                  |  2 +-
+ .../media/common/videobuf2/videobuf2-core.c   |  2 +-
+ .../media/platform/samsung/s5p-mfc/s5p_mfc.c  |  2 +-
+ drivers/media/v4l2-core/v4l2-mem2mem.c        |  2 +-
+ drivers/misc/genwqe/card_dev.c                |  2 +-
+ drivers/misc/ocxl/context.c                   |  6 +-
+ drivers/parisc/ccio-dma.c                     |  9 ++-
+ drivers/parisc/sba_iommu.c                    | 12 ++--
+ drivers/rapidio/devices/rio_mport_cdev.c      |  2 +-
+ drivers/s390/char/sclp.h                      |  6 +-
+ drivers/s390/char/sclp_cmd.c                  |  2 +-
+ drivers/s390/char/sclp_early.c                |  2 +-
+ drivers/s390/char/sclp_early_core.c           |  2 +-
+ drivers/sbus/char/flash.c                     |  6 +-
+ drivers/scsi/sg.c                             |  2 +-
+ drivers/staging/vme_user/vme.c                |  2 +-
+ drivers/usb/mon/mon_bin.c                     |  2 +-
+ drivers/vdpa/vdpa_user/iova_domain.c          |  2 +-
+ drivers/vfio/cdx/main.c                       |  4 +-
+ drivers/vfio/fsl-mc/vfio_fsl_mc.c             |  4 +-
+ .../vfio/pci/hisilicon/hisi_acc_vfio_pci.c    |  2 +-
+ drivers/vfio/pci/nvgrace-gpu/main.c           |  4 +-
+ drivers/vfio/pci/vfio_pci_core.c              |  4 +-
+ drivers/vfio/platform/vfio_platform_common.c  |  4 +-
+ drivers/vhost/vdpa.c                          |  2 +-
+ drivers/video/fbdev/aty/atyfb_base.c          |  2 +-
+ drivers/video/fbdev/core/fb_defio.c           |  4 +-
+ drivers/video/fbdev/efifb.c                   |  4 +-
+ drivers/video/fbdev/ep93xx-fb.c               |  2 +-
+ drivers/video/fbdev/gbefb.c                   |  2 +-
+ .../video/fbdev/omap2/omapfb/omapfb-main.c    |  2 +-
+ drivers/video/fbdev/ps3fb.c                   |  2 +-
+ drivers/video/fbdev/sa1100fb.c                |  2 +-
+ drivers/video/fbdev/sbuslib.c                 |  2 +-
+ drivers/video/fbdev/smscufx.c                 |  2 +-
+ drivers/video/fbdev/udlfb.c                   |  2 +-
+ drivers/xen/balloon.c                         |  4 +-
+ drivers/xen/gntalloc.c                        |  2 +-
+ drivers/xen/mem-reservation.c                 |  4 +-
+ 102 files changed, 495 insertions(+), 380 deletions(-)
+
+diff --git a/drivers/accel/habanalabs/common/memory_mgr.c b/drivers/accel/habanalabs/common/memory_mgr.c
+index 9fdd34acf389..43022c6e07bb 100644
+--- a/drivers/accel/habanalabs/common/memory_mgr.c
++++ b/drivers/accel/habanalabs/common/memory_mgr.c
+@@ -238,7 +238,7 @@ int hl_mem_mgr_mmap(struct hl_mem_mgr *mmg, struct vm_area_struct *vma,
+ 	/* We use the page offset to hold the idr and thus we need to clear
+ 	 * it before doing the mmap itself
+ 	 */
+-	handle = vma->vm_pgoff << PAGE_SHIFT;
++	handle = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	vma->vm_pgoff = 0;
+ 
+ 	/* Reference was taken here */
+diff --git a/drivers/acpi/osl.c b/drivers/acpi/osl.c
+index ed2162a97bd2..7b7a55f67e14 100644
+--- a/drivers/acpi/osl.c
++++ b/drivers/acpi/osl.c
+@@ -282,8 +282,24 @@ acpi_map_lookup_virt(void __iomem *virt, acpi_size size)
+ 	return NULL;
+ }
+ 
+-#if defined(CONFIG_ARM64) || defined(CONFIG_RISCV)
+-/* ioremap will take care of cache attributes */
++#if defined(CONFIG_ARM64) || defined(CONFIG_RISCV) || defined(CONFIG_LOONGARCH) || CONFIG_PAGE_MMUSHIFT > 0
++/*
++ * ioremap will take care of cache attributes (LoongArch uses the DMW
++ * direct-mapped window, ioremap is essentially free there).
++ *
++ * The kmap path is unsafe under PGCL (PAGE_MMUSHIFT > 0) on EVERY arch,
++ * not just the three above: struct page is PAGE-granular (one per
++ * PAGE_SIZE cluster), but acpi_map() derives an MMUPAGE-granular pfn
++ * (pg_off >> MMUPAGE_SHIFT) and feeds it to page_is_ram()/pfn_to_page()/
++ * kmap(), which all expect a PAGE pfn (pg_off >> PAGE_SHIFT).  The pfn is
++ * then PAGE_MMUCOUNT times too large, so page_is_ram() probes the wrong
++ * address (e.g. table at phys P is tested at P << PAGE_MMUSHIFT) and, when
++ * that happens to land in RAM on a large-memory machine, kmap() maps the
++ * wrong physical page and ACPI reads garbage (e.g. a bogus MCFG length ->
++ * runaway entry loop).  Small-RAM/QEMU configs dodge it by accident
++ * because P << PAGE_MMUSHIFT lands above RAM.  Route through ioremap under
++ * PGCL on all arches.  Identity (page_is_ram) when PAGE_MMUSHIFT == 0.
++ */
+ #define should_use_kmap(pfn)   0
+ #else
+ #define should_use_kmap(pfn)   page_is_ram(pfn)
+@@ -293,9 +309,9 @@ static void __iomem *acpi_map(acpi_physical_address pg_off, unsigned long pg_sz)
+ {
+ 	unsigned long pfn;
+ 
+-	pfn = pg_off >> PAGE_SHIFT;
++	pfn = pg_off >> MMUPAGE_SHIFT;
+ 	if (should_use_kmap(pfn)) {
+-		if (pg_sz > PAGE_SIZE)
++		if (pg_sz > MMUPAGE_SIZE)
+ 			return NULL;
+ 		return (void __iomem __force *)kmap(pfn_to_page(pfn));
+ 	} else
+@@ -306,7 +322,7 @@ static void acpi_unmap(acpi_physical_address pg_off, void __iomem *vaddr)
+ {
+ 	unsigned long pfn;
+ 
+-	pfn = pg_off >> PAGE_SHIFT;
++	pfn = pg_off >> MMUPAGE_SHIFT;
+ 	if (should_use_kmap(pfn))
+ 		kunmap(pfn_to_page(pfn));
+ 	else
+@@ -356,8 +372,8 @@ void __iomem __ref
+ 		return NULL;
+ 	}
+ 
+-	pg_off = round_down(phys, PAGE_SIZE);
+-	pg_sz = round_up(phys + size, PAGE_SIZE) - pg_off;
++	pg_off = round_down(phys, MMUPAGE_SIZE);
++	pg_sz = round_up(phys + size, MMUPAGE_SIZE) - pg_off;
+ 	virt = acpi_map(phys, size);
+ 	if (!virt) {
+ 		mutex_unlock(&acpi_ioremap_lock);
+@@ -366,7 +382,7 @@ void __iomem __ref
+ 	}
+ 
+ 	INIT_LIST_HEAD(&map->list);
+-	map->virt = (void __iomem __force *)((unsigned long)virt & PAGE_MASK);
++	map->virt = (void __iomem __force *)((unsigned long)virt & MMUPAGE_MASK);
+ 	map->phys = pg_off;
+ 	map->size = pg_sz;
+ 	map->track.refcount = 1;
+diff --git a/drivers/acpi/tables.c b/drivers/acpi/tables.c
+index 4286e4af1092..b7057d4b1ba4 100644
+--- a/drivers/acpi/tables.c
++++ b/drivers/acpi/tables.c
+@@ -416,7 +416,14 @@ static const char table_sigs[][ACPI_NAMESEG_SIZE] __nonstring_array __initconst
+ static struct cpio_data __initdata acpi_initrd_files[NR_ACPI_INITRD_TABLES];
+ static DECLARE_BITMAP(acpi_initrd_installed, NR_ACPI_INITRD_TABLES);
+ 
+-#define MAP_CHUNK_SIZE   (NR_FIX_BTMAPS << PAGE_SHIFT)
++/*
++ * early_memremap() is fixmap-backed: each of the NR_FIX_BTMAPS slots maps one
++ * MMUPAGE_SIZE hardware page, so the one-shot mappable window is sized in
++ * MMUPAGE units.  Using PAGE_SHIFT here would over-claim the window by
++ * PAGE_MMUCOUNT under page clustering and overflow the fixmap.  Identity when
++ * PAGE_MMUSHIFT == 0.
++ */
++#define MAP_CHUNK_SIZE   (NR_FIX_BTMAPS << MMUPAGE_SHIFT)
+ 
+ void __init acpi_table_upgrade(void)
+ {
+@@ -527,11 +534,11 @@ void __init acpi_table_upgrade(void)
+ 		total_offset += size;
+ 
+ 		while (size) {
+-			slop = dest_addr & ~PAGE_MASK;
++			slop = dest_addr & ~MMUPAGE_MASK;
+ 			clen = size;
+ 			if (clen > MAP_CHUNK_SIZE - slop)
+ 				clen = MAP_CHUNK_SIZE - slop;
+-			dest_p = early_memremap(dest_addr & PAGE_MASK,
++			dest_p = early_memremap(dest_addr & MMUPAGE_MASK,
+ 						clen + slop);
+ 			memcpy(dest_p + slop, src_p, clen);
+ 			early_memunmap(dest_p, clen + slop);
+diff --git a/drivers/block/ublk_drv.c b/drivers/block/ublk_drv.c
+index 6c041eaebdb9..058d185e10cc 100644
+--- a/drivers/block/ublk_drv.c
++++ b/drivers/block/ublk_drv.c
+@@ -2644,7 +2644,7 @@ static int ublk_ch_mmap(struct file *filp, struct vm_area_struct *vma)
+ 	struct ublk_device *ub = filp->private_data;
+ 	size_t sz = vma->vm_end - vma->vm_start;
+ 	unsigned max_sz = ublk_max_cmd_buf_size();
+-	unsigned long pfn, end, phys_off = vma->vm_pgoff << PAGE_SHIFT;
++	unsigned long pfn, end, phys_off = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	int q_id, ret = 0;
+ 
+ 	spin_lock(&ub->lock);
+diff --git a/drivers/char/mem.c b/drivers/char/mem.c
+index 5fd421e48c04..97797bbeb55a 100644
+--- a/drivers/char/mem.c
++++ b/drivers/char/mem.c
+@@ -331,37 +331,50 @@ static int mmap_mem_prepare(struct vm_area_desc *desc)
+ {
+ 	struct file *file = desc->file;
+ 	const size_t size = vma_desc_size(desc);
+-	const phys_addr_t offset = (phys_addr_t)desc->pgoff << PAGE_SHIFT;
++	/*
++	 * PGCL: desc->pgoff is MMUPAGE-granular, but the upstream APIs
++	 * here (valid_mmap_phys_addr_range, range_is_allowed,
++	 * phys_mem_access_prot, mmap_action_remap_full) expect PAGE-
++	 * granular PFNs (they shift by PAGE_SHIFT internally).  Require
++	 * the offset to be PAGE-aligned and convert.
++	 */
++	const unsigned long pfn = desc->pgoff >> PAGE_MMUSHIFT;
++	const phys_addr_t offset = (phys_addr_t)pfn << PAGE_SHIFT;
++
++#if PAGE_MMUSHIFT > 0
++	if (desc->pgoff & (PAGE_MMUCOUNT - 1))
++		return -EINVAL;
++#endif
+ 
+ 	/* Does it even fit in phys_addr_t? */
+-	if (offset >> PAGE_SHIFT != desc->pgoff)
++	if (offset >> PAGE_SHIFT != pfn)
+ 		return -EINVAL;
+ 
+ 	/* It's illegal to wrap around the end of the physical address space. */
+ 	if (offset + (phys_addr_t)size - 1 < offset)
+ 		return -EINVAL;
+ 
+-	if (!valid_mmap_phys_addr_range(desc->pgoff, size))
++	if (!valid_mmap_phys_addr_range(pfn, size))
+ 		return -EINVAL;
+ 
+ 	if (!private_mapping_ok(desc))
+ 		return -ENOSYS;
+ 
+-	if (!range_is_allowed(desc->pgoff, size))
++	if (!range_is_allowed(pfn, size))
+ 		return -EPERM;
+ 
+-	if (!phys_mem_access_prot_allowed(file, desc->pgoff, size,
++	if (!phys_mem_access_prot_allowed(file, pfn, size,
+ 					  &desc->page_prot))
+ 		return -EINVAL;
+ 
+-	desc->page_prot = phys_mem_access_prot(file, desc->pgoff,
++	desc->page_prot = phys_mem_access_prot(file, pfn,
+ 					       size,
+ 					       desc->page_prot);
+ 
+ 	desc->vm_ops = &mmap_mem_ops;
+ 
+ 	/* Remap-pfn-range will mark the range with the I/O flag. */
+-	mmap_action_remap_full(desc, desc->pgoff);
++	mmap_action_remap_full(desc, pfn);
+ 	/* We filter remap errors to -EAGAIN. */
+ 	desc->action.error_hook = mmap_filter_error;
+ 
+diff --git a/drivers/comedi/comedi_fops.c b/drivers/comedi/comedi_fops.c
+index c09bbe04be6c..a2e524ff2559 100644
+--- a/drivers/comedi/comedi_fops.c
++++ b/drivers/comedi/comedi_fops.c
+@@ -2462,7 +2462,7 @@ static int comedi_vm_access(struct vm_area_struct *vma, unsigned long addr,
+ {
+ 	struct comedi_buf_map *bm = vma->vm_private_data;
+ 	unsigned long offset =
+-	    addr - vma->vm_start + (vma->vm_pgoff << PAGE_SHIFT);
++	    addr - vma->vm_start + (vma->vm_pgoff << MMUPAGE_SHIFT);
+ 
+ 	if (len < 0)
+ 		return -EINVAL;
+diff --git a/drivers/firmware/efi/libstub/loongarch.c b/drivers/firmware/efi/libstub/loongarch.c
+index 2b0c87dc9908..3361b5aa3aa9 100644
+--- a/drivers/firmware/efi/libstub/loongarch.c
++++ b/drivers/firmware/efi/libstub/loongarch.c
+@@ -29,10 +29,20 @@ unsigned long efi_get_kimg_kaslr_address(void)
+ 
+ #ifdef CONFIG_RANDOMIZE_BASE
+ 	if (!efi_nokaslr) {
++		/*
++		 * Align KASLR offset to at least PAGE_SIZE; the percpu
++		 * setup BUGs on offset_in_page(__per_cpu_start), which a
++		 * sub-PAGE relocation would violate. With PGCL the kernel
++		 * PAGE_SIZE can exceed SZ_64K (e.g. 1 MB at PAGE_MMUSHIFT=6
++		 * with 16 KB MMU pages); the old SZ_64K alignment hung the
++		 * boot before the kernel banner.
++		 */
++		unsigned long align = max_t(unsigned long, SZ_64K, PAGE_SIZE);
++
+ 		efi_get_random_bytes(sizeof(random_offset), (u8 *)&random_offset);
+ 		random_offset ^= (random_get_entropy() << 16);
+ 		random_offset &= (CONFIG_RANDOMIZE_BASE_MAX_OFFSET - 1);
+-		random_offset = ALIGN(random_offset + SZ_64K, SZ_64K);
++		random_offset = ALIGN(random_offset + align, align);
+ 	}
+ #endif
+ 
+diff --git a/drivers/firmware/efi/libstub/unaccepted_memory.c b/drivers/firmware/efi/libstub/unaccepted_memory.c
+index 757dbe734a47..0afed7caeeee 100644
+--- a/drivers/firmware/efi/libstub/unaccepted_memory.c
++++ b/drivers/firmware/efi/libstub/unaccepted_memory.c
+@@ -35,7 +35,7 @@ efi_status_t allocate_unaccepted_bitmap(__u32 nr_desc,
+ 
+ 		unaccepted_start = min(unaccepted_start, d->phys_addr);
+ 		unaccepted_end = max(unaccepted_end,
+-				     d->phys_addr + d->num_pages * PAGE_SIZE);
++				     d->phys_addr + d->num_pages * EFI_PAGE_SIZE);
+ 	}
+ 
+ 	if (unaccepted_start == ULLONG_MAX)
+diff --git a/drivers/firmware/efi/libstub/x86-stub.c b/drivers/firmware/efi/libstub/x86-stub.c
+index cef32e2c82d8..ace586464bd6 100644
+--- a/drivers/firmware/efi/libstub/x86-stub.c
++++ b/drivers/firmware/efi/libstub/x86-stub.c
+@@ -634,7 +634,7 @@ setup_e820(struct boot_params *params, struct setup_data *e820ext, u32 e820ext_s
+ 				continue;
+ 			e820_type = E820_TYPE_RAM;
+ 			process_unaccepted_memory(d->phys_addr,
+-						  d->phys_addr + PAGE_SIZE * d->num_pages);
++						  d->phys_addr + EFI_PAGE_SIZE * d->num_pages);
+ 			break;
+ 		default:
+ 			continue;
+@@ -659,7 +659,7 @@ setup_e820(struct boot_params *params, struct setup_data *e820ext, u32 e820ext_s
+ 		}
+ 
+ 		entry->addr = d->phys_addr;
+-		entry->size = d->num_pages << PAGE_SHIFT;
++		entry->size = d->num_pages << EFI_PAGE_SHIFT;
+ 		entry->type = e820_type;
+ 		prev = entry++;
+ 		nr_entries++;
+diff --git a/drivers/firmware/efi/mokvar-table.c b/drivers/firmware/efi/mokvar-table.c
+index 6842aa96d704..a1ecba593994 100644
+--- a/drivers/firmware/efi/mokvar-table.c
++++ b/drivers/firmware/efi/mokvar-table.c
+@@ -161,11 +161,17 @@ void __init efi_mokvar_table_init(void)
+ 
+ 		/*
+ 		 * Don't bother remapping if the current entry header and the
+-		 * next one end on the same page.
++		 * next one end within the same early_memremap window.  That
++		 * window is fixmap-backed and therefore MMUPAGE_SIZE-granular,
++		 * so the "still mapped" test must use MMUPAGE_MASK, not
++		 * PAGE_MASK: under page clustering PAGE_SIZE spans several
++		 * MMUPAGEs, and two entries in the same PAGE but different
++		 * MMUPAGEs would otherwise skip the remap and fault on the
++		 * unmapped MMUPAGE.  Identity when PAGE_MMUSHIFT == 0.
+ 		 */
+ 		next_entry = (void *)((unsigned long)mokvar_entry + size);
+ 		if (((((unsigned long)(mokvar_entry + 1) - 1) ^
+-		      ((unsigned long)(next_entry + 1) - 1)) & PAGE_MASK) == 0) {
++		      ((unsigned long)(next_entry + 1) - 1)) & MMUPAGE_MASK) == 0) {
+ 			mokvar_entry = next_entry;
+ 			goto next;
+ 		}
+diff --git a/drivers/fpga/dfl-afu-main.c b/drivers/fpga/dfl-afu-main.c
+index 3bf8e7338dbe..11e36fb0a954 100644
+--- a/drivers/fpga/dfl-afu-main.c
++++ b/drivers/fpga/dfl-afu-main.c
+@@ -819,7 +819,7 @@ static int afu_mmap(struct file *filp, struct vm_area_struct *vma)
+ 
+ 	fdata = to_dfl_feature_dev_data(&pdev->dev);
+ 
+-	offset = vma->vm_pgoff << PAGE_SHIFT;
++	offset = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	ret = afu_mmio_region_get_by_offset(fdata, offset, size, &region);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index 8785f7810157..fe5431197bb2 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -3544,7 +3544,7 @@ static int kfd_mmap(struct file *filep, struct vm_area_struct *vma)
+ 	if (process->lead_thread != current->group_leader)
+ 		return -EBADF;
+ 
+-	mmap_offset = vma->vm_pgoff << PAGE_SHIFT;
++	mmap_offset = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	gpu_id = KFD_MMAP_GET_GPU_ID(mmap_offset);
+ 	if (gpu_id)
+ 		dev = kfd_device_by_id(gpu_id);
+diff --git a/drivers/gpu/drm/drm_gem.c b/drivers/gpu/drm/drm_gem.c
+index 3b2448a3a9de..74ff4def3619 100644
+--- a/drivers/gpu/drm/drm_gem.c
++++ b/drivers/gpu/drm/drm_gem.c
+@@ -188,6 +188,12 @@ int drm_gem_object_init(struct drm_device *dev, struct drm_gem_object *obj,
+ 	struct file *filp;
+ 	const vma_flags_t flags = mk_vma_flags(VMA_NORESERVE_BIT);
+ 
++	/*
++	 * PGCL: round up to the cluster up-front so the shmem backing below is
++	 * sized to agree with obj->size (see drm_gem_private_object_init).
++	 */
++	size = PAGE_ALIGN(size);
++
+ 	drm_gem_private_object_init(dev, obj, size);
+ 
+ 	huge_mnt = drm_gem_get_huge_mnt(dev);
+@@ -219,7 +225,16 @@ EXPORT_SYMBOL(drm_gem_object_init);
+ void drm_gem_private_object_init(struct drm_device *dev,
+ 				 struct drm_gem_object *obj, size_t size)
+ {
+-	BUG_ON((size & (PAGE_SIZE - 1)) != 0);
++	/*
++	 * PGCL: GEM objects are backed and accounted in PAGE_SIZE (cluster)
++	 * units -- there is one struct page per cluster, and the backing page
++	 * array, the LRU and the shrinker all use obj->size >> PAGE_SHIFT.
++	 * Callers size objects in MMUPAGE (hardware-page) units, which need not
++	 * be cluster-aligned (e.g. i915 internal scratch objects), so round up
++	 * to the cluster to keep those invariants consistent rather than BUG.
++	 * Identity when PAGE_MMUSHIFT == 0 (size is already PAGE-aligned).
++	 */
++	size = PAGE_ALIGN(size);
+ 
+ 	obj->dev = dev;
+ 	obj->filp = NULL;
+@@ -602,7 +617,7 @@ drm_gem_create_mmap_offset_size(struct drm_gem_object *obj, size_t size)
+ 	struct drm_device *dev = obj->dev;
+ 
+ 	return drm_vma_offset_add(dev->vma_offset_manager, &obj->vma_node,
+-				  size / PAGE_SIZE);
++				  size / MMUPAGE_SIZE);
+ }
+ EXPORT_SYMBOL(drm_gem_create_mmap_offset_size);
+ 
+@@ -1343,7 +1358,7 @@ unsigned long drm_gem_get_unmapped_area(struct file *filp, unsigned long uaddr,
+ 	struct drm_gem_object *obj;
+ 	unsigned long ret;
+ 
+-	obj = drm_gem_object_lookup_at_offset(filp, pgoff, len >> PAGE_SHIFT);
++	obj = drm_gem_object_lookup_at_offset(filp, pgoff, len >> MMUPAGE_SHIFT);
+ 	if (IS_ERR(obj))
+ 		obj = NULL;
+ 
+@@ -1385,7 +1400,7 @@ int drm_gem_mmap(struct file *filp, struct vm_area_struct *vma)
+ 		return PTR_ERR(obj);
+ 
+ 	ret = drm_gem_mmap_obj(obj,
+-			       drm_vma_node_size(&obj->vma_node) << PAGE_SHIFT,
++			       drm_vma_node_size(&obj->vma_node) << MMUPAGE_SHIFT,
+ 			       vma);
+ 
+ 	drm_gem_object_put(obj);
+diff --git a/drivers/gpu/drm/drm_gem_shmem_helper.c b/drivers/gpu/drm/drm_gem_shmem_helper.c
+index 545933c7f712..f50e095c4847 100644
+--- a/drivers/gpu/drm/drm_gem_shmem_helper.c
++++ b/drivers/gpu/drm/drm_gem_shmem_helper.c
+@@ -559,14 +559,15 @@ static void drm_gem_shmem_record_mkwrite(struct vm_fault *vmf)
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct drm_gem_object *obj = vma->vm_private_data;
+ 	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
+-	loff_t num_pages = obj->size >> PAGE_SHIFT;
+-	pgoff_t page_offset = vmf->pgoff - vma->vm_pgoff; /* page offset within VMA */
++	loff_t num_pages = obj->size >> PAGE_SHIFT;	/* clusters (struct pages) */
++	pgoff_t page_offset = vmf->pgoff - vma->vm_pgoff; /* MMUPAGE offset in VMA */
++	unsigned long cluster = page_offset >> PAGE_MMUSHIFT;
+ 
+-	if (drm_WARN_ON(obj->dev, !shmem->pages || page_offset >= num_pages))
++	if (drm_WARN_ON(obj->dev, !shmem->pages || cluster >= num_pages))
+ 		return;
+ 
+ 	file_update_time(vma->vm_file);
+-	folio_mark_dirty(page_folio(shmem->pages[page_offset]));
++	folio_mark_dirty(page_folio(shmem->pages[cluster]));
+ }
+ 
+ static vm_fault_t try_insert_pfn(struct vm_fault *vmf, unsigned int order,
+@@ -576,6 +577,15 @@ static vm_fault_t try_insert_pfn(struct vm_fault *vmf, unsigned int order,
+ 		return vmf_insert_pfn(vmf->vma, vmf->address, pfn);
+ #ifdef CONFIG_ARCH_SUPPORTS_PMD_PFNMAP
+ 	} else if (order == PMD_ORDER) {
++#if PAGE_MMUSHIFT
++		/*
++		 * PGCL: pfn is MMUPAGE-granular and the object is cluster-
++		 * backed; the huge-PMD pfnmap math below assumes a 1:1
++		 * page/pfn world.  Fall back to PTE faults, as the TTM fault
++		 * path does under clustering.
++		 */
++		return VM_FAULT_FALLBACK;
++#else
+ 		unsigned long paddr = pfn << PAGE_SHIFT;
+ 		bool aligned = (vmf->address & ~PMD_MASK) == (paddr & ~PMD_MASK);
+ 
+@@ -599,6 +609,7 @@ static vm_fault_t try_insert_pfn(struct vm_fault *vmf, unsigned int order,
+ 
+ 			return ret;
+ 		}
++#endif /* PAGE_MMUSHIFT */
+ #endif
+ 	}
+ 	return VM_FAULT_FALLBACK;
+@@ -610,10 +621,11 @@ static vm_fault_t drm_gem_shmem_any_fault(struct vm_fault *vmf, unsigned int ord
+ 	struct drm_gem_object *obj = vma->vm_private_data;
+ 	struct drm_device *dev = obj->dev;
+ 	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
+-	loff_t num_pages = obj->size >> PAGE_SHIFT;
++	loff_t num_pages = obj->size >> PAGE_SHIFT;	/* clusters (struct pages) */
+ 	vm_fault_t ret = VM_FAULT_SIGBUS;
+ 	struct page **pages = shmem->pages;
+-	pgoff_t page_offset = vmf->pgoff - vma->vm_pgoff; /* page offset within VMA */
++	pgoff_t page_offset = vmf->pgoff - vma->vm_pgoff; /* MMUPAGE offset in VMA */
++	unsigned long cluster = page_offset >> PAGE_MMUSHIFT;
+ 	struct page *page;
+ 	struct folio *folio;
+ 	unsigned long pfn;
+@@ -623,16 +635,21 @@ static vm_fault_t drm_gem_shmem_any_fault(struct vm_fault *vmf, unsigned int ord
+ 
+ 	dma_resv_lock(obj->resv, NULL);
+ 
+-	if (page_offset >= num_pages || drm_WARN_ON_ONCE(dev, !shmem->pages) ||
++	if (cluster >= num_pages || drm_WARN_ON_ONCE(dev, !shmem->pages) ||
+ 	    shmem->madv < 0)
+ 		goto out;
+ 
+-	page = pages[page_offset];
++	page = pages[cluster];
+ 	if (drm_WARN_ON_ONCE(dev, !page))
+ 		goto out;
+ 	folio = page_folio(page);
+ 
+-	pfn = page_to_pfn(page);
++	/*
++	 * PGCL: one struct page per cluster; vmf_insert_pfn() takes an
++	 * MMUPAGE-granular pfn, so shift the cluster pfn up and add the
++	 * sub-page (MMU page) index within the cluster (see ttm_bo_vm.c).
++	 */
++	pfn = (page_to_pfn(page) << PAGE_MMUSHIFT) + (page_offset & (PAGE_MMUCOUNT - 1));
+ 
+ 	ret = try_insert_pfn(vmf, order, pfn);
+ 	if (ret == VM_FAULT_NOPAGE)
+diff --git a/drivers/gpu/drm/gma500/fbdev.c b/drivers/gpu/drm/gma500/fbdev.c
+index d1e93588234f..b3a2fd5718d1 100644
+--- a/drivers/gpu/drm/gma500/fbdev.c
++++ b/drivers/gpu/drm/gma500/fbdev.c
+@@ -23,10 +23,10 @@ static vm_fault_t psb_fbdev_vm_fault(struct vm_fault *vmf)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct fb_info *info = vma->vm_private_data;
+-	unsigned long address = vmf->address - (vmf->pgoff << PAGE_SHIFT);
+-	unsigned long pfn = info->fix.smem_start >> PAGE_SHIFT;
++	unsigned long address = vmf->address - (vmf->pgoff << MMUPAGE_SHIFT);
++	unsigned long pfn = info->fix.smem_start >> MMUPAGE_SHIFT;
+ 	vm_fault_t err = VM_FAULT_SIGBUS;
+-	unsigned long page_num = vma_pages(vma);
++	unsigned long page_num = (vma->vm_end - vma->vm_start) >> MMUPAGE_SHIFT;
+ 	unsigned long i;
+ 
+ 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+@@ -35,7 +35,7 @@ static vm_fault_t psb_fbdev_vm_fault(struct vm_fault *vmf)
+ 		err = vmf_insert_mixed(vma, address, pfn);
+ 		if (unlikely(err & VM_FAULT_ERROR))
+ 			break;
+-		address += PAGE_SIZE;
++		address += MMUPAGE_SIZE;
+ 		++pfn;
+ 	}
+ 
+@@ -54,7 +54,7 @@ static int psb_fbdev_fb_mmap(struct fb_info *info, struct vm_area_struct *vma)
+ {
+ 	if (vma->vm_pgoff != 0)
+ 		return -EINVAL;
+-	if (vma->vm_pgoff > (~0UL >> PAGE_SHIFT))
++	if (vma->vm_pgoff > (~0UL >> MMUPAGE_SHIFT))
+ 		return -EINVAL;
+ 
+ 	/*
+diff --git a/drivers/gpu/drm/i915/display/intel_fb.c b/drivers/gpu/drm/i915/display/intel_fb.c
+index 5768619f840f..737ff999fc55 100644
+--- a/drivers/gpu/drm/i915/display/intel_fb.c
++++ b/drivers/gpu/drm/i915/display/intel_fb.c
+@@ -1639,7 +1639,7 @@ static void intel_fb_view_init(struct intel_display *display,
+ 
+ 	if (view_type == I915_GTT_VIEW_REMAPPED &&
+ 	    (display->platform.alderlake_p || DISPLAY_VER(display) >= 14))
+-		view->gtt.remapped.plane_alignment = SZ_2M / PAGE_SIZE;
++		view->gtt.remapped.plane_alignment = SZ_2M / MMUPAGE_SIZE;
+ }
+ 
+ bool intel_fb_supports_90_270_rotation(const struct intel_framebuffer *fb)
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+index 65ce54b20ec2..138321eb8b66 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+@@ -1169,7 +1169,7 @@ static void reloc_cache_remap(struct reloc_cache *cache,
+ 
+ 		offset = cache->node.start;
+ 		if (!drm_mm_node_allocated(&cache->node))
+-			offset += cache->page << PAGE_SHIFT;
++			offset += cache->page << MMUPAGE_SHIFT;
+ 
+ 		cache->vaddr = (unsigned long)
+ 			io_mapping_map_atomic_wc(&ggtt->iomap, offset);
+@@ -1301,7 +1301,7 @@ static void *reloc_iomap(struct i915_vma *batch,
+ 			mutex_lock(&ggtt->vm.mutex);
+ 			err = drm_mm_insert_node_in_range
+ 				(&ggtt->vm.mm, &cache->node,
+-				 PAGE_SIZE, 0, I915_COLOR_UNEVICTABLE,
++				 I915_GTT_PAGE_SIZE, 0, I915_COLOR_UNEVICTABLE,
+ 				 0, ggtt->mappable_end,
+ 				 DRM_MM_INSERT_LOW);
+ 			mutex_unlock(&ggtt->vm.mutex);
+@@ -1322,7 +1322,7 @@ static void *reloc_iomap(struct i915_vma *batch,
+ 							    I915_CACHE_NONE),
+ 				     0);
+ 	} else {
+-		offset += page << PAGE_SHIFT;
++		offset += page << MMUPAGE_SHIFT;
+ 	}
+ 
+ 	vaddr = (void __force *)io_mapping_map_atomic_wc(&ggtt->iomap,
+@@ -1388,12 +1388,12 @@ relocate_entry(struct i915_vma *vma,
+ 
+ repeat:
+ 	vaddr = reloc_vaddr(vma, eb,
+-			    offset >> PAGE_SHIFT);
++			    offset >> MMUPAGE_SHIFT);
+ 	if (IS_ERR(vaddr))
+ 		return PTR_ERR(vaddr);
+ 
+ 	GEM_BUG_ON(!IS_ALIGNED(offset, sizeof(u32)));
+-	clflush_write32(vaddr + offset_in_page(offset),
++	clflush_write32(vaddr + (offset & (MMUPAGE_SIZE - 1)),
+ 			lower_32_bits(target_addr),
+ 			eb->reloc_cache.vaddr);
+ 
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_internal.c b/drivers/gpu/drm/i915/gem/i915_gem_internal.c
+index 37d286ecb99b..16351ff55731 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_internal.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_internal.c
+@@ -144,7 +144,7 @@ __i915_gem_object_create_internal(struct drm_i915_private *i915,
+ 	unsigned int cache_level;
+ 
+ 	GEM_BUG_ON(!size);
+-	GEM_BUG_ON(!IS_ALIGNED(size, PAGE_SIZE));
++	GEM_BUG_ON(!IS_ALIGNED(size, MMUPAGE_SIZE));
+ 
+ 	if (overflows_type(size, obj->base.size))
+ 		return ERR_PTR(-E2BIG);
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_mman.c b/drivers/gpu/drm/i915/gem/i915_gem_mman.c
+index 0644f85c6c8e..c47cadf4d408 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_mman.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_mman.c
+@@ -131,7 +131,7 @@ i915_gem_mmap_ioctl(struct drm_device *dev, void *data,
+ 
+ static unsigned int tile_row_pages(const struct drm_i915_gem_object *obj)
+ {
+-	return i915_gem_object_get_tile_row_size(obj) >> PAGE_SHIFT;
++	return i915_gem_object_get_tile_row_size(obj) >> MMUPAGE_SHIFT;
+ }
+ 
+ /**
+@@ -210,10 +210,10 @@ compute_partial_view(const struct drm_i915_gem_object *obj,
+ 	view.partial.offset = rounddown(page_offset, chunk);
+ 	view.partial.size =
+ 		min_t(unsigned int, chunk,
+-		      (obj->base.size >> PAGE_SHIFT) - view.partial.offset);
++		      (obj->base.size >> MMUPAGE_SHIFT) - view.partial.offset);
+ 
+ 	/* If the partial covers the entire object, just create a normal VMA. */
+-	if (chunk >= obj->base.size >> PAGE_SHIFT)
++	if (chunk >= obj->base.size >> MMUPAGE_SHIFT)
+ 		view.type = I915_GTT_VIEW_NORMAL;
+ 
+ 	return view;
+@@ -306,12 +306,12 @@ static void set_address_limits(struct vm_area_struct *area,
+ 	long start, end; /* memory boundaries */
+ 
+ 	/*
+-	 * Let's move into the ">> PAGE_SHIFT"
++	 * Let's move into the ">> MMUPAGE_SHIFT"
+ 	 * domain to be sure not to lose bits
+ 	 */
+-	vm_start = area->vm_start >> PAGE_SHIFT;
+-	vm_end = area->vm_end >> PAGE_SHIFT;
+-	vma_size = vma->size >> PAGE_SHIFT;
++	vm_start = area->vm_start >> MMUPAGE_SHIFT;
++	vm_end = area->vm_end >> MMUPAGE_SHIFT;
++	vma_size = vma->size >> MMUPAGE_SHIFT;
+ 
+ 	/*
+ 	 * Calculate the memory boundaries by considering the offset
+@@ -326,18 +326,18 @@ static void set_address_limits(struct vm_area_struct *area,
+ 	start = max_t(long, start, vm_start);
+ 	end = min_t(long, end, vm_end);
+ 
+-	/* Let's move back into the "<< PAGE_SHIFT" domain */
+-	*start_vaddr = (unsigned long)start << PAGE_SHIFT;
+-	*end_vaddr = (unsigned long)end << PAGE_SHIFT;
++	/* Let's move back into the "<< MMUPAGE_SHIFT" domain */
++	*start_vaddr = (unsigned long)start << MMUPAGE_SHIFT;
++	*end_vaddr = (unsigned long)end << MMUPAGE_SHIFT;
+ 
+-	*pfn = (gmadr_start + i915_ggtt_offset(vma)) >> PAGE_SHIFT;
+-	*pfn += (*start_vaddr - area->vm_start) >> PAGE_SHIFT;
++	*pfn = (gmadr_start + i915_ggtt_offset(vma)) >> MMUPAGE_SHIFT;
++	*pfn += (*start_vaddr - area->vm_start) >> MMUPAGE_SHIFT;
+ 	*pfn += obj_offset - vma->gtt_view.partial.offset;
+ }
+ 
+ static vm_fault_t vm_fault_gtt(struct vm_fault *vmf)
+ {
+-#define MIN_CHUNK_PAGES (SZ_1M >> PAGE_SHIFT)
++#define MIN_CHUNK_PAGES (SZ_1M >> MMUPAGE_SHIFT)
+ 	struct vm_area_struct *area = vmf->vma;
+ 	struct i915_mmap_offset *mmo = area->vm_private_data;
+ 	struct drm_i915_gem_object *obj = mmo->obj;
+@@ -357,7 +357,7 @@ static vm_fault_t vm_fault_gtt(struct vm_fault *vmf)
+ 	int ret;
+ 
+ 	obj_offset = area->vm_pgoff - drm_vma_node_start(&mmo->vma_node);
+-	page_offset = (vmf->address - area->vm_start) >> PAGE_SHIFT;
++	page_offset = (vmf->address - area->vm_start) >> MMUPAGE_SHIFT;
+ 	page_offset += obj_offset;
+ 
+ 	trace_i915_gem_object_fault(obj, page_offset, true, write);
+@@ -739,7 +739,7 @@ mmap_offset_attach(struct drm_i915_gem_object *obj,
+ 	drm_vma_node_reset(&mmo->vma_node);
+ 
+ 	err = drm_vma_offset_add(obj->base.dev->vma_offset_manager,
+-				 &mmo->vma_node, obj->base.size / PAGE_SIZE);
++				 &mmo->vma_node, obj->base.size / MMUPAGE_SIZE);
+ 	if (likely(!err))
+ 		goto insert;
+ 
+@@ -751,7 +751,7 @@ mmap_offset_attach(struct drm_i915_gem_object *obj,
+ 
+ 	i915_gem_drain_freed_objects(i915);
+ 	err = drm_vma_offset_add(obj->base.dev->vma_offset_manager,
+-				 &mmo->vma_node, obj->base.size / PAGE_SIZE);
++				 &mmo->vma_node, obj->base.size / MMUPAGE_SIZE);
+ 	if (err)
+ 		goto err;
+ 
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object.c b/drivers/gpu/drm/i915/gem/i915_gem_object.c
+index 5172d3982654..dbaa0b90d665 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object.c
+@@ -492,16 +492,16 @@ i915_gem_object_read_from_page_kmap(struct drm_i915_gem_object *obj, u64 offset,
+ static void
+ i915_gem_object_read_from_page_iomap(struct drm_i915_gem_object *obj, u64 offset, void *dst, int size)
+ {
+-	pgoff_t idx = offset >> PAGE_SHIFT;
++	pgoff_t idx = offset >> MMUPAGE_SHIFT;
+ 	dma_addr_t dma = i915_gem_object_get_dma_address(obj, idx);
+ 	void __iomem *src_map;
+ 	void __iomem *src_ptr;
+ 
+ 	src_map = io_mapping_map_wc(&obj->mm.region->iomap,
+ 				    dma - obj->mm.region->region.start,
+-				    PAGE_SIZE);
++				    MMUPAGE_SIZE);
+ 
+-	src_ptr = src_map + offset_in_page(offset);
++	src_ptr = src_map + (offset & (MMUPAGE_SIZE - 1));
+ 	if (!i915_memcpy_from_wc(dst, (void __force *)src_ptr, size))
+ 		memcpy_fromio(dst, src_ptr, size);
+ 
+@@ -534,9 +534,9 @@ static bool object_has_mappable_iomem(struct drm_i915_gem_object *obj)
+  */
+ int i915_gem_object_read_from_page(struct drm_i915_gem_object *obj, u64 offset, void *dst, int size)
+ {
+-	GEM_BUG_ON(overflows_type(offset >> PAGE_SHIFT, pgoff_t));
++	GEM_BUG_ON(overflows_type(offset >> MMUPAGE_SHIFT, pgoff_t));
+ 	GEM_BUG_ON(offset >= obj->base.size);
+-	GEM_BUG_ON(offset_in_page(offset) > PAGE_SIZE - size);
++	GEM_BUG_ON((offset & (MMUPAGE_SIZE - 1)) > MMUPAGE_SIZE - size);
+ 	GEM_BUG_ON(!i915_gem_object_has_pinned_pages(obj));
+ 
+ 	if (i915_gem_object_has_struct_page(obj))
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_pages.c b/drivers/gpu/drm/i915/gem/i915_gem_pages.c
+index df35bdb755e4..de63c334088c 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_pages.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_pages.c
+@@ -334,7 +334,7 @@ static void *i915_gem_object_map_pfn(struct drm_i915_gem_object *obj,
+ {
+ 	resource_size_t iomap = obj->mm.region->iomap.base -
+ 		obj->mm.region->region.start;
+-	unsigned long n_pfn = obj->base.size >> PAGE_SHIFT;
++	unsigned long n_pfn = obj->base.size >> MMUPAGE_SHIFT;
+ 	unsigned long stack[32], *pfns = stack, i;
+ 	struct sgt_iter iter;
+ 	dma_addr_t addr;
+@@ -351,7 +351,7 @@ static void *i915_gem_object_map_pfn(struct drm_i915_gem_object *obj,
+ 
+ 	i = 0;
+ 	for_each_sgt_daddr(addr, iter, obj->mm.pages)
+-		pfns[i++] = (iomap + addr) >> PAGE_SHIFT;
++		pfns[i++] = (iomap + addr) >> MMUPAGE_SHIFT;
+ 	vaddr = vmap_pfn(pfns, n_pfn, pgprot_writecombine(PAGE_KERNEL_IO));
+ 	if (pfns != stack)
+ 		kvfree(pfns);
+@@ -654,7 +654,7 @@ __i915_gem_object_page_iter_get_sg(struct drm_i915_gem_object *obj,
+ 	struct scatterlist *sg;
+ 
+ 	might_sleep();
+-	GEM_BUG_ON(n >= obj->base.size >> PAGE_SHIFT);
++	GEM_BUG_ON(n >= obj->base.size >> (dma ? MMUPAGE_SHIFT : PAGE_SHIFT));
+ 	if (!i915_gem_object_has_pinned_pages(obj))
+ 		assert_object_held(obj);
+ 
+@@ -793,9 +793,9 @@ __i915_gem_object_get_dma_address_len(struct drm_i915_gem_object *obj,
+ 	sg = i915_gem_object_get_sg_dma(obj, n, &offset);
+ 
+ 	if (len)
+-		*len = sg_dma_len(sg) - (offset << PAGE_SHIFT);
++		*len = sg_dma_len(sg) - (offset << MMUPAGE_SHIFT);
+ 
+-	return sg_dma_address(sg) + (offset << PAGE_SHIFT);
++	return sg_dma_address(sg) + (offset << MMUPAGE_SHIFT);
+ }
+ 
+ dma_addr_t
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_stolen.c b/drivers/gpu/drm/i915/gem/i915_gem_stolen.c
+index 77f85359f279..c8389f811769 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_stolen.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_stolen.c
+@@ -605,7 +605,7 @@ static void dbg_poison(struct i915_ggtt *ggtt,
+ 	if (ggtt->vm.bind_async_flags & I915_VMA_GLOBAL_BIND)
+ 		return; /* beware stop_machine() inversion */
+ 
+-	GEM_BUG_ON(!IS_ALIGNED(size, PAGE_SIZE));
++	GEM_BUG_ON(!IS_ALIGNED(size, I915_GTT_PAGE_SIZE));
+ 
+ 	mutex_lock(&ggtt->error_mutex);
+ 	while (size) {
+@@ -620,15 +620,15 @@ static void dbg_poison(struct i915_ggtt *ggtt,
+ 
+ 		s = io_mapping_map_wc(&ggtt->iomap,
+ 				      ggtt->error_capture.start,
+-				      PAGE_SIZE);
+-		memset_io(s, x, PAGE_SIZE);
++				      I915_GTT_PAGE_SIZE);
++		memset_io(s, x, I915_GTT_PAGE_SIZE);
+ 		io_mapping_unmap(s);
+ 
+-		addr += PAGE_SIZE;
+-		size -= PAGE_SIZE;
++		addr += I915_GTT_PAGE_SIZE;
++		size -= I915_GTT_PAGE_SIZE;
+ 	}
+ 	mb();
+-	ggtt->vm.clear_range(&ggtt->vm, ggtt->error_capture.start, PAGE_SIZE);
++	ggtt->vm.clear_range(&ggtt->vm, ggtt->error_capture.start, I915_GTT_PAGE_SIZE);
+ 	mutex_unlock(&ggtt->error_mutex);
+ #endif
+ }
+@@ -1009,7 +1009,7 @@ i915_gem_stolen_smem_setup(struct drm_i915_private *i915, u16 type,
+ 	mem = intel_memory_region_create(i915,
+ 					 intel_graphics_stolen_res.start,
+ 					 resource_size(&intel_graphics_stolen_res),
+-					 PAGE_SIZE, 0, 0, type, instance,
++					 MMUPAGE_SIZE, 0, 0, type, instance,
+ 					 &i915_region_stolen_smem_ops);
+ 	if (IS_ERR(mem))
+ 		return mem;
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_ttm.c b/drivers/gpu/drm/i915/gem/i915_gem_ttm.c
+index df3fcc2b1248..3e31171c0f08 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_ttm.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_ttm.c
+@@ -140,17 +140,17 @@ i915_ttm_place_from_region(const struct intel_memory_region *mr,
+ 	if (flags & I915_BO_ALLOC_CONTIGUOUS)
+ 		place->flags |= TTM_PL_FLAG_CONTIGUOUS;
+ 	if (offset != I915_BO_INVALID_OFFSET) {
+-		WARN_ON(overflows_type(offset >> PAGE_SHIFT, place->fpfn));
+-		place->fpfn = offset >> PAGE_SHIFT;
+-		WARN_ON(overflows_type(place->fpfn + (size >> PAGE_SHIFT), place->lpfn));
+-		place->lpfn = place->fpfn + (size >> PAGE_SHIFT);
++		WARN_ON(overflows_type(offset >> MMUPAGE_SHIFT, place->fpfn));
++		place->fpfn = offset >> MMUPAGE_SHIFT;
++		WARN_ON(overflows_type(place->fpfn + (size >> MMUPAGE_SHIFT), place->lpfn));
++		place->lpfn = place->fpfn + (size >> MMUPAGE_SHIFT);
+ 	} else if (resource_size(&mr->io) && resource_size(&mr->io) < mr->total) {
+ 		if (flags & I915_BO_ALLOC_GPU_ONLY) {
+ 			place->flags |= TTM_PL_FLAG_TOPDOWN;
+ 		} else {
+ 			place->fpfn = 0;
+-			WARN_ON(overflows_type(resource_size(&mr->io) >> PAGE_SHIFT, place->lpfn));
+-			place->lpfn = resource_size(&mr->io) >> PAGE_SHIFT;
++			WARN_ON(overflows_type(resource_size(&mr->io) >> MMUPAGE_SHIFT, place->lpfn));
++			place->lpfn = resource_size(&mr->io) >> MMUPAGE_SHIFT;
+ 		}
+ 	}
+ }
+@@ -575,7 +575,7 @@ i915_ttm_resource_get_st(struct drm_i915_gem_object *obj,
+ 	if (!i915_ttm_gtt_binds_lmem(res))
+ 		return i915_ttm_tt_get_st(bo->ttm);
+ 
+-	page_alignment = bo->page_alignment << PAGE_SHIFT;
++	page_alignment = bo->page_alignment << MMUPAGE_SHIFT;
+ 	if (!page_alignment)
+ 		page_alignment = obj->mm.region->min_page_size;
+ 
+@@ -701,7 +701,7 @@ static unsigned long i915_ttm_io_mem_pfn(struct ttm_buffer_object *bo,
+ 	base = obj->mm.region->iomap.base - obj->mm.region->region.start;
+ 	sg = i915_gem_object_page_iter_get_sg(obj, &obj->ttm.get_io_page, page_offset, &ofs);
+ 
+-	return ((base + sg_dma_address(sg)) >> PAGE_SHIFT) + ofs;
++	return ((base + sg_dma_address(sg)) >> MMUPAGE_SHIFT) + ofs;
+ }
+ 
+ static int i915_ttm_access_memory(struct ttm_buffer_object *bo,
+@@ -711,7 +711,7 @@ static int i915_ttm_access_memory(struct ttm_buffer_object *bo,
+ 	struct drm_i915_gem_object *obj = i915_ttm_to_gem(bo);
+ 	resource_size_t iomap = obj->mm.region->iomap.base -
+ 		obj->mm.region->region.start;
+-	unsigned long page = offset >> PAGE_SHIFT;
++	unsigned long page = offset >> MMUPAGE_SHIFT;
+ 	unsigned long bytes_left = len;
+ 
+ 	/*
+@@ -722,9 +722,9 @@ static int i915_ttm_access_memory(struct ttm_buffer_object *bo,
+ 	if (!i915_ttm_resource_mappable(bo->resource))
+ 		return -EIO;
+ 
+-	offset -= page << PAGE_SHIFT;
++	offset -= page << MMUPAGE_SHIFT;
+ 	do {
+-		unsigned long bytes = min(bytes_left, PAGE_SIZE - offset);
++		unsigned long bytes = min(bytes_left, MMUPAGE_SIZE - offset);
+ 		void __iomem *ptr;
+ 		dma_addr_t daddr;
+ 
+diff --git a/drivers/gpu/drm/i915/gt/gen8_ppgtt.c b/drivers/gpu/drm/i915/gt/gen8_ppgtt.c
+index cfa09b250a1b..2023fb2fc85f 100644
+--- a/drivers/gpu/drm/i915/gt/gen8_ppgtt.c
++++ b/drivers/gpu/drm/i915/gt/gen8_ppgtt.c
+@@ -490,11 +490,11 @@ gen8_ppgtt_insert_pte(struct i915_ppgtt *ppgtt,
+ 				pd = pdp->entry[gen8_pd_index(idx, 2)];
+ 			}
+ 
+-			drm_clflush_virt_range(vaddr, PAGE_SIZE);
++			drm_clflush_virt_range(vaddr, I915_GTT_PAGE_SIZE);
+ 			vaddr = px_vaddr(i915_pt_entry(pd, gen8_pd_index(idx, 1)));
+ 		}
+ 	} while (1);
+-	drm_clflush_virt_range(vaddr, PAGE_SIZE);
++	drm_clflush_virt_range(vaddr, I915_GTT_PAGE_SIZE);
+ 
+ 	return idx;
+ }
+@@ -603,7 +603,7 @@ xehp_ppgtt_insert_huge(struct i915_address_space *vm,
+ 			}
+ 		} while (rem >= page_size && index < max);
+ 
+-		drm_clflush_virt_range(vaddr, PAGE_SIZE);
++		drm_clflush_virt_range(vaddr, I915_GTT_PAGE_SIZE);
+ 		vma_res->page_sizes_gtt |= page_size;
+ 	} while (iter->sg && sg_dma_len(iter->sg));
+ }
+@@ -687,7 +687,7 @@ static void gen8_ppgtt_insert_huge(struct i915_address_space *vm,
+ 			}
+ 		} while (rem >= page_size && index < I915_PDES);
+ 
+-		drm_clflush_virt_range(vaddr, PAGE_SIZE);
++		drm_clflush_virt_range(vaddr, I915_GTT_PAGE_SIZE);
+ 
+ 		/*
+ 		 * Is it safe to mark the 2M block as 64K? -- Either we have
+@@ -703,7 +703,7 @@ static void gen8_ppgtt_insert_huge(struct i915_address_space *vm,
+ 					      I915_GTT_PAGE_SIZE_2M)))) {
+ 			vaddr = px_vaddr(pd);
+ 			vaddr[maybe_64K] |= GEN8_PDE_IPS_64K;
+-			drm_clflush_virt_range(vaddr, PAGE_SIZE);
++			drm_clflush_virt_range(vaddr, I915_GTT_PAGE_SIZE);
+ 			page_size = I915_GTT_PAGE_SIZE_64K;
+ 
+ 			/*
+@@ -724,7 +724,7 @@ static void gen8_ppgtt_insert_huge(struct i915_address_space *vm,
+ 				for (i = 1; i < index; i += 16)
+ 					memset64(vaddr + i, encode, 15);
+ 
+-				drm_clflush_virt_range(vaddr, PAGE_SIZE);
++				drm_clflush_virt_range(vaddr, I915_GTT_PAGE_SIZE);
+ 			}
+ 		}
+ 
+@@ -965,11 +965,11 @@ static int gen8_init_rsvd(struct i915_address_space *vm)
+ 		return 0;
+ 
+ 	/* The memory will be used only by GPU. */
+-	obj = i915_gem_object_create_lmem(i915, PAGE_SIZE,
++	obj = i915_gem_object_create_lmem(i915, I915_GTT_PAGE_SIZE,
+ 					  I915_BO_ALLOC_VOLATILE |
+ 					  I915_BO_ALLOC_GPU_ONLY);
+ 	if (IS_ERR(obj))
+-		obj = i915_gem_object_create_internal(i915, PAGE_SIZE);
++		obj = i915_gem_object_create_internal(i915, I915_GTT_PAGE_SIZE);
+ 	if (IS_ERR(obj))
+ 		return PTR_ERR(obj);
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_engine_cs.c b/drivers/gpu/drm/i915/gt/intel_engine_cs.c
+index c0fd349a4600..6402f49fbc5f 100644
+--- a/drivers/gpu/drm/i915/gt/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/gt/intel_engine_cs.c
+@@ -275,7 +275,7 @@ u32 intel_engine_context_size(struct intel_gt *gt, u8 class)
+ 	struct intel_uncore *uncore = gt->uncore;
+ 	u32 cxt_size;
+ 
+-	BUILD_BUG_ON(I915_GTT_PAGE_SIZE != PAGE_SIZE);
++	BUILD_BUG_ON(I915_GTT_PAGE_SIZE != MMUPAGE_SIZE);
+ 
+ 	switch (class) {
+ 	case COMPUTE_CLASS:
+diff --git a/drivers/gpu/drm/i915/gt/intel_ggtt.c b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+index 08c4e735481b..9ff491db68c2 100644
+--- a/drivers/gpu/drm/i915/gt/intel_ggtt.c
++++ b/drivers/gpu/drm/i915/gt/intel_ggtt.c
+@@ -950,7 +950,7 @@ static int init_ggtt(struct i915_ggtt *ggtt)
+ 	}
+ 
+ 	/* And finally clear the reserved guard page */
+-	ggtt->vm.clear_range(&ggtt->vm, ggtt->vm.total - PAGE_SIZE, PAGE_SIZE);
++	ggtt->vm.clear_range(&ggtt->vm, ggtt->vm.total - I915_GTT_PAGE_SIZE, I915_GTT_PAGE_SIZE);
+ 
+ 	return 0;
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_ggtt_fencing.c b/drivers/gpu/drm/i915/gt/intel_ggtt_fencing.c
+index ac9aede82320..b6a7c2f05dbc 100644
+--- a/drivers/gpu/drm/i915/gt/intel_ggtt_fencing.c
++++ b/drivers/gpu/drm/i915/gt/intel_ggtt_fencing.c
+@@ -814,7 +814,7 @@ void
+ i915_gem_object_save_bit_17_swizzle(struct drm_i915_gem_object *obj,
+ 				    struct sg_table *pages)
+ {
+-	const unsigned int page_count = obj->base.size >> PAGE_SHIFT;
++	const unsigned int page_count = obj->base.size >> MMUPAGE_SHIFT;
+ 	struct sgt_iter sgt_iter;
+ 	struct page *page;
+ 	int i;
+diff --git a/drivers/gpu/drm/i915/gt/intel_gtt.c b/drivers/gpu/drm/i915/gt/intel_gtt.c
+index afbc5c769308..3f601ac9817f 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gtt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gtt.c
+@@ -340,7 +340,7 @@ fill_page_dma(struct drm_i915_gem_object *p, const u64 val, unsigned int count)
+ 	void *vaddr = __px_vaddr(p);
+ 
+ 	memset64(vaddr, val, count);
+-	drm_clflush_virt_range(vaddr, PAGE_SIZE);
++	drm_clflush_virt_range(vaddr, I915_GTT_PAGE_SIZE);
+ }
+ 
+ static void poison_scratch_page(struct drm_i915_gem_object *scratch)
+diff --git a/drivers/gpu/drm/i915/gt/intel_gtt.h b/drivers/gpu/drm/i915/gt/intel_gtt.h
+index b54ee4f25af1..8817e8a5d17a 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gtt.h
++++ b/drivers/gpu/drm/i915/gt/intel_gtt.h
+@@ -622,7 +622,7 @@ void i915_ggtt_resume(struct i915_ggtt *ggtt);
+ void
+ fill_page_dma(struct drm_i915_gem_object *p, const u64 val, unsigned int count);
+ 
+-#define fill_px(px, v) fill_page_dma(px_base(px), (v), PAGE_SIZE / sizeof(u64))
++#define fill_px(px, v) fill_page_dma(px_base(px), (v), I915_GTT_PAGE_SIZE / sizeof(u64))
+ #define fill32_px(px, v) do {						\
+ 	u64 v__ = lower_32_bits(v);					\
+ 	fill_px((px), v__ << 32 | v__);					\
+diff --git a/drivers/gpu/drm/i915/gt/intel_migrate.c b/drivers/gpu/drm/i915/gt/intel_migrate.c
+index aff5aca591e6..70ad5f2744fd 100644
+--- a/drivers/gpu/drm/i915/gt/intel_migrate.c
++++ b/drivers/gpu/drm/i915/gt/intel_migrate.c
+@@ -80,7 +80,7 @@ static void insert_pte(struct i915_address_space *vm,
+ 	vm->insert_page(vm, px_dma(pt), d->offset,
+ 			i915_gem_get_pat_index(vm->i915, I915_CACHE_NONE),
+ 			i915_gem_object_is_lmem(pt->base) ? PTE_LM : 0);
+-	d->offset += PAGE_SIZE;
++	d->offset += I915_GTT_PAGE_SIZE;
+ }
+ 
+ static struct i915_address_space *migrate_vm(struct intel_gt *gt)
+@@ -477,7 +477,7 @@ static int emit_pte(struct i915_request *rq,
+ 
+ static bool wa_1209644611_applies(int ver, u32 size)
+ {
+-	u32 height = size >> PAGE_SHIFT;
++	u32 height = size >> MMUPAGE_SHIFT;
+ 
+ 	if (ver != 11)
+ 		return false;
+@@ -591,33 +591,33 @@ static int emit_copy(struct i915_request *rq,
+ 
+ 	if (ver >= 9 && !wa_1209644611_applies(ver, size)) {
+ 		*cs++ = GEN9_XY_FAST_COPY_BLT_CMD | (10 - 2);
+-		*cs++ = BLT_DEPTH_32 | PAGE_SIZE;
++		*cs++ = BLT_DEPTH_32 | I915_GTT_PAGE_SIZE;
+ 		*cs++ = 0;
+-		*cs++ = size >> PAGE_SHIFT << 16 | PAGE_SIZE / 4;
++		*cs++ = size >> MMUPAGE_SHIFT << 16 | I915_GTT_PAGE_SIZE / 4;
+ 		*cs++ = dst_offset;
+ 		*cs++ = instance;
+ 		*cs++ = 0;
+-		*cs++ = PAGE_SIZE;
++		*cs++ = I915_GTT_PAGE_SIZE;
+ 		*cs++ = src_offset;
+ 		*cs++ = instance;
+ 	} else if (ver >= 8) {
+ 		*cs++ = XY_SRC_COPY_BLT_CMD | BLT_WRITE_RGBA | (10 - 2);
+-		*cs++ = BLT_DEPTH_32 | BLT_ROP_SRC_COPY | PAGE_SIZE;
++		*cs++ = BLT_DEPTH_32 | BLT_ROP_SRC_COPY | I915_GTT_PAGE_SIZE;
+ 		*cs++ = 0;
+-		*cs++ = size >> PAGE_SHIFT << 16 | PAGE_SIZE / 4;
++		*cs++ = size >> MMUPAGE_SHIFT << 16 | I915_GTT_PAGE_SIZE / 4;
+ 		*cs++ = dst_offset;
+ 		*cs++ = instance;
+ 		*cs++ = 0;
+-		*cs++ = PAGE_SIZE;
++		*cs++ = I915_GTT_PAGE_SIZE;
+ 		*cs++ = src_offset;
+ 		*cs++ = instance;
+ 	} else {
+ 		GEM_BUG_ON(instance);
+ 		*cs++ = SRC_COPY_BLT_CMD | BLT_WRITE_RGBA | (6 - 2);
+-		*cs++ = BLT_DEPTH_32 | BLT_ROP_SRC_COPY | PAGE_SIZE;
+-		*cs++ = size >> PAGE_SHIFT << 16 | PAGE_SIZE;
++		*cs++ = BLT_DEPTH_32 | BLT_ROP_SRC_COPY | I915_GTT_PAGE_SIZE;
++		*cs++ = size >> MMUPAGE_SHIFT << 16 | I915_GTT_PAGE_SIZE;
+ 		*cs++ = dst_offset;
+-		*cs++ = PAGE_SIZE;
++		*cs++ = I915_GTT_PAGE_SIZE;
+ 		*cs++ = src_offset;
+ 	}
+ 
+@@ -923,7 +923,7 @@ static int emit_clear(struct i915_request *rq, u32 offset, int size,
+ 	int ring_sz;
+ 	u32 *cs;
+ 
+-	GEM_BUG_ON(size >> PAGE_SHIFT > S16_MAX);
++	GEM_BUG_ON(size >> MMUPAGE_SHIFT > S16_MAX);
+ 
+ 	if (GRAPHICS_VER_FULL(i915) >= IP_VER(12, 55))
+ 		ring_sz = XY_FAST_COLOR_BLT_DW;
+@@ -940,9 +940,9 @@ static int emit_clear(struct i915_request *rq, u32 offset, int size,
+ 		*cs++ = XY_FAST_COLOR_BLT_CMD | XY_FAST_COLOR_BLT_DEPTH_32 |
+ 			(XY_FAST_COLOR_BLT_DW - 2);
+ 		*cs++ = FIELD_PREP(XY_FAST_COLOR_BLT_MOCS_MASK, mocs) |
+-			(PAGE_SIZE - 1);
++			(I915_GTT_PAGE_SIZE - 1);
+ 		*cs++ = 0;
+-		*cs++ = size >> PAGE_SHIFT << 16 | PAGE_SIZE / 4;
++		*cs++ = size >> MMUPAGE_SHIFT << 16 | I915_GTT_PAGE_SIZE / 4;
+ 		*cs++ = offset;
+ 		*cs++ = rq->engine->instance;
+ 		*cs++ = !is_lmem << XY_FAST_COLOR_BLT_MEM_TYPE_SHIFT;
+@@ -960,18 +960,18 @@ static int emit_clear(struct i915_request *rq, u32 offset, int size,
+ 		*cs++ = 0;
+ 	} else if (ver >= 8) {
+ 		*cs++ = XY_COLOR_BLT_CMD | BLT_WRITE_RGBA | (7 - 2);
+-		*cs++ = BLT_DEPTH_32 | BLT_ROP_COLOR_COPY | PAGE_SIZE;
++		*cs++ = BLT_DEPTH_32 | BLT_ROP_COLOR_COPY | I915_GTT_PAGE_SIZE;
+ 		*cs++ = 0;
+-		*cs++ = size >> PAGE_SHIFT << 16 | PAGE_SIZE / 4;
++		*cs++ = size >> MMUPAGE_SHIFT << 16 | I915_GTT_PAGE_SIZE / 4;
+ 		*cs++ = offset;
+ 		*cs++ = rq->engine->instance;
+ 		*cs++ = value;
+ 		*cs++ = MI_NOOP;
+ 	} else {
+ 		*cs++ = XY_COLOR_BLT_CMD | BLT_WRITE_RGBA | (6 - 2);
+-		*cs++ = BLT_DEPTH_32 | BLT_ROP_COLOR_COPY | PAGE_SIZE;
++		*cs++ = BLT_DEPTH_32 | BLT_ROP_COLOR_COPY | I915_GTT_PAGE_SIZE;
+ 		*cs++ = 0;
+-		*cs++ = size >> PAGE_SHIFT << 16 | PAGE_SIZE / 4;
++		*cs++ = size >> MMUPAGE_SHIFT << 16 | I915_GTT_PAGE_SIZE / 4;
+ 		*cs++ = offset;
+ 		*cs++ = value;
+ 	}
+diff --git a/drivers/gpu/drm/i915/gvt/dmabuf.c b/drivers/gpu/drm/i915/gvt/dmabuf.c
+index 8a1d6c5636c2..f879cb2b90c4 100644
+--- a/drivers/gpu/drm/i915/gvt/dmabuf.c
++++ b/drivers/gpu/drm/i915/gvt/dmabuf.c
+@@ -55,10 +55,10 @@ static int vgpu_gem_get_pages(struct drm_i915_gem_object *obj)
+ 	struct intel_vgpu_fb_info *fb_info;
+ 	unsigned int page_num; /* limited by sg_alloc_table */
+ 
+-	if (overflows_type(obj->base.size >> PAGE_SHIFT, page_num))
++	if (overflows_type(obj->base.size >> MMUPAGE_SHIFT, page_num))
+ 		return -E2BIG;
+ 
+-	page_num = obj->base.size >> PAGE_SHIFT;
++	page_num = obj->base.size >> MMUPAGE_SHIFT;
+ 	fb_info = (struct intel_vgpu_fb_info *)obj->gvt_info;
+ 	if (drm_WARN_ON(&dev_priv->drm, !fb_info))
+ 		return -ENODEV;
+@@ -77,7 +77,7 @@ static int vgpu_gem_get_pages(struct drm_i915_gem_object *obj)
+ 		return ret;
+ 	}
+ 	gtt_entries = (gen8_pte_t __iomem *)to_gt(dev_priv)->ggtt->gsm +
+-		(fb_info->start >> PAGE_SHIFT);
++		(fb_info->start >> MMUPAGE_SHIFT);
+ 	for_each_sg(st->sgl, sg, page_num, i) {
+ 		dma_addr_t dma_addr =
+ 			GEN8_DECODE_PTE(readq(&gtt_entries[i]));
+@@ -87,8 +87,8 @@ static int vgpu_gem_get_pages(struct drm_i915_gem_object *obj)
+ 		}
+ 
+ 		sg->offset = 0;
+-		sg->length = PAGE_SIZE;
+-		sg_dma_len(sg) = PAGE_SIZE;
++		sg->length = MMUPAGE_SIZE;
++		sg_dma_len(sg) = MMUPAGE_SIZE;
+ 		sg_dma_address(sg) = dma_addr;
+ 	}
+ 
+@@ -208,7 +208,7 @@ static struct drm_i915_gem_object *vgpu_create_gem(struct drm_device *dev,
+ 		return NULL;
+ 
+ 	drm_gem_private_object_init(dev, &obj->base,
+-		roundup(info->size, PAGE_SIZE));
++		roundup(info->size, MMUPAGE_SIZE));
+ 	i915_gem_object_init(obj, &intel_vgpu_gem_ops, &lock_class, 0);
+ 	i915_gem_object_set_readonly(obj);
+ 
+@@ -325,7 +325,7 @@ static int vgpu_get_plane_info(struct drm_device *dev,
+ 		return -EINVAL;
+ 	}
+ 
+-	if (info->start & (PAGE_SIZE - 1)) {
++	if (info->start & (MMUPAGE_SIZE - 1)) {
+ 		gvt_vgpu_err("Not aligned fb address:0x%llx\n", info->start);
+ 		return -EFAULT;
+ 	}
+diff --git a/drivers/gpu/drm/i915/gvt/gtt.c b/drivers/gpu/drm/i915/gvt/gtt.c
+index 5056a5887b31..876b1acb0406 100644
+--- a/drivers/gpu/drm/i915/gvt/gtt.c
++++ b/drivers/gpu/drm/i915/gvt/gtt.c
+@@ -304,13 +304,13 @@ static unsigned long gen8_gtt_get_pfn(struct intel_gvt_gtt_entry *e)
+ 	unsigned long pfn;
+ 
+ 	if (e->type == GTT_TYPE_PPGTT_PTE_1G_ENTRY)
+-		pfn = (e->val64 & ADDR_1G_MASK) >> PAGE_SHIFT;
++		pfn = (e->val64 & ADDR_1G_MASK) >> MMUPAGE_SHIFT;
+ 	else if (e->type == GTT_TYPE_PPGTT_PTE_2M_ENTRY)
+-		pfn = (e->val64 & ADDR_2M_MASK) >> PAGE_SHIFT;
++		pfn = (e->val64 & ADDR_2M_MASK) >> MMUPAGE_SHIFT;
+ 	else if (e->type == GTT_TYPE_PPGTT_PTE_64K_ENTRY)
+-		pfn = (e->val64 & ADDR_64K_MASK) >> PAGE_SHIFT;
++		pfn = (e->val64 & ADDR_64K_MASK) >> MMUPAGE_SHIFT;
+ 	else
+-		pfn = (e->val64 & ADDR_4K_MASK) >> PAGE_SHIFT;
++		pfn = (e->val64 & ADDR_4K_MASK) >> MMUPAGE_SHIFT;
+ 	return pfn;
+ }
+ 
+@@ -318,19 +318,19 @@ static void gen8_gtt_set_pfn(struct intel_gvt_gtt_entry *e, unsigned long pfn)
+ {
+ 	if (e->type == GTT_TYPE_PPGTT_PTE_1G_ENTRY) {
+ 		e->val64 &= ~ADDR_1G_MASK;
+-		pfn &= (ADDR_1G_MASK >> PAGE_SHIFT);
++		pfn &= (ADDR_1G_MASK >> MMUPAGE_SHIFT);
+ 	} else if (e->type == GTT_TYPE_PPGTT_PTE_2M_ENTRY) {
+ 		e->val64 &= ~ADDR_2M_MASK;
+-		pfn &= (ADDR_2M_MASK >> PAGE_SHIFT);
++		pfn &= (ADDR_2M_MASK >> MMUPAGE_SHIFT);
+ 	} else if (e->type == GTT_TYPE_PPGTT_PTE_64K_ENTRY) {
+ 		e->val64 &= ~ADDR_64K_MASK;
+-		pfn &= (ADDR_64K_MASK >> PAGE_SHIFT);
++		pfn &= (ADDR_64K_MASK >> MMUPAGE_SHIFT);
+ 	} else {
+ 		e->val64 &= ~ADDR_4K_MASK;
+-		pfn &= (ADDR_4K_MASK >> PAGE_SHIFT);
++		pfn &= (ADDR_4K_MASK >> MMUPAGE_SHIFT);
+ 	}
+ 
+-	e->val64 |= (pfn << PAGE_SHIFT);
++	e->val64 |= (pfn << MMUPAGE_SHIFT);
+ }
+ 
+ static bool gen8_gtt_test_pse(struct intel_gvt_gtt_entry *e)
+@@ -572,10 +572,10 @@ static void ggtt_set_host_entry(struct intel_vgpu_mm *mm,
+ 	GEM_BUG_ON(mm->type != INTEL_GVT_MM_GGTT);
+ 
+ 	if (vgpu_gmadr_is_aperture(mm->vgpu, index << I915_GTT_PAGE_SHIFT)) {
+-		offset -= (vgpu_aperture_gmadr_base(mm->vgpu) >> PAGE_SHIFT);
++		offset -= (vgpu_aperture_gmadr_base(mm->vgpu) >> MMUPAGE_SHIFT);
+ 		mm->ggtt_mm.host_ggtt_aperture[offset] = entry->val64;
+ 	} else if (vgpu_gmadr_is_hidden(mm->vgpu, index << I915_GTT_PAGE_SHIFT)) {
+-		offset -= (vgpu_hidden_gmadr_base(mm->vgpu) >> PAGE_SHIFT);
++		offset -= (vgpu_hidden_gmadr_base(mm->vgpu) >> MMUPAGE_SHIFT);
+ 		mm->ggtt_mm.host_ggtt_hidden[offset] = entry->val64;
+ 	}
+ 
+@@ -802,7 +802,7 @@ static struct intel_vgpu_ppgtt_spt *ppgtt_alloc_spt(
+ 	return spt;
+ 
+ err_unmap_dma:
+-	dma_unmap_page(kdev, daddr, PAGE_SIZE, DMA_BIDIRECTIONAL);
++	dma_unmap_page(kdev, daddr, 4096, DMA_BIDIRECTIONAL);
+ err_free_spt:
+ 	free_spt(spt);
+ 	return ERR_PTR(ret);
+@@ -932,7 +932,7 @@ static inline void ppgtt_invalidate_pte(struct intel_vgpu_ppgtt_spt *spt,
+ 	if (!pfn || pfn == vgpu->gtt.scratch_pt[type].page_mfn)
+ 		return;
+ 
+-	intel_gvt_dma_unmap_guest_page(vgpu, pfn << PAGE_SHIFT);
++	intel_gvt_dma_unmap_guest_page(vgpu, pfn << MMUPAGE_SHIFT);
+ }
+ 
+ static int ppgtt_invalidate_spt(struct intel_vgpu_ppgtt_spt *spt)
+@@ -1107,7 +1107,7 @@ static int split_2MB_gtt_entry(struct intel_vgpu *vgpu,
+ 
+ 	for_each_shadow_entry(sub_spt, &sub_se, sub_index) {
+ 		ret = intel_gvt_dma_map_guest_page(vgpu, start_gfn + sub_index,
+-						   PAGE_SIZE, &dma_addr);
++						   MMUPAGE_SIZE, &dma_addr);
+ 		if (ret)
+ 			goto err;
+ 		sub_se.val64 = se->val64;
+@@ -1116,7 +1116,7 @@ static int split_2MB_gtt_entry(struct intel_vgpu *vgpu,
+ 		sub_se.val64 &= ~_PAGE_PAT;
+ 		sub_se.val64 |= (se->val64 & _PAGE_PAT_LARGE) >> 5;
+ 
+-		ops->set_pfn(&sub_se, dma_addr >> PAGE_SHIFT);
++		ops->set_pfn(&sub_se, dma_addr >> MMUPAGE_SHIFT);
+ 		ppgtt_set_shadow_entry(sub_spt, &sub_se, sub_index);
+ 	}
+ 
+@@ -1162,11 +1162,11 @@ static int split_64KB_gtt_entry(struct intel_vgpu *vgpu,
+ 
+ 	for (i = 0; i < GTT_64K_PTE_STRIDE; i++) {
+ 		ret = intel_gvt_dma_map_guest_page(vgpu, start_gfn + i,
+-						   PAGE_SIZE, &dma_addr);
++						   MMUPAGE_SIZE, &dma_addr);
+ 		if (ret)
+ 			return ret;
+ 
+-		ops->set_pfn(&entry, dma_addr >> PAGE_SHIFT);
++		ops->set_pfn(&entry, dma_addr >> MMUPAGE_SHIFT);
+ 		ppgtt_set_shadow_entry(spt, &entry, index + i);
+ 	}
+ 	return 0;
+@@ -1190,7 +1190,7 @@ static int ppgtt_populate_shadow_entry(struct intel_vgpu *vgpu,
+ 	switch (ge->type) {
+ 	case GTT_TYPE_PPGTT_PTE_4K_ENTRY:
+ 		gvt_vdbg_mm("shadow 4K gtt entry\n");
+-		ret = intel_gvt_dma_map_guest_page(vgpu, gfn, PAGE_SIZE, &dma_addr);
++		ret = intel_gvt_dma_map_guest_page(vgpu, gfn, MMUPAGE_SIZE, &dma_addr);
+ 		if (ret)
+ 			return -ENXIO;
+ 		break;
+@@ -1218,7 +1218,7 @@ static int ppgtt_populate_shadow_entry(struct intel_vgpu *vgpu,
+ 	}
+ 
+ 	/* Successfully shadowed a 4K or 2M page (without splitting). */
+-	pte_ops->set_pfn(&se, dma_addr >> PAGE_SHIFT);
++	pte_ops->set_pfn(&se, dma_addr >> MMUPAGE_SHIFT);
+ 	ppgtt_set_shadow_entry(spt, &se, index);
+ 	return 0;
+ }
+@@ -1358,7 +1358,7 @@ static int sync_oos_page(struct intel_vgpu *vgpu,
+ 				info->gtt_entry_size_shift); index++) {
+ 		ops->get_entry(oos_page->mem, &old, index, false, 0, vgpu);
+ 		ops->get_entry(NULL, &new, index, true,
+-			       spt->guest_page.gfn << PAGE_SHIFT, vgpu);
++			       spt->guest_page.gfn << MMUPAGE_SHIFT, vgpu);
+ 
+ 		if (old.val64 == new.val64
+ 			&& !test_and_clear_bit(index, spt->post_shadow_bitmap))
+@@ -1636,7 +1636,7 @@ static int ppgtt_handle_guest_write_page_table_bytes(
+ 	unsigned long index;
+ 	int ret;
+ 
+-	index = (pa & (PAGE_SIZE - 1)) >> info->gtt_entry_size_shift;
++	index = (pa & (MMUPAGE_SIZE - 1)) >> info->gtt_entry_size_shift;
+ 
+ 	ppgtt_get_guest_entry(spt, &we, index);
+ 
+@@ -1860,14 +1860,14 @@ static struct intel_vgpu_mm *intel_vgpu_create_ggtt_mm(struct intel_vgpu *vgpu)
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
+-	mm->ggtt_mm.host_ggtt_aperture = vzalloc((vgpu_aperture_sz(vgpu) >> PAGE_SHIFT) * sizeof(u64));
++	mm->ggtt_mm.host_ggtt_aperture = vzalloc((vgpu_aperture_sz(vgpu) >> MMUPAGE_SHIFT) * sizeof(u64));
+ 	if (!mm->ggtt_mm.host_ggtt_aperture) {
+ 		vfree(mm->ggtt_mm.virtual_ggtt);
+ 		vgpu_free_mm(mm);
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
+-	mm->ggtt_mm.host_ggtt_hidden = vzalloc((vgpu_hidden_sz(vgpu) >> PAGE_SHIFT) * sizeof(u64));
++	mm->ggtt_mm.host_ggtt_hidden = vzalloc((vgpu_hidden_sz(vgpu) >> MMUPAGE_SHIFT) * sizeof(u64));
+ 	if (!mm->ggtt_mm.host_ggtt_hidden) {
+ 		vfree(mm->ggtt_mm.host_ggtt_aperture);
+ 		vfree(mm->ggtt_mm.virtual_ggtt);
+@@ -2139,7 +2139,7 @@ static void ggtt_invalidate_pte(struct intel_vgpu *vgpu,
+ 
+ 	pfn = pte_ops->get_pfn(entry);
+ 	if (pfn != vgpu->gvt->gtt.scratch_mfn)
+-		intel_gvt_dma_unmap_guest_page(vgpu, pfn << PAGE_SHIFT);
++		intel_gvt_dma_unmap_guest_page(vgpu, pfn << MMUPAGE_SHIFT);
+ }
+ 
+ static int emulate_ggtt_mmio_write(struct intel_vgpu *vgpu, unsigned int off,
+@@ -2222,7 +2222,7 @@ static int emulate_ggtt_mmio_write(struct intel_vgpu *vgpu, unsigned int off,
+ 		m.val64 = e.val64;
+ 		m.type = e.type;
+ 
+-		ret = intel_gvt_dma_map_guest_page(vgpu, gfn, PAGE_SIZE,
++		ret = intel_gvt_dma_map_guest_page(vgpu, gfn, MMUPAGE_SIZE,
+ 						   &dma_addr);
+ 		if (ret) {
+ 			gvt_vgpu_err("fail to populate guest ggtt entry\n");
+@@ -2232,7 +2232,7 @@ static int emulate_ggtt_mmio_write(struct intel_vgpu *vgpu, unsigned int off,
+ 			 */
+ 			ops->set_pfn(&m, gvt->gtt.scratch_mfn);
+ 		} else
+-			ops->set_pfn(&m, dma_addr >> PAGE_SHIFT);
++			ops->set_pfn(&m, dma_addr >> MMUPAGE_SHIFT);
+ 	} else {
+ 		ops->set_pfn(&m, gvt->gtt.scratch_mfn);
+ 		ops->clear_present(&m);
+@@ -2734,8 +2734,8 @@ void intel_vgpu_reset_ggtt(struct intel_vgpu *vgpu, bool invalidate_old)
+ 	pte_ops->set_pfn(&entry, gvt->gtt.scratch_mfn);
+ 	pte_ops->set_present(&entry);
+ 
+-	index = vgpu_aperture_gmadr_base(vgpu) >> PAGE_SHIFT;
+-	num_entries = vgpu_aperture_sz(vgpu) >> PAGE_SHIFT;
++	index = vgpu_aperture_gmadr_base(vgpu) >> MMUPAGE_SHIFT;
++	num_entries = vgpu_aperture_sz(vgpu) >> MMUPAGE_SHIFT;
+ 	while (num_entries--) {
+ 		if (invalidate_old) {
+ 			ggtt_get_host_entry(vgpu->gtt.ggtt_mm, &old_entry, index);
+@@ -2744,8 +2744,8 @@ void intel_vgpu_reset_ggtt(struct intel_vgpu *vgpu, bool invalidate_old)
+ 		ggtt_set_host_entry(vgpu->gtt.ggtt_mm, &entry, index++);
+ 	}
+ 
+-	index = vgpu_hidden_gmadr_base(vgpu) >> PAGE_SHIFT;
+-	num_entries = vgpu_hidden_sz(vgpu) >> PAGE_SHIFT;
++	index = vgpu_hidden_gmadr_base(vgpu) >> MMUPAGE_SHIFT;
++	num_entries = vgpu_hidden_sz(vgpu) >> MMUPAGE_SHIFT;
+ 	while (num_entries--) {
+ 		if (invalidate_old) {
+ 			ggtt_get_host_entry(vgpu->gtt.ggtt_mm, &old_entry, index);
+@@ -2777,16 +2777,16 @@ void intel_gvt_restore_ggtt(struct intel_gvt *gvt)
+ 	idr_for_each_entry(&(gvt)->vgpu_idr, vgpu, id) {
+ 		mm = vgpu->gtt.ggtt_mm;
+ 
+-		num_low = vgpu_aperture_sz(vgpu) >> PAGE_SHIFT;
+-		offset = vgpu_aperture_gmadr_base(vgpu) >> PAGE_SHIFT;
++		num_low = vgpu_aperture_sz(vgpu) >> MMUPAGE_SHIFT;
++		offset = vgpu_aperture_gmadr_base(vgpu) >> MMUPAGE_SHIFT;
+ 		for (idx = 0; idx < num_low; idx++) {
+ 			pte = mm->ggtt_mm.host_ggtt_aperture[idx];
+ 			if (pte & GEN8_PAGE_PRESENT)
+ 				write_pte64(vgpu->gvt->gt->ggtt, offset + idx, pte);
+ 		}
+ 
+-		num_hi = vgpu_hidden_sz(vgpu) >> PAGE_SHIFT;
+-		offset = vgpu_hidden_gmadr_base(vgpu) >> PAGE_SHIFT;
++		num_hi = vgpu_hidden_sz(vgpu) >> MMUPAGE_SHIFT;
++		offset = vgpu_hidden_gmadr_base(vgpu) >> MMUPAGE_SHIFT;
+ 		for (idx = 0; idx < num_hi; idx++) {
+ 			pte = mm->ggtt_mm.host_ggtt_hidden[idx];
+ 			if (pte & GEN8_PAGE_PRESENT)
+diff --git a/drivers/gpu/drm/i915/gvt/kvmgt.c b/drivers/gpu/drm/i915/gvt/kvmgt.c
+index ec62db5cc367..f7a10375e681 100644
+--- a/drivers/gpu/drm/i915/gvt/kvmgt.c
++++ b/drivers/gpu/drm/i915/gvt/kvmgt.c
+@@ -63,7 +63,7 @@ MODULE_IMPORT_NS("I915_GVT");
+ #define VFIO_PCI_INDEX_TO_OFFSET(index) ((u64)(index) << VFIO_PCI_OFFSET_SHIFT)
+ #define VFIO_PCI_OFFSET_MASK    (((u64)(1) << VFIO_PCI_OFFSET_SHIFT) - 1)
+ 
+-#define EDID_BLOB_OFFSET (PAGE_SIZE/2)
++#define EDID_BLOB_OFFSET (MMUPAGE_SIZE/2)
+ 
+ #define OPREGION_SIGNATURE "IntelGraphicsMem"
+ 
+@@ -129,15 +129,15 @@ static ssize_t intel_vgpu_show_description(struct mdev_type *mtype, char *buf)
+ static void gvt_unpin_guest_page(struct intel_vgpu *vgpu, unsigned long gfn,
+ 		unsigned long size)
+ {
+-	vfio_unpin_pages(&vgpu->vfio_device, gfn << PAGE_SHIFT,
+-			 DIV_ROUND_UP(size, PAGE_SIZE));
++	vfio_unpin_pages(&vgpu->vfio_device, gfn << MMUPAGE_SHIFT,
++			 DIV_ROUND_UP(size, MMUPAGE_SIZE));
+ }
+ 
+ /* Pin a normal or compound guest page for dma. */
+ static int gvt_pin_guest_page(struct intel_vgpu *vgpu, unsigned long gfn,
+ 		unsigned long size, struct page **page)
+ {
+-	int total_pages = DIV_ROUND_UP(size, PAGE_SIZE);
++	int total_pages = DIV_ROUND_UP(size, MMUPAGE_SIZE);
+ 	struct page *base_page = NULL;
+ 	int npage;
+ 	int ret;
+@@ -147,7 +147,7 @@ static int gvt_pin_guest_page(struct intel_vgpu *vgpu, unsigned long gfn,
+ 	 * on stack to hold pfns.
+ 	 */
+ 	for (npage = 0; npage < total_pages; npage++) {
+-		dma_addr_t cur_iova = (gfn + npage) << PAGE_SHIFT;
++		dma_addr_t cur_iova = (gfn + npage) << MMUPAGE_SHIFT;
+ 		struct page *cur_page;
+ 
+ 		ret = vfio_pin_pages(&vgpu->vfio_device, cur_iova, 1,
+@@ -171,7 +171,7 @@ static int gvt_pin_guest_page(struct intel_vgpu *vgpu, unsigned long gfn,
+ 	return 0;
+ err:
+ 	if (npage)
+-		gvt_unpin_guest_page(vgpu, gfn, npage * PAGE_SIZE);
++		gvt_unpin_guest_page(vgpu, gfn, npage * MMUPAGE_SIZE);
+ 	return ret;
+ }
+ 
+@@ -623,8 +623,8 @@ static void intel_vgpu_dma_unmap(struct vfio_device *vfio_dev, u64 iova,
+ {
+ 	struct intel_vgpu *vgpu = vfio_dev_to_vgpu(vfio_dev);
+ 	struct gvt_dma *entry;
+-	u64 iov_pfn = iova >> PAGE_SHIFT;
+-	u64 end_iov_pfn = iov_pfn + length / PAGE_SIZE;
++	u64 iov_pfn = iova >> MMUPAGE_SHIFT;
++	u64 end_iov_pfn = iov_pfn + length / MMUPAGE_SIZE;
+ 
+ 	mutex_lock(&vgpu->cache_lock);
+ 	for (; iov_pfn < end_iov_pfn; iov_pfn++) {
+@@ -782,15 +782,15 @@ static int intel_vgpu_aperture_rw(struct intel_vgpu *vgpu, u64 off,
+ 	}
+ 
+ 	aperture_va = io_mapping_map_wc(&vgpu->gvt->gt->ggtt->iomap,
+-					ALIGN_DOWN(off, PAGE_SIZE),
+-					count + offset_in_page(off));
++					ALIGN_DOWN(off, MMUPAGE_SIZE),
++					count + (off & (MMUPAGE_SIZE - 1)));
+ 	if (!aperture_va)
+ 		return -EIO;
+ 
+ 	if (is_write)
+-		memcpy_toio(aperture_va + offset_in_page(off), buf, count);
++		memcpy_toio(aperture_va + (off & (MMUPAGE_SIZE - 1)), buf, count);
+ 	else
+-		memcpy_fromio(buf, aperture_va + offset_in_page(off), count);
++		memcpy_fromio(buf, aperture_va + (off & (MMUPAGE_SIZE - 1)), count);
+ 
+ 	io_mapping_unmap(aperture_va);
+ 
+@@ -1020,7 +1020,7 @@ static int intel_vgpu_mmap(struct vfio_device *vfio_dev,
+ 	unsigned long req_size, pgoff, req_start;
+ 	pgprot_t pg_prot;
+ 
+-	index = vma->vm_pgoff >> (VFIO_PCI_OFFSET_SHIFT - PAGE_SHIFT);
++	index = vma->vm_pgoff >> (VFIO_PCI_OFFSET_SHIFT - MMUPAGE_SHIFT);
+ 	if (index >= VFIO_PCI_ROM_REGION_INDEX)
+ 		return -EINVAL;
+ 
+@@ -1035,8 +1035,8 @@ static int intel_vgpu_mmap(struct vfio_device *vfio_dev,
+ 	virtaddr = vma->vm_start;
+ 	req_size = vma->vm_end - vma->vm_start;
+ 	pgoff = vma->vm_pgoff &
+-		((1U << (VFIO_PCI_OFFSET_SHIFT - PAGE_SHIFT)) - 1);
+-	req_start = pgoff << PAGE_SHIFT;
++		((1U << (VFIO_PCI_OFFSET_SHIFT - MMUPAGE_SHIFT)) - 1);
++	req_start = pgoff << MMUPAGE_SHIFT;
+ 
+ 	if (!intel_vgpu_in_aperture(vgpu, req_start))
+ 		return -EINVAL;
+@@ -1044,7 +1044,7 @@ static int intel_vgpu_mmap(struct vfio_device *vfio_dev,
+ 	    vgpu_aperture_offset(vgpu) + vgpu_aperture_sz(vgpu))
+ 		return -EINVAL;
+ 
+-	pgoff = (gvt_aperture_pa_base(vgpu->gvt) >> PAGE_SHIFT) + pgoff;
++	pgoff = (gvt_aperture_pa_base(vgpu->gvt) >> MMUPAGE_SHIFT) + pgoff;
+ 
+ 	return remap_pfn_range(vma, virtaddr, pgoff, req_size, pg_prot);
+ }
+@@ -1566,7 +1566,7 @@ static void kvmgt_page_track_write(gpa_t gpa, const u8 *val, int len,
+ 
+ 	mutex_lock(&info->vgpu_lock);
+ 
+-	if (kvmgt_gfn_is_write_protected(info, gpa >> PAGE_SHIFT))
++	if (kvmgt_gfn_is_write_protected(info, gpa >> MMUPAGE_SHIFT))
+ 		intel_vgpu_page_track_handler(info, gpa,
+ 						     (void *)val, len);
+ 
+diff --git a/drivers/gpu/drm/i915/gvt/opregion.c b/drivers/gpu/drm/i915/gvt/opregion.c
+index d6e76ba31d60..731381845954 100644
+--- a/drivers/gpu/drm/i915/gvt/opregion.c
++++ b/drivers/gpu/drm/i915/gvt/opregion.c
+@@ -274,7 +274,7 @@ int intel_vgpu_opregion_base_write_handler(struct intel_vgpu *vgpu, u32 gpa)
+ 	gvt_dbg_core("emulate opregion from kernel\n");
+ 
+ 	for (i = 0; i < INTEL_GVT_OPREGION_PAGES; i++)
+-		vgpu_opregion(vgpu)->gfn[i] = (gpa >> PAGE_SHIFT) + i;
++		vgpu_opregion(vgpu)->gfn[i] = (gpa >> MMUPAGE_SHIFT) + i;
+ 	return 0;
+ }
+ 
+@@ -419,9 +419,9 @@ int intel_vgpu_emulate_opregion_request(struct intel_vgpu *vgpu, u32 swsci)
+ 	u64 scic_pa = 0, parm_pa = 0;
+ 	int ret;
+ 
+-	scic_pa = (vgpu_opregion(vgpu)->gfn[0] << PAGE_SHIFT) +
++	scic_pa = (vgpu_opregion(vgpu)->gfn[0] << MMUPAGE_SHIFT) +
+ 				INTEL_GVT_OPREGION_SCIC;
+-	parm_pa = (vgpu_opregion(vgpu)->gfn[0] << PAGE_SHIFT) +
++	parm_pa = (vgpu_opregion(vgpu)->gfn[0] << MMUPAGE_SHIFT) +
+ 				INTEL_GVT_OPREGION_PARM;
+ 	ret = intel_gvt_read_gpa(vgpu, scic_pa, &scic, sizeof(scic));
+ 	if (ret) {
+diff --git a/drivers/gpu/drm/i915/gvt/scheduler.c b/drivers/gpu/drm/i915/gvt/scheduler.c
+index 15fdd514ca83..a6cb00f79720 100644
+--- a/drivers/gpu/drm/i915/gvt/scheduler.c
++++ b/drivers/gpu/drm/i915/gvt/scheduler.c
+@@ -221,7 +221,7 @@ static int populate_shadow_context(struct intel_vgpu_workload *workload)
+ 
+ 	s->last_ctx[ring_id].valid = false;
+ 	context_page_num = workload->engine->context_size;
+-	context_page_num = context_page_num >> PAGE_SHIFT;
++	context_page_num = context_page_num >> MMUPAGE_SHIFT;
+ 
+ 	if (IS_BROADWELL(gvt->gt->i915) && workload->engine->id == RCS0)
+ 		context_page_num = 19;
+@@ -981,7 +981,7 @@ static void update_guest_context(struct intel_vgpu_workload *workload)
+ 	vgpu_vreg_t(vgpu, RING_HEAD(ring_base)) = head;
+ 
+ 	context_page_num = rq->engine->context_size;
+-	context_page_num = context_page_num >> PAGE_SHIFT;
++	context_page_num = context_page_num >> MMUPAGE_SHIFT;
+ 
+ 	if (IS_BROADWELL(rq->i915) && rq->engine->id == RCS0)
+ 		context_page_num = 19;
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index a432daf8038a..d09b29d9dcf6 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -290,7 +290,7 @@ gtt_user_read(struct io_mapping *mapping,
+ 					    length);
+ 	io_mapping_unmap_atomic(vaddr);
+ 	if (unwritten) {
+-		vaddr = io_mapping_map_wc(mapping, base, PAGE_SIZE);
++		vaddr = io_mapping_map_wc(mapping, base, I915_GTT_PAGE_SIZE);
+ 		unwritten = copy_to_user(user_data,
+ 					 (void __force *)vaddr + offset,
+ 					 length);
+@@ -332,7 +332,7 @@ static struct i915_vma *i915_gem_gtt_prepare(struct drm_i915_gem_object *obj,
+ 		node->start = i915_ggtt_offset(vma);
+ 		node->flags = 0;
+ 	} else {
+-		ret = insert_mappable_node(ggtt, node, PAGE_SIZE);
++		ret = insert_mappable_node(ggtt, node, I915_GTT_PAGE_SIZE);
+ 		if (ret)
+ 			goto err_ww;
+ 		GEM_BUG_ON(!drm_mm_node_allocated(node));
+@@ -413,18 +413,18 @@ i915_gem_gtt_pread(struct drm_i915_gem_object *obj,
+ 		 * page_length = bytes to copy for this page
+ 		 */
+ 		u32 page_base = node.start;
+-		unsigned page_offset = offset_in_page(offset);
+-		unsigned page_length = PAGE_SIZE - page_offset;
++		unsigned page_offset = offset & (MMUPAGE_SIZE - 1);
++		unsigned page_length = MMUPAGE_SIZE - page_offset;
+ 		page_length = remain < page_length ? remain : page_length;
+ 		if (drm_mm_node_allocated(&node)) {
+ 			ggtt->vm.insert_page(&ggtt->vm,
+ 					     i915_gem_object_get_dma_address(obj,
+-									     offset >> PAGE_SHIFT),
++									     offset >> MMUPAGE_SHIFT),
+ 					     node.start,
+ 					     i915_gem_get_pat_index(i915,
+ 								    I915_CACHE_NONE), 0);
+ 		} else {
+-			page_base += offset & PAGE_MASK;
++			page_base += offset & MMUPAGE_MASK;
+ 		}
+ 
+ 		if (gtt_user_read(&ggtt->iomap, page_base, page_offset,
+@@ -524,7 +524,7 @@ ggtt_write(struct io_mapping *mapping,
+ 						      user_data, length);
+ 	io_mapping_unmap_atomic(vaddr);
+ 	if (unwritten) {
+-		vaddr = io_mapping_map_wc(mapping, base, PAGE_SIZE);
++		vaddr = io_mapping_map_wc(mapping, base, I915_GTT_PAGE_SIZE);
+ 		unwritten = copy_from_user((void __force *)vaddr + offset,
+ 					   user_data, length);
+ 		io_mapping_unmap(vaddr);
+@@ -592,21 +592,21 @@ i915_gem_gtt_pwrite_fast(struct drm_i915_gem_object *obj,
+ 		 * page_length = bytes to copy for this page
+ 		 */
+ 		u32 page_base = node.start;
+-		unsigned int page_offset = offset_in_page(offset);
+-		unsigned int page_length = PAGE_SIZE - page_offset;
++		unsigned int page_offset = offset & (MMUPAGE_SIZE - 1);
++		unsigned int page_length = MMUPAGE_SIZE - page_offset;
+ 		page_length = remain < page_length ? remain : page_length;
+ 		if (drm_mm_node_allocated(&node)) {
+ 			/* flush the write before we modify the GGTT */
+ 			intel_gt_flush_ggtt_writes(ggtt->vm.gt);
+ 			ggtt->vm.insert_page(&ggtt->vm,
+ 					     i915_gem_object_get_dma_address(obj,
+-									     offset >> PAGE_SHIFT),
++									     offset >> MMUPAGE_SHIFT),
+ 					     node.start,
+ 					     i915_gem_get_pat_index(i915,
+ 								    I915_CACHE_NONE), 0);
+ 			wmb(); /* flush modifications to the GGTT (insert_page) */
+ 		} else {
+-			page_base += offset & PAGE_MASK;
++			page_base += offset & MMUPAGE_MASK;
+ 		}
+ 		/* If we get a fault while copying data, then (presumably) our
+ 		 * source page isn't available.  Return the error and we'll
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index 5353a9c66694..4dcfba98f852 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -301,14 +301,14 @@ static void *compress_next_page(struct i915_vma_compress *c,
+ static int compress_page(struct i915_vma_compress *c,
+ 			 void *src,
+ 			 struct i915_vma_coredump *dst,
+-			 bool wc)
++			 bool wc, unsigned long size)
+ {
+ 	struct z_stream_s *zstream = &c->zstream;
+ 
+ 	zstream->next_in = src;
+-	if (wc && c->tmp && i915_memcpy_from_wc(c->tmp, src, PAGE_SIZE))
++	if (wc && c->tmp && i915_memcpy_from_wc(c->tmp, src, size))
+ 		zstream->next_in = c->tmp;
+-	zstream->avail_in = PAGE_SIZE;
++	zstream->avail_in = size;
+ 
+ 	do {
+ 		if (zstream->avail_out == 0) {
+@@ -398,7 +398,7 @@ static bool compress_start(struct i915_vma_compress *c)
+ static int compress_page(struct i915_vma_compress *c,
+ 			 void *src,
+ 			 struct i915_vma_coredump *dst,
+-			 bool wc)
++			 bool wc, unsigned long size)
+ {
+ 	void *ptr;
+ 
+@@ -406,8 +406,8 @@ static int compress_page(struct i915_vma_compress *c,
+ 	if (!ptr)
+ 		return -ENOMEM;
+ 
+-	if (!(wc && i915_memcpy_from_wc(ptr, src, PAGE_SIZE)))
+-		memcpy(ptr, src, PAGE_SIZE);
++	if (!(wc && i915_memcpy_from_wc(ptr, src, size)))
++		memcpy(ptr, src, size);
+ 	list_add_tail(&virt_to_page(ptr)->lru, &dst->page_list);
+ 	cond_resched();
+ 
+@@ -1189,14 +1189,14 @@ i915_vma_coredump_create(const struct intel_gt *gt,
+ 						     0);
+ 			mb();
+ 
+-			s = io_mapping_map_wc(&ggtt->iomap, slot, PAGE_SIZE);
++			s = io_mapping_map_wc(&ggtt->iomap, slot, I915_GTT_PAGE_SIZE);
+ 			ret = compress_page(compress,
+ 					    (void  __force *)s, dst,
+-					    true);
++					    true, I915_GTT_PAGE_SIZE);
+ 			io_mapping_unmap(s);
+ 
+ 			mb();
+-			ggtt->vm.clear_range(&ggtt->vm, slot, PAGE_SIZE);
++			ggtt->vm.clear_range(&ggtt->vm, slot, I915_GTT_PAGE_SIZE);
+ 			mutex_unlock(&ggtt->error_mutex);
+ 			if (ret)
+ 				break;
+@@ -1209,15 +1209,15 @@ i915_vma_coredump_create(const struct intel_gt *gt,
+ 			dma_addr_t offset = dma - mem->region.start;
+ 			void __iomem *s;
+ 
+-			if (offset + PAGE_SIZE > resource_size(&mem->io)) {
++			if (offset + MMUPAGE_SIZE > resource_size(&mem->io)) {
+ 				ret = -EINVAL;
+ 				break;
+ 			}
+ 
+-			s = io_mapping_map_wc(&mem->iomap, offset, PAGE_SIZE);
++			s = io_mapping_map_wc(&mem->iomap, offset, MMUPAGE_SIZE);
+ 			ret = compress_page(compress,
+ 					    (void __force *)s, dst,
+-					    true);
++					    true, MMUPAGE_SIZE);
+ 			io_mapping_unmap(s);
+ 			if (ret)
+ 				break;
+@@ -1231,7 +1231,7 @@ i915_vma_coredump_create(const struct intel_gt *gt,
+ 			drm_clflush_pages(&page, 1);
+ 
+ 			s = kmap_local_page(page);
+-			ret = compress_page(compress, s, dst, false);
++			ret = compress_page(compress, s, dst, false, PAGE_SIZE);
+ 			kunmap_local(s);
+ 
+ 			drm_clflush_pages(&page, 1);
+diff --git a/drivers/gpu/drm/i915/i915_mm.c b/drivers/gpu/drm/i915/i915_mm.c
+index fd89e7c7d8d6..10178d7d5ca3 100644
+--- a/drivers/gpu/drm/i915/i915_mm.c
++++ b/drivers/gpu/drm/i915/i915_mm.c
+@@ -43,9 +43,9 @@ struct remap_pfn {
+ static inline unsigned long sgt_pfn(const struct remap_pfn *r)
+ {
+ 	if (use_dma(r->iobase))
+-		return (r->sgt.dma + r->sgt.curr + r->iobase) >> PAGE_SHIFT;
++		return (r->sgt.dma + r->sgt.curr + r->iobase) >> MMUPAGE_SHIFT;
+ 	else
+-		return r->sgt.pfn + (r->sgt.curr >> PAGE_SHIFT);
++		return r->sgt.pfn + (r->sgt.curr >> MMUPAGE_SHIFT);
+ }
+ 
+ static int remap_sg(pte_t *pte, unsigned long addr, void *data)
+@@ -60,7 +60,7 @@ static int remap_sg(pte_t *pte, unsigned long addr, void *data)
+ 		   pte_mkspecial(pfn_pte(sgt_pfn(r), r->prot)));
+ 	r->pfn++; /* track insertions in case we need to unwind later */
+ 
+-	r->sgt.curr += PAGE_SIZE;
++	r->sgt.curr += MMUPAGE_SIZE;
+ 	if (r->sgt.curr >= r->sgt.max)
+ 		r->sgt = __sgt_iter(__sg_next(r->sgt.sgp), use_dma(r->iobase));
+ 
+@@ -108,7 +108,7 @@ int remap_io_mapping(struct vm_area_struct *vma,
+ 
+ 	err = apply_to_page_range(r.mm, addr, size, remap_pfn, &r);
+ 	if (unlikely(err)) {
+-		zap_special_vma_range(vma, addr, (r.pfn - pfn) << PAGE_SHIFT);
++		zap_special_vma_range(vma, addr, (r.pfn - pfn) << MMUPAGE_SHIFT);
+ 		return err;
+ 	}
+ 
+@@ -143,20 +143,20 @@ int remap_io_sg(struct vm_area_struct *vma,
+ 	/* We rely on prevalidation of the io-mapping to skip pfnmap tracking. */
+ 	GEM_BUG_ON((vma->vm_flags & EXPECTED_FLAGS) != EXPECTED_FLAGS);
+ 
+-	while (offset >= r.sgt.max >> PAGE_SHIFT) {
+-		offset -= r.sgt.max >> PAGE_SHIFT;
++	while (offset >= r.sgt.max >> MMUPAGE_SHIFT) {
++		offset -= r.sgt.max >> MMUPAGE_SHIFT;
+ 		r.sgt = __sgt_iter(__sg_next(r.sgt.sgp), use_dma(iobase));
+ 		if (!r.sgt.sgp)
+ 			return -EINVAL;
+ 	}
+-	r.sgt.curr = offset << PAGE_SHIFT;
++	r.sgt.curr = offset << MMUPAGE_SHIFT;
+ 
+ 	if (!use_dma(iobase))
+ 		flush_cache_range(vma, addr, size);
+ 
+ 	err = apply_to_page_range(r.mm, addr, size, remap_sg, &r);
+ 	if (unlikely(err)) {
+-		zap_special_vma_range(vma, addr, r.pfn << PAGE_SHIFT);
++		zap_special_vma_range(vma, addr, r.pfn << MMUPAGE_SHIFT);
+ 		return err;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/i915_scatterlist.c b/drivers/gpu/drm/i915/i915_scatterlist.c
+index 9f81e206b646..d9ec91d214fe 100644
+--- a/drivers/gpu/drm/i915/i915_scatterlist.c
++++ b/drivers/gpu/drm/i915/i915_scatterlist.c
+@@ -82,7 +82,7 @@ struct i915_refct_sgt *i915_rsgt_from_mm_node(const struct drm_mm_node *node,
+ 					      u32 page_alignment)
+ {
+ 	const u32 max_segment = round_down(UINT_MAX, page_alignment);
+-	const u32 segment_pages = max_segment >> PAGE_SHIFT;
++	const u32 segment_pages = max_segment >> MMUPAGE_SHIFT;
+ 	u64 block_size, offset, prev_end;
+ 	struct i915_refct_sgt *rsgt;
+ 	struct sg_table *st;
+@@ -94,7 +94,7 @@ struct i915_refct_sgt *i915_rsgt_from_mm_node(const struct drm_mm_node *node,
+ 	if (!rsgt)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	i915_refct_sgt_init(rsgt, node->size << PAGE_SHIFT);
++	i915_refct_sgt_init(rsgt, node->size << MMUPAGE_SHIFT);
+ 	st = &rsgt->table;
+ 	/* restricted by sg_alloc_table */
+ 	if (WARN_ON(overflows_type(DIV_ROUND_UP_ULL(node->size, segment_pages),
+@@ -112,8 +112,8 @@ struct i915_refct_sgt *i915_rsgt_from_mm_node(const struct drm_mm_node *node,
+ 	sg = st->sgl;
+ 	st->nents = 0;
+ 	prev_end = (resource_size_t)-1;
+-	block_size = node->size << PAGE_SHIFT;
+-	offset = node->start << PAGE_SHIFT;
++	block_size = node->size << MMUPAGE_SHIFT;
++	offset = node->start << MMUPAGE_SHIFT;
+ 
+ 	while (block_size) {
+ 		u64 len;
+diff --git a/drivers/gpu/drm/i915/i915_scatterlist.h b/drivers/gpu/drm/i915/i915_scatterlist.h
+index 6cf8a298849f..22dd1ea78d2b 100644
+--- a/drivers/gpu/drm/i915/i915_scatterlist.h
++++ b/drivers/gpu/drm/i915/i915_scatterlist.h
+@@ -54,7 +54,7 @@ static inline int __sg_page_count(const struct scatterlist *sg)
+ 
+ static inline int __sg_dma_page_count(const struct scatterlist *sg)
+ {
+-	return sg_dma_len(sg) >> PAGE_SHIFT;
++	return sg_dma_len(sg) >> MMUPAGE_SHIFT;
+ }
+ 
+ static inline struct scatterlist *____sg_next(struct scatterlist *sg)
+@@ -130,7 +130,7 @@ static inline unsigned int i915_sg_dma_sizes(struct scatterlist *sg)
+ 	page_sizes = 0;
+ 	while (sg && sg_dma_len(sg)) {
+ 		GEM_BUG_ON(sg->offset);
+-		GEM_BUG_ON(!IS_ALIGNED(sg_dma_len(sg), PAGE_SIZE));
++		GEM_BUG_ON(!IS_ALIGNED(sg_dma_len(sg), MMUPAGE_SIZE));
+ 		page_sizes |= sg_dma_len(sg);
+ 		sg = __sg_next(sg);
+ 	}
+@@ -156,8 +156,8 @@ static inline unsigned int i915_sg_segment_size(struct device *dev)
+ 	 * with addressing limitations.
+ 	 */
+ 	if (xen_pv_domain())
+-		max = PAGE_SIZE;
+-	return round_down(max, PAGE_SIZE);
++		max = MMUPAGE_SIZE;
++	return round_down(max, MMUPAGE_SIZE);
+ }
+ 
+ bool i915_sg_trim(struct sg_table *orig_st);
+diff --git a/drivers/gpu/drm/i915/i915_ttm_buddy_manager.c b/drivers/gpu/drm/i915/i915_ttm_buddy_manager.c
+index 10df50a54e88..4067fc28afee 100644
+--- a/drivers/gpu/drm/i915/i915_ttm_buddy_manager.c
++++ b/drivers/gpu/drm/i915/i915_ttm_buddy_manager.c
+@@ -71,12 +71,12 @@ static int i915_ttm_buddy_man_alloc(struct ttm_resource_manager *man,
+ 
+ 	min_page_size = bman->default_page_size;
+ 	if (bo->page_alignment)
+-		min_page_size = bo->page_alignment << PAGE_SHIFT;
++		min_page_size = bo->page_alignment << MMUPAGE_SHIFT;
+ 
+ 	GEM_BUG_ON(min_page_size < mm->chunk_size);
+ 	GEM_BUG_ON(!IS_ALIGNED(size, min_page_size));
+ 
+-	if (size > lpfn << PAGE_SHIFT) {
++	if (size > lpfn << MMUPAGE_SHIFT) {
+ 		err = -E2BIG;
+ 		goto err_free_res;
+ 	}
+@@ -90,9 +90,9 @@ static int i915_ttm_buddy_man_alloc(struct ttm_resource_manager *man,
+ 		goto err_free_res;
+ 	}
+ 
+-	err = gpu_buddy_alloc_blocks(mm, (u64)place->fpfn << PAGE_SHIFT,
+-				     (u64)lpfn << PAGE_SHIFT,
+-				     (u64)n_pages << PAGE_SHIFT,
++	err = gpu_buddy_alloc_blocks(mm, (u64)place->fpfn << MMUPAGE_SHIFT,
++				     (u64)lpfn << MMUPAGE_SHIFT,
++				     (u64)n_pages << MMUPAGE_SHIFT,
+ 				     min_page_size,
+ 				     &bman_res->blocks,
+ 				     bman_res->flags);
+@@ -106,11 +106,11 @@ static int i915_ttm_buddy_man_alloc(struct ttm_resource_manager *man,
+ 
+ 		list_for_each_entry(block, &bman_res->blocks, link) {
+ 			unsigned long start =
+-				gpu_buddy_block_offset(block) >> PAGE_SHIFT;
++				gpu_buddy_block_offset(block) >> MMUPAGE_SHIFT;
+ 
+ 			if (start < bman->visible_size) {
+ 				unsigned long end = start +
+-					(gpu_buddy_block_size(mm, block) >> PAGE_SHIFT);
++					(gpu_buddy_block_size(mm, block) >> MMUPAGE_SHIFT);
+ 
+ 				bman_res->used_visible_size +=
+ 					min(end, bman->visible_size) - start;
+@@ -177,9 +177,9 @@ static bool i915_ttm_buddy_man_intersects(struct ttm_resource_manager *man,
+ 	/* Check each drm buddy block individually */
+ 	list_for_each_entry(block, &bman_res->blocks, link) {
+ 		unsigned long fpfn =
+-			gpu_buddy_block_offset(block) >> PAGE_SHIFT;
++			gpu_buddy_block_offset(block) >> MMUPAGE_SHIFT;
+ 		unsigned long lpfn = fpfn +
+-			(gpu_buddy_block_size(mm, block) >> PAGE_SHIFT);
++			(gpu_buddy_block_size(mm, block) >> MMUPAGE_SHIFT);
+ 
+ 		if (place->fpfn < lpfn && place->lpfn > fpfn)
+ 			return true;
+@@ -210,9 +210,9 @@ static bool i915_ttm_buddy_man_compatible(struct ttm_resource_manager *man,
+ 	/* Check each drm buddy block individually */
+ 	list_for_each_entry(block, &bman_res->blocks, link) {
+ 		unsigned long fpfn =
+-			gpu_buddy_block_offset(block) >> PAGE_SHIFT;
++			gpu_buddy_block_offset(block) >> MMUPAGE_SHIFT;
+ 		unsigned long lpfn = fpfn +
+-			(gpu_buddy_block_size(mm, block) >> PAGE_SHIFT);
++			(gpu_buddy_block_size(mm, block) >> MMUPAGE_SHIFT);
+ 
+ 		if (fpfn < place->fpfn || lpfn > place->lpfn)
+ 			return false;
+@@ -231,11 +231,11 @@ static void i915_ttm_buddy_man_debug(struct ttm_resource_manager *man,
+ 	drm_printf(printer, "default_page_size: %lluKiB\n",
+ 		   bman->default_page_size >> 10);
+ 	drm_printf(printer, "visible_avail: %lluMiB\n",
+-		   (u64)bman->visible_avail << PAGE_SHIFT >> 20);
++		   (u64)bman->visible_avail << MMUPAGE_SHIFT >> 20);
+ 	drm_printf(printer, "visible_size: %lluMiB\n",
+-		   (u64)bman->visible_size << PAGE_SHIFT >> 20);
++		   (u64)bman->visible_size << MMUPAGE_SHIFT >> 20);
+ 	drm_printf(printer, "visible_reserved: %lluMiB\n",
+-		   (u64)bman->visible_reserved << PAGE_SHIFT >> 20);
++		   (u64)bman->visible_reserved << MMUPAGE_SHIFT >> 20);
+ 
+ 	drm_buddy_print(&bman->mm, printer);
+ 
+@@ -302,13 +302,13 @@ int i915_ttm_buddy_man_init(struct ttm_device *bdev,
+ 	INIT_LIST_HEAD(&bman->reserved);
+ 	GEM_BUG_ON(default_page_size < chunk_size);
+ 	bman->default_page_size = default_page_size;
+-	bman->visible_size = visible_size >> PAGE_SHIFT;
++	bman->visible_size = visible_size >> MMUPAGE_SHIFT;
+ 	bman->visible_avail = bman->visible_size;
+ 
+ 	man = &bman->manager;
+ 	man->use_tt = use_tt;
+ 	man->func = &i915_ttm_buddy_manager_func;
+-	ttm_resource_manager_init(man, bdev, bman->mm.size >> PAGE_SHIFT);
++	ttm_resource_manager_init(man, bdev, bman->mm.size >> MMUPAGE_SHIFT);
+ 
+ 	ttm_resource_manager_set_used(man, true);
+ 	ttm_set_driver_manager(bdev, type, man);
+@@ -373,7 +373,7 @@ int i915_ttm_buddy_man_reserve(struct ttm_resource_manager *man,
+ {
+ 	struct i915_ttm_buddy_manager *bman = to_buddy_manager(man);
+ 	struct gpu_buddy *mm = &bman->mm;
+-	unsigned long fpfn = start >> PAGE_SHIFT;
++	unsigned long fpfn = start >> MMUPAGE_SHIFT;
+ 	unsigned long flags = 0;
+ 	int ret;
+ 
+@@ -387,7 +387,7 @@ int i915_ttm_buddy_man_reserve(struct ttm_resource_manager *man,
+ 				     flags);
+ 
+ 	if (fpfn < bman->visible_size) {
+-		unsigned long lpfn = fpfn + (size >> PAGE_SHIFT);
++		unsigned long lpfn = fpfn + (size >> MMUPAGE_SHIFT);
+ 		unsigned long visible = min(lpfn, bman->visible_size) - fpfn;
+ 
+ 		bman->visible_reserved += visible;
+@@ -425,7 +425,7 @@ void i915_ttm_buddy_man_avail(struct ttm_resource_manager *man,
+ 	struct i915_ttm_buddy_manager *bman = to_buddy_manager(man);
+ 
+ 	mutex_lock(&bman->lock);
+-	*avail = bman->mm.avail >> PAGE_SHIFT;
++	*avail = bman->mm.avail >> MMUPAGE_SHIFT;
+ 	*visible_avail = bman->visible_avail;
+ 	mutex_unlock(&bman->lock);
+ }
+diff --git a/drivers/gpu/drm/i915/i915_vma.c b/drivers/gpu/drm/i915/i915_vma.c
+index 6a3a4d4244dc..613ce8b159c4 100644
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -186,16 +186,16 @@ vma_create(struct drm_i915_gem_object *obj,
+ 			GEM_BUG_ON(range_overflows_t(u64,
+ 						     view->partial.offset,
+ 						     view->partial.size,
+-						     obj->base.size >> PAGE_SHIFT));
++						     obj->base.size >> MMUPAGE_SHIFT));
+ 			vma->size = view->partial.size;
+-			vma->size <<= PAGE_SHIFT;
++			vma->size <<= MMUPAGE_SHIFT;
+ 			GEM_BUG_ON(vma->size > obj->base.size);
+ 		} else if (view->type == I915_GTT_VIEW_ROTATED) {
+ 			vma->size = intel_rotation_info_size(&view->rotated);
+-			vma->size <<= PAGE_SHIFT;
++			vma->size <<= MMUPAGE_SHIFT;
+ 		} else if (view->type == I915_GTT_VIEW_REMAPPED) {
+ 			vma->size = intel_remapped_info_size(&view->remapped);
+-			vma->size <<= PAGE_SHIFT;
++			vma->size <<= MMUPAGE_SHIFT;
+ 		}
+ 	}
+ 
+@@ -1129,7 +1129,7 @@ remap_tiled_color_plane_pages(struct drm_i915_gem_object *obj,
+ 		if (!left)
+ 			continue;
+ 
+-		sg = add_padding_pages(left >> PAGE_SHIFT, st, sg);
++		sg = add_padding_pages(left >> MMUPAGE_SHIFT, st, sg);
+ 	}
+ 
+ 	*gtt_offset += alignment_pad + dst_stride * height;
+@@ -1152,15 +1152,15 @@ remap_contiguous_pages(struct drm_i915_gem_object *obj,
+ 	do {
+ 		unsigned int len;
+ 
+-		len = min(sg_dma_len(iter) - (offset << PAGE_SHIFT),
+-			  count << PAGE_SHIFT);
++		len = min(sg_dma_len(iter) - (offset << MMUPAGE_SHIFT),
++			  count << MMUPAGE_SHIFT);
+ 		sg_set_page(sg, NULL, len, 0);
+ 		sg_dma_address(sg) =
+-			sg_dma_address(iter) + (offset << PAGE_SHIFT);
++			sg_dma_address(iter) + (offset << MMUPAGE_SHIFT);
+ 		sg_dma_len(sg) = len;
+ 
+ 		st->nents++;
+-		count -= len >> PAGE_SHIFT;
++		count -= len >> MMUPAGE_SHIFT;
+ 		if (count == 0)
+ 			return sg;
+ 
+@@ -1939,7 +1939,7 @@ void i915_vma_revoke_mmap(struct i915_vma *vma)
+ 	GEM_BUG_ON(!vma->obj->userfault_count);
+ 
+ 	node = &vma->mmo->vma_node;
+-	vma_offset = vma->gtt_view.partial.offset << PAGE_SHIFT;
++	vma_offset = vma->gtt_view.partial.offset << MMUPAGE_SHIFT;
+ 	unmap_mapping_range(vma->vm->i915->drm.anon_inode->i_mapping,
+ 			    drm_vma_node_offset_addr(node) + vma_offset,
+ 			    vma->size,
+diff --git a/drivers/gpu/drm/i915/intel_memory_region.c b/drivers/gpu/drm/i915/intel_memory_region.c
+index 35f96ce7822f..cf2dcfd1adab 100644
+--- a/drivers/gpu/drm/i915/intel_memory_region.c
++++ b/drivers/gpu/drm/i915/intel_memory_region.c
+@@ -68,7 +68,7 @@ static int iopagetest(struct intel_memory_region *mem,
+ 	int err;
+ 	int i;
+ 
+-	va = ioremap_wc(mem->io.start + offset, PAGE_SIZE);
++	va = ioremap_wc(mem->io.start + offset, MMUPAGE_SIZE);
+ 	if (!va) {
+ 		dev_err(mem->i915->drm.dev,
+ 			"Failed to ioremap memory region [%pa + %pa] for %ps\n",
+@@ -77,11 +77,11 @@ static int iopagetest(struct intel_memory_region *mem,
+ 	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(val); i++) {
+-		err = __iopagetest(mem, va, PAGE_SIZE, val[i], offset, caller);
++		err = __iopagetest(mem, va, MMUPAGE_SIZE, val[i], offset, caller);
+ 		if (err)
+ 			break;
+ 
+-		err = __iopagetest(mem, va, PAGE_SIZE, ~val[i], offset, caller);
++		err = __iopagetest(mem, va, MMUPAGE_SIZE, ~val[i], offset, caller);
+ 		if (err)
+ 			break;
+ 	}
+@@ -93,7 +93,7 @@ static int iopagetest(struct intel_memory_region *mem,
+ static resource_size_t random_page(resource_size_t last)
+ {
+ 	/* Limited to low 44b (16TiB), but should suffice for a spot check */
+-	return get_random_u32_below(last >> PAGE_SHIFT) << PAGE_SHIFT;
++	return get_random_u32_below(last >> MMUPAGE_SHIFT) << MMUPAGE_SHIFT;
+ }
+ 
+ static int iomemtest(struct intel_memory_region *mem,
+@@ -103,10 +103,10 @@ static int iomemtest(struct intel_memory_region *mem,
+ 	resource_size_t last, page;
+ 	int err;
+ 
+-	if (resource_size(&mem->io) < PAGE_SIZE)
++	if (resource_size(&mem->io) < MMUPAGE_SIZE)
+ 		return 0;
+ 
+-	last = resource_size(&mem->io) - PAGE_SIZE;
++	last = resource_size(&mem->io) - MMUPAGE_SIZE;
+ 
+ 	/*
+ 	 * Quick test to check read/write access to the iomap (backing store).
+@@ -120,7 +120,7 @@ static int iomemtest(struct intel_memory_region *mem,
+ 	 */
+ 
+ 	if (test_all) {
+-		for (page = 0; page <= last; page += PAGE_SIZE) {
++		for (page = 0; page <= last; page += MMUPAGE_SIZE) {
+ 			err = iopagetest(mem, page, caller);
+ 			if (err)
+ 				return err;
+@@ -313,8 +313,8 @@ void intel_memory_region_avail(struct intel_memory_region *mr,
+ 	if (mr->type == INTEL_MEMORY_LOCAL) {
+ 		i915_ttm_buddy_man_avail(mr->region_private,
+ 					 avail, visible_avail);
+-		*avail <<= PAGE_SHIFT;
+-		*visible_avail <<= PAGE_SHIFT;
++		*avail <<= MMUPAGE_SHIFT;
++		*visible_avail <<= MMUPAGE_SHIFT;
+ 	} else {
+ 		*avail = mr->total;
+ 		*visible_avail = mr->total;
+diff --git a/drivers/gpu/drm/i915/intel_region_ttm.c b/drivers/gpu/drm/i915/intel_region_ttm.c
+index 47a69aad5c3f..9f40c8923365 100644
+--- a/drivers/gpu/drm/i915/intel_region_ttm.c
++++ b/drivers/gpu/drm/i915/intel_region_ttm.c
+@@ -209,26 +209,26 @@ intel_region_ttm_resource_alloc(struct intel_memory_region *mem,
+ 	if (flags & I915_BO_ALLOC_CONTIGUOUS)
+ 		place.flags |= TTM_PL_FLAG_CONTIGUOUS;
+ 	if (offset != I915_BO_INVALID_OFFSET) {
+-		if (WARN_ON(overflows_type(offset >> PAGE_SHIFT, place.fpfn))) {
++		if (WARN_ON(overflows_type(offset >> MMUPAGE_SHIFT, place.fpfn))) {
+ 			ret = -E2BIG;
+ 			goto out;
+ 		}
+-		place.fpfn = offset >> PAGE_SHIFT;
+-		if (WARN_ON(overflows_type(place.fpfn + (size >> PAGE_SHIFT), place.lpfn))) {
++		place.fpfn = offset >> MMUPAGE_SHIFT;
++		if (WARN_ON(overflows_type(place.fpfn + (size >> MMUPAGE_SHIFT), place.lpfn))) {
+ 			ret = -E2BIG;
+ 			goto out;
+ 		}
+-		place.lpfn = place.fpfn + (size >> PAGE_SHIFT);
++		place.lpfn = place.fpfn + (size >> MMUPAGE_SHIFT);
+ 	} else if (resource_size(&mem->io) && resource_size(&mem->io) < mem->total) {
+ 		if (flags & I915_BO_ALLOC_GPU_ONLY) {
+ 			place.flags |= TTM_PL_FLAG_TOPDOWN;
+ 		} else {
+ 			place.fpfn = 0;
+-			if (WARN_ON(overflows_type(resource_size(&mem->io) >> PAGE_SHIFT, place.lpfn))) {
++			if (WARN_ON(overflows_type(resource_size(&mem->io) >> MMUPAGE_SHIFT, place.lpfn))) {
+ 				ret = -E2BIG;
+ 				goto out;
+ 			}
+-			place.lpfn = resource_size(&mem->io) >> PAGE_SHIFT;
++			place.lpfn = resource_size(&mem->io) >> MMUPAGE_SHIFT;
+ 		}
+ 	}
+ 
+diff --git a/drivers/gpu/drm/imagination/pvr_mmu.h b/drivers/gpu/drm/imagination/pvr_mmu.h
+index a8ecd460168d..8007d8b35051 100644
+--- a/drivers/gpu/drm/imagination/pvr_mmu.h
++++ b/drivers/gpu/drm/imagination/pvr_mmu.h
+@@ -47,10 +47,17 @@ struct sg_table;
+  *    This value is derived from %PVR_DEVICE_PAGE_SIZE.
+  */
+ 
+-/* PVR_DEVICE_PAGE_SIZE determines the page size */
+-#define PVR_DEVICE_PAGE_SIZE (PAGE_SIZE)
+-#define PVR_DEVICE_PAGE_SHIFT (PAGE_SHIFT)
+-#define PVR_DEVICE_PAGE_MASK (PAGE_MASK)
++/* PVR_DEVICE_PAGE_SIZE determines the page size.  This is the GPU's
++ * MMU page size, which must be one of the hardware-supported sizes
++ * (SZ_4K, SZ_16K, SZ_64K, SZ_256K, SZ_1M, SZ_2M -- see pvr_mmu.c).
++ * Under PGCL the kernel PAGE_SIZE may be a multiple of the MMU page
++ * (e.g. 128K at PGCL=5 with a 4K MMU page), which would be rejected
++ * by the device MMU.  Use MMUPAGE_SIZE so the GPU programs the
++ * underlying hardware page size instead of the kernel-cluster size.
++ */
++#define PVR_DEVICE_PAGE_SIZE (MMUPAGE_SIZE)
++#define PVR_DEVICE_PAGE_SHIFT (MMUPAGE_SHIFT)
++#define PVR_DEVICE_PAGE_MASK (MMUPAGE_MASK)
+ 
+ /**
+  * DOC: Page table index utilities (constants)
+diff --git a/drivers/gpu/drm/panthor/panthor_device.c b/drivers/gpu/drm/panthor/panthor_device.c
+index 54fbb1aa07c5..7c578b05db20 100644
+--- a/drivers/gpu/drm/panthor/panthor_device.c
++++ b/drivers/gpu/drm/panthor/panthor_device.c
+@@ -410,7 +410,7 @@ static vm_fault_t panthor_mmio_vm_fault(struct vm_fault *vmf)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct panthor_device *ptdev = vma->vm_private_data;
+-	u64 offset = (u64)vma->vm_pgoff << PAGE_SHIFT;
++	u64 offset = (u64)vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	unsigned long pfn;
+ 	pgprot_t pgprot;
+ 	vm_fault_t ret;
+@@ -454,7 +454,7 @@ static const struct vm_operations_struct panthor_mmio_vm_ops = {
+ 
+ int panthor_device_mmap_io(struct panthor_device *ptdev, struct vm_area_struct *vma)
+ {
+-	u64 offset = (u64)vma->vm_pgoff << PAGE_SHIFT;
++	u64 offset = (u64)vma->vm_pgoff << MMUPAGE_SHIFT;
+ 
+ 	if ((vma->vm_flags & VM_SHARED) == 0)
+ 		return -EINVAL;
+diff --git a/drivers/gpu/drm/panthor/panthor_drv.c b/drivers/gpu/drm/panthor/panthor_drv.c
+index 87d27c3c1456..365dd3f51731 100644
+--- a/drivers/gpu/drm/panthor/panthor_drv.c
++++ b/drivers/gpu/drm/panthor/panthor_drv.c
+@@ -1668,7 +1668,7 @@ static int panthor_mmap(struct file *filp, struct vm_area_struct *vma)
+ 	struct drm_file *file = filp->private_data;
+ 	struct panthor_file *pfile = file->driver_priv;
+ 	struct panthor_device *ptdev = pfile->ptdev;
+-	u64 offset = (u64)vma->vm_pgoff << PAGE_SHIFT;
++	u64 offset = (u64)vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	u64 user_mmio_offset;
+ 	int ret, cookie;
+ 
+@@ -1684,7 +1684,7 @@ static int panthor_mmap(struct file *filp, struct vm_area_struct *vma)
+ 	if (offset >= user_mmio_offset) {
+ 		offset -= user_mmio_offset;
+ 		offset += DRM_PANTHOR_USER_MMIO_OFFSET;
+-		vma->vm_pgoff = offset >> PAGE_SHIFT;
++		vma->vm_pgoff = offset >> MMUPAGE_SHIFT;
+ 		ret = panthor_device_mmap_io(ptdev, vma);
+ 	} else {
+ 		ret = drm_gem_mmap(filp, vma);
+diff --git a/drivers/gpu/drm/sysfb/ofdrm.c b/drivers/gpu/drm/sysfb/ofdrm.c
+index 247cf13c80a0..9a0df5316bb2 100644
+--- a/drivers/gpu/drm/sysfb/ofdrm.c
++++ b/drivers/gpu/drm/sysfb/ofdrm.c
+@@ -947,8 +947,8 @@ static struct ofdrm_device *ofdrm_device_create(struct drm_driver *drv,
+ 	 * I/O resources
+ 	 */
+ 
+-	fb_pgbase = round_down(fb_base, PAGE_SIZE);
+-	fb_pgsize = fb_base - fb_pgbase + round_up(fb_size, PAGE_SIZE);
++	fb_pgbase = round_down(fb_base, MMUPAGE_SIZE);
++	fb_pgsize = fb_base - fb_pgbase + round_up(fb_size, MMUPAGE_SIZE);
+ 
+ 	ret = devm_aperture_acquire_for_platform_device(pdev, fb_pgbase, fb_pgsize);
+ 	if (ret) {
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index bcd76f6bb7f0..8e60be15f4bd 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -954,7 +954,7 @@ int ttm_bo_init_reserved(struct ttm_device *bdev, struct ttm_buffer_object *bo,
+ 	 */
+ 	if (bo->type == ttm_bo_type_device || bo->type == ttm_bo_type_sg) {
+ 		ret = drm_vma_offset_add(bdev->vma_manager, &bo->base.vma_node,
+-					 PFN_UP(bo->base.size));
++					 DIV_ROUND_UP(bo->base.size, MMUPAGE_SIZE));
+ 		if (ret)
+ 			goto err_put;
+ 	}
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_vm.c b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+index a80510489c45..36b571f0e444 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_vm.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+@@ -91,7 +91,7 @@ static unsigned long ttm_bo_io_mem_pfn(struct ttm_buffer_object *bo,
+ 	if (bdev->funcs->io_mem_pfn)
+ 		return bdev->funcs->io_mem_pfn(bo, page_offset);
+ 
+-	return (bo->resource->bus.offset >> PAGE_SHIFT) + page_offset;
++	return (bo->resource->bus.offset >> MMUPAGE_SHIFT) + page_offset;
+ }
+ 
+ /**
+@@ -208,12 +208,12 @@ vm_fault_t ttm_bo_vm_fault_reserved(struct vm_fault *vmf,
+ 	if (unlikely(err != 0))
+ 		return VM_FAULT_SIGBUS;
+ 
+-	page_offset = ((address - vma->vm_start) >> PAGE_SHIFT) +
++	page_offset = ((address - vma->vm_start) >> MMUPAGE_SHIFT) +
+ 		vma->vm_pgoff - drm_vma_node_start(&bo->base.vma_node);
+ 	page_last = vma_pages(vma) + vma->vm_pgoff -
+ 		drm_vma_node_start(&bo->base.vma_node);
+ 
+-	if (unlikely(page_offset >= PFN_UP(bo->base.size)))
++	if (unlikely(page_offset >= DIV_ROUND_UP(bo->base.size, MMUPAGE_SIZE)))
+ 		return VM_FAULT_SIGBUS;
+ 
+ 	prot = ttm_io_prot(bo, bo->resource, prot);
+@@ -241,18 +241,29 @@ vm_fault_t ttm_bo_vm_fault_reserved(struct vm_fault *vmf,
+ 	/*
+ 	 * Speculatively prefault a number of pages. Only error on
+ 	 * first page.
++	 *
++	 * page_offset is in MMUPAGE units. For the iomem path, it is
++	 * passed directly to io_mem_pfn which returns MMUPAGE PFNs.
++	 * For the struct page path, we convert to kernel page index
++	 * and add the sub-page PFN offset.
+ 	 */
+ 	for (i = 0; i < num_prefault; ++i) {
+ 		if (bo->resource->bus.is_iomem) {
+ 			pfn = ttm_bo_io_mem_pfn(bo, page_offset);
+ 		} else {
+-			page = ttm->pages[page_offset];
++			page = ttm->pages[page_offset >> PAGE_MMUSHIFT];
+ 			if (unlikely(!page && i == 0)) {
+ 				return VM_FAULT_OOM;
+ 			} else if (unlikely(!page)) {
+ 				break;
+ 			}
+-			pfn = page_to_pfn(page);
++			/*
++			 * vmf_insert_pfn_prot() takes an MMUPAGE-granular PFN:
++			 * the kernel-page PFN shifted up by PAGE_MMUSHIFT, plus
++			 * the sub-page (MMU page) index within the kernel page.
++			 */
++			pfn = (page_to_pfn(page) << PAGE_MMUSHIFT) +
++			      (page_offset & (PAGE_MMUCOUNT - 1));
+ 		}
+ 
+ 		/*
+@@ -273,7 +284,7 @@ vm_fault_t ttm_bo_vm_fault_reserved(struct vm_fault *vmf,
+ 				break;
+ 		}
+ 
+-		address += PAGE_SIZE;
++		address += MMUPAGE_SIZE;
+ 		if (unlikely(++page_offset >= page_last))
+ 			break;
+ 	}
+@@ -307,11 +318,12 @@ vm_fault_t ttm_bo_vm_dummy_page(struct vm_fault *vmf, pgprot_t prot)
+ 				     page))
+ 		return VM_FAULT_OOM;
+ 
+-	pfn = page_to_pfn(page);
++	/* vmf_insert_pfn_prot() takes an MMUPAGE-granular PFN (sub-page 0). */
++	pfn = page_to_pfn(page) << PAGE_MMUSHIFT;
+ 
+ 	/* Prefault the entire VMA range right away to avoid further faults */
+ 	for (address = vma->vm_start; address < vma->vm_end;
+-	     address += PAGE_SIZE)
++	     address += MMUPAGE_SIZE)
+ 		ret = vmf_insert_pfn_prot(vma, address, pfn, prot);
+ 
+ 	return ret;
+@@ -464,7 +476,7 @@ int ttm_bo_vm_access(struct vm_area_struct *vma, unsigned long addr,
+ 	struct ttm_buffer_object *bo = vma->vm_private_data;
+ 	unsigned long offset = (addr) - vma->vm_start +
+ 		((vma->vm_pgoff - drm_vma_node_start(&bo->base.vma_node))
+-		 << PAGE_SHIFT);
++		 << MMUPAGE_SHIFT);
+ 
+ 	return ttm_bo_access(bo, offset, buf, len, write);
+ }
+diff --git a/drivers/gpu/drm/virtio/virtgpu_vram.c b/drivers/gpu/drm/virtio/virtgpu_vram.c
+index 084e80227433..b39f1ce32874 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_vram.c
++++ b/drivers/gpu/drm/virtio/virtgpu_vram.c
+@@ -57,7 +57,7 @@ static int virtio_gpu_vram_mmap(struct drm_gem_object *obj,
+ 	else if (vram->map_info == VIRTIO_GPU_MAP_CACHE_UNCACHED)
+ 		vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+ 
+-	if (check_add_overflow(vma->vm_pgoff << PAGE_SHIFT, vm_size, &vm_end))
++	if (check_add_overflow(vma->vm_pgoff << MMUPAGE_SHIFT, vm_size, &vm_end))
+ 		return -EINVAL;
+ 
+ 	if (vm_end > vram->vram_node.size)
+diff --git a/drivers/gpu/drm/xe/xe_bo.c b/drivers/gpu/drm/xe/xe_bo.c
+index 6b518858538f..90f6cf580898 100644
+--- a/drivers/gpu/drm/xe/xe_bo.c
++++ b/drivers/gpu/drm/xe/xe_bo.c
+@@ -1639,12 +1639,16 @@ static unsigned long xe_ttm_io_mem_pfn(struct ttm_buffer_object *ttm_bo,
+ 	struct xe_res_cursor cursor;
+ 	struct xe_vram_region *vram;
+ 
++	/*
++	 * page_offset is in MMUPAGE units and the TTM io_mem path feeds the
++	 * result straight to vmf_insert_pfn_prot(), so return an MMUPAGE PFN.
++	 */
+ 	if (ttm_bo->resource->mem_type == XE_PL_STOLEN)
+-		return xe_ttm_stolen_io_offset(bo, page_offset << PAGE_SHIFT) >> PAGE_SHIFT;
++		return xe_ttm_stolen_io_offset(bo, page_offset << MMUPAGE_SHIFT) >> MMUPAGE_SHIFT;
+ 
+ 	vram = res_to_mem_region(ttm_bo->resource);
+-	xe_res_first(ttm_bo->resource, (u64)page_offset << PAGE_SHIFT, 0, &cursor);
+-	return (vram->io_start + cursor.start) >> PAGE_SHIFT;
++	xe_res_first(ttm_bo->resource, (u64)page_offset << MMUPAGE_SHIFT, 0, &cursor);
++	return (vram->io_start + cursor.start) >> MMUPAGE_SHIFT;
+ }
+ 
+ static void __xe_bo_vunmap(struct xe_bo *bo);
+diff --git a/drivers/gpu/drm/xe/xe_device.c b/drivers/gpu/drm/xe/xe_device.c
+index ffea4a453c01..66f92e673e8d 100644
+--- a/drivers/gpu/drm/xe/xe_device.c
++++ b/drivers/gpu/drm/xe/xe_device.c
+@@ -285,8 +285,9 @@ static vm_fault_t barrier_fault(struct vm_fault *vmf)
+ 		unsigned long pfn;
+ 
+ #define LAST_DB_PAGE_OFFSET 0x7ff001
+-		pfn = PHYS_PFN(pci_resource_start(to_pci_dev(dev->dev), 0) +
+-				LAST_DB_PAGE_OFFSET);
++		/* vmf_insert_pfn_prot() takes an MMUPAGE-granular PFN. */
++		pfn = (pci_resource_start(to_pci_dev(dev->dev), 0) +
++				LAST_DB_PAGE_OFFSET) >> MMUPAGE_SHIFT;
+ 		ret = vmf_insert_pfn_prot(vma, vma->vm_start, pfn,
+ 					  pgprot_noncached(prot));
+ 		drm_dev_exit(idx);
+@@ -302,7 +303,9 @@ static vm_fault_t barrier_fault(struct vm_fault *vmf)
+ 		if (drmm_add_action_or_reset(dev, barrier_release_dummy_page, page))
+ 			return VM_FAULT_OOM;
+ 
+-		ret = vmf_insert_pfn_prot(vma, vma->vm_start, page_to_pfn(page),
++		/* vmf_insert_pfn_prot() takes an MMUPAGE-granular PFN. */
++		ret = vmf_insert_pfn_prot(vma, vma->vm_start,
++					  page_to_pfn(page) << PAGE_MMUSHIFT,
+ 					  prot);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/xe/xe_mmio_gem.c b/drivers/gpu/drm/xe/xe_mmio_gem.c
+index 8c803ef233cc..8703ed53e6a3 100644
+--- a/drivers/gpu/drm/xe/xe_mmio_gem.c
++++ b/drivers/gpu/drm/xe/xe_mmio_gem.c
+@@ -178,10 +178,11 @@ static vm_fault_t xe_mmio_gem_vm_fault_dummy_page(struct vm_area_struct *vma)
+ 	if (drmm_add_action_or_reset(dev, xe_mmio_gem_release_dummy_page, page))
+ 		return VM_FAULT_OOM;
+ 
+-	pfn = page_to_pfn(page);
++	/* vmf_insert_pfn() maps one MMUPAGE and takes an MMUPAGE-granular PFN. */
++	pfn = page_to_pfn(page) << PAGE_MMUSHIFT;
+ 
+ 	/* Map the entire VMA to the same dummy page */
+-	for (i = 0; i < base->size; i += PAGE_SIZE) {
++	for (i = 0; i < base->size; i += MMUPAGE_SIZE) {
+ 		unsigned long addr = vma->vm_start + i;
+ 
+ 		ret = vmf_insert_pfn(vma, addr, pfn);
+@@ -212,11 +213,12 @@ static vm_fault_t xe_mmio_gem_vm_fault(struct vm_fault *vmf)
+ 		return xe_mmio_gem_vm_fault_dummy_page(vma);
+ 	}
+ 
+-	for (i = 0; i < base->size; i += PAGE_SIZE) {
++	/* vmf_insert_pfn() maps one MMUPAGE and takes an MMUPAGE-granular PFN. */
++	for (i = 0; i < base->size; i += MMUPAGE_SIZE) {
+ 		unsigned long addr = vma->vm_start + i;
+ 		unsigned long phys_addr = obj->phys_addr + i;
+ 
+-		ret = vmf_insert_pfn(vma, addr, PHYS_PFN(phys_addr));
++		ret = vmf_insert_pfn(vma, addr, phys_addr >> MMUPAGE_SHIFT);
+ 		if (ret & VM_FAULT_ERROR)
+ 			break;
+ 	}
+diff --git a/drivers/hv/mshv_vtl_main.c b/drivers/hv/mshv_vtl_main.c
+index c19400701467..d8f97dc4baf5 100644
+--- a/drivers/hv/mshv_vtl_main.c
++++ b/drivers/hv/mshv_vtl_main.c
+@@ -1225,12 +1225,12 @@ static bool can_fault(struct vm_fault *vmf, unsigned long size, unsigned long *p
+ 	unsigned long end = start + size;
+ 	bool is_valid;
+ 
+-	is_valid = (vmf->address & mask) == ((vmf->pgoff << PAGE_SHIFT) & mask) &&
++	is_valid = (vmf->address & mask) == ((vmf->pgoff << MMUPAGE_SHIFT) & mask) &&
+ 		start >= vmf->vma->vm_start &&
+ 		end <= vmf->vma->vm_end;
+ 
+ 	if (is_valid)
+-		*pfn = vmf->pgoff & ~(mask >> PAGE_SHIFT);
++		*pfn = vmf->pgoff & ~(mask >> MMUPAGE_SHIFT);
+ 
+ 	return is_valid;
+ }
+diff --git a/drivers/hv/ring_buffer.c b/drivers/hv/ring_buffer.c
+index 592a9601faaa..68c3c8ba5d7e 100644
+--- a/drivers/hv/ring_buffer.c
++++ b/drivers/hv/ring_buffer.c
+@@ -190,7 +190,7 @@ int hv_ringbuffer_init(struct hv_ring_buffer_info *ring_info,
+ 	struct page **pages_wraparound;
+ 	int i;
+ 
+-	BUILD_BUG_ON((sizeof(struct hv_ring_buffer) != PAGE_SIZE));
++	BUILD_BUG_ON((sizeof(struct hv_ring_buffer) != HV_HYP_PAGE_SIZE));
+ 
+ 	/*
+ 	 * First page holds struct hv_ring_buffer, do wraparound mapping for
+diff --git a/drivers/infiniband/hw/cxgb4/provider.c b/drivers/infiniband/hw/cxgb4/provider.c
+index 616019ac1da5..bd53b3fb369e 100644
+--- a/drivers/infiniband/hw/cxgb4/provider.c
++++ b/drivers/infiniband/hw/cxgb4/provider.c
+@@ -128,7 +128,7 @@ static int c4iw_alloc_ucontext(struct ib_ucontext *ucontext,
+ static int c4iw_mmap(struct ib_ucontext *context, struct vm_area_struct *vma)
+ {
+ 	int len = vma->vm_end - vma->vm_start;
+-	u32 key = vma->vm_pgoff << PAGE_SHIFT;
++	u32 key = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	struct c4iw_rdev *rdev;
+ 	int ret = 0;
+ 	struct c4iw_mm_entry *mm;
+diff --git a/drivers/infiniband/hw/hfi1/file_ops.c b/drivers/infiniband/hw/hfi1/file_ops.c
+index 56031becb273..92da2b62e258 100644
+--- a/drivers/infiniband/hw/hfi1/file_ops.c
++++ b/drivers/infiniband/hw/hfi1/file_ops.c
+@@ -321,7 +321,7 @@ static int hfi1_file_mmap(struct file *fp, struct vm_area_struct *vma)
+ 	struct hfi1_ctxtdata *uctxt = fd->uctxt;
+ 	struct hfi1_devdata *dd;
+ 	unsigned long flags;
+-	u64 token = vma->vm_pgoff << PAGE_SHIFT,
++	u64 token = vma->vm_pgoff << MMUPAGE_SHIFT,
+ 		memaddr = 0;
+ 	void *memvirt = NULL;
+ 	dma_addr_t memdma = 0;
+@@ -596,7 +596,7 @@ static vm_fault_t vma_fault(struct vm_fault *vmf)
+ {
+ 	struct page *page;
+ 
+-	page = vmalloc_to_page((void *)(vmf->pgoff << PAGE_SHIFT));
++	page = vmalloc_to_page((void *)(vmf->pgoff << MMUPAGE_SHIFT));
+ 	if (!page)
+ 		return VM_FAULT_SIGBUS;
+ 
+diff --git a/drivers/infiniband/hw/ionic/ionic_controlpath.c b/drivers/infiniband/hw/ionic/ionic_controlpath.c
+index 7051a81cca94..4fd885f25f03 100644
+--- a/drivers/infiniband/hw/ionic/ionic_controlpath.c
++++ b/drivers/infiniband/hw/ionic/ionic_controlpath.c
+@@ -448,7 +448,7 @@ int ionic_mmap(struct ib_ucontext *ibctx, struct vm_area_struct *vma)
+ 	rdma_entry = rdma_user_mmap_entry_get(&ctx->ibctx, vma);
+ 	if (!rdma_entry) {
+ 		ibdev_dbg(&dev->ibdev, "not found %#lx\n",
+-			  vma->vm_pgoff << PAGE_SHIFT);
++			  vma->vm_pgoff << MMUPAGE_SHIFT);
+ 		return -EINVAL;
+ 	}
+ 
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+index a88cc5d84af8..f4e9f190d71d 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+@@ -540,7 +540,7 @@ int ocrdma_mmap(struct ib_ucontext *context, struct vm_area_struct *vma)
+ {
+ 	struct ocrdma_ucontext *ucontext = get_ocrdma_ucontext(context);
+ 	struct ocrdma_dev *dev = get_ocrdma_dev(context->device);
+-	unsigned long vm_page = vma->vm_pgoff << PAGE_SHIFT;
++	unsigned long vm_page = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	u64 unmapped_db = (u64) dev->nic_info.unmapped_db;
+ 	unsigned long len = (vma->vm_end - vma->vm_start);
+ 	int status;
+@@ -548,7 +548,7 @@ int ocrdma_mmap(struct ib_ucontext *context, struct vm_area_struct *vma)
+ 
+ 	if (vma->vm_start & (PAGE_SIZE - 1))
+ 		return -EINVAL;
+-	found = ocrdma_search_mmap(ucontext, vma->vm_pgoff << PAGE_SHIFT, len);
++	found = ocrdma_search_mmap(ucontext, vma->vm_pgoff << MMUPAGE_SHIFT, len);
+ 	if (!found)
+ 		return -EINVAL;
+ 
+diff --git a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_verbs.c b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_verbs.c
+index c7c2b41060e5..0f6567254884 100644
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_verbs.c
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_verbs.c
+@@ -369,7 +369,7 @@ int pvrdma_mmap(struct ib_ucontext *ibcontext, struct vm_area_struct *vma)
+ 	struct pvrdma_ucontext *context = to_vucontext(ibcontext);
+ 	unsigned long start = vma->vm_start;
+ 	unsigned long size = vma->vm_end - vma->vm_start;
+-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
++	unsigned long offset = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 
+ 	dev_dbg(&context->dev->pdev->dev, "create mmap region\n");
+ 
+diff --git a/drivers/infiniband/sw/rdmavt/mmap.c b/drivers/infiniband/sw/rdmavt/mmap.c
+index 473f464f33fa..7b4af3f7d77f 100644
+--- a/drivers/infiniband/sw/rdmavt/mmap.c
++++ b/drivers/infiniband/sw/rdmavt/mmap.c
+@@ -73,7 +73,7 @@ static const struct vm_operations_struct rvt_vm_ops = {
+ int rvt_mmap(struct ib_ucontext *context, struct vm_area_struct *vma)
+ {
+ 	struct rvt_dev_info *rdi = ib_to_rvt(context->device);
+-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
++	unsigned long offset = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	unsigned long size = vma->vm_end - vma->vm_start;
+ 	struct rvt_mmap_info *ip, *pp;
+ 	int ret = -EINVAL;
+diff --git a/drivers/infiniband/sw/rxe/rxe_mmap.c b/drivers/infiniband/sw/rxe/rxe_mmap.c
+index db380302149e..733bc1de4db7 100644
+--- a/drivers/infiniband/sw/rxe/rxe_mmap.c
++++ b/drivers/infiniband/sw/rxe/rxe_mmap.c
+@@ -62,7 +62,7 @@ static const struct vm_operations_struct rxe_vm_ops = {
+ int rxe_mmap(struct ib_ucontext *context, struct vm_area_struct *vma)
+ {
+ 	struct rxe_dev *rxe = to_rdev(context->device);
+-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
++	unsigned long offset = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	unsigned long size = vma->vm_end - vma->vm_start;
+ 	struct rxe_mmap_info *ip, *pp;
+ 	int ret;
+diff --git a/drivers/iommu/iommufd/main.c b/drivers/iommu/iommufd/main.c
+index 8c6d43601afb..9631de422dd1 100644
+--- a/drivers/iommu/iommufd/main.c
++++ b/drivers/iommu/iommufd/main.c
+@@ -577,7 +577,7 @@ static int iommufd_fops_mmap(struct file *filp, struct vm_area_struct *vma)
+ 
+ 	mtree_lock(&ictx->mt_mmap);
+ 	/* vma->vm_pgoff carries a page-shifted start position to an immap */
+-	immap = mtree_load(&ictx->mt_mmap, vma->vm_pgoff << PAGE_SHIFT);
++	immap = mtree_load(&ictx->mt_mmap, vma->vm_pgoff << MMUPAGE_SHIFT);
+ 	if (!immap || !refcount_inc_not_zero(&immap->owner->users)) {
+ 		mtree_unlock(&ictx->mt_mmap);
+ 		return -ENXIO;
+diff --git a/drivers/media/common/videobuf2/videobuf2-core.c b/drivers/media/common/videobuf2/videobuf2-core.c
+index adf668b213c2..eba0f20ee462 100644
+--- a/drivers/media/common/videobuf2/videobuf2-core.c
++++ b/drivers/media/common/videobuf2/videobuf2-core.c
+@@ -2486,7 +2486,7 @@ EXPORT_SYMBOL_GPL(vb2_core_expbuf);
+ 
+ int vb2_mmap(struct vb2_queue *q, struct vm_area_struct *vma)
+ {
+-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
++	unsigned long offset = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	struct vb2_buffer *vb;
+ 	unsigned int plane = 0;
+ 	int ret;
+diff --git a/drivers/media/platform/samsung/s5p-mfc/s5p_mfc.c b/drivers/media/platform/samsung/s5p-mfc/s5p_mfc.c
+index 32eb402d439c..517f1c16dcbd 100644
+--- a/drivers/media/platform/samsung/s5p-mfc/s5p_mfc.c
++++ b/drivers/media/platform/samsung/s5p-mfc/s5p_mfc.c
+@@ -1078,7 +1078,7 @@ static __poll_t s5p_mfc_poll(struct file *file,
+ static int s5p_mfc_mmap(struct file *file, struct vm_area_struct *vma)
+ {
+ 	struct s5p_mfc_ctx *ctx = file_to_ctx(file);
+-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
++	unsigned long offset = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	int ret;
+ 
+ 	if (offset < DST_QUEUE_OFF_BASE) {
+diff --git a/drivers/media/v4l2-core/v4l2-mem2mem.c b/drivers/media/v4l2-core/v4l2-mem2mem.c
+index a65cbb124cfe..ee2697be2c48 100644
+--- a/drivers/media/v4l2-core/v4l2-mem2mem.c
++++ b/drivers/media/v4l2-core/v4l2-mem2mem.c
+@@ -978,7 +978,7 @@ EXPORT_SYMBOL_GPL(v4l2_m2m_poll);
+ int v4l2_m2m_mmap(struct file *file, struct v4l2_m2m_ctx *m2m_ctx,
+ 			 struct vm_area_struct *vma)
+ {
+-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
++	unsigned long offset = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	struct vb2_queue *vq;
+ 
+ 	if (offset < DST_QUEUE_OFF_BASE) {
+diff --git a/drivers/misc/genwqe/card_dev.c b/drivers/misc/genwqe/card_dev.c
+index 5a07e8403e97..0eb8dad464dd 100644
+--- a/drivers/misc/genwqe/card_dev.c
++++ b/drivers/misc/genwqe/card_dev.c
+@@ -403,7 +403,7 @@ static void genwqe_vma_close(struct vm_area_struct *vma)
+ 	if (dma_map == NULL) {
+ 		dev_err(&pci_dev->dev,
+ 			"  [%s] err: mapping not found: v=%lx, p=%lx s=%lx\n",
+-			__func__, vma->vm_start, vma->vm_pgoff << PAGE_SHIFT,
++			__func__, vma->vm_start, vma->vm_pgoff << MMUPAGE_SHIFT,
+ 			vsize);
+ 		return;
+ 	}
+diff --git a/drivers/misc/ocxl/context.c b/drivers/misc/ocxl/context.c
+index 33f25be46247..f7754b2196f6 100644
+--- a/drivers/misc/ocxl/context.c
++++ b/drivers/misc/ocxl/context.c
+@@ -143,7 +143,7 @@ static vm_fault_t ocxl_mmap_fault(struct vm_fault *vmf)
+ 	u64 offset;
+ 	vm_fault_t ret;
+ 
+-	offset = vmf->pgoff << PAGE_SHIFT;
++	offset = vmf->pgoff << MMUPAGE_SHIFT;
+ 	pr_debug("%s: pasid %d address 0x%lx offset 0x%llx\n", __func__,
+ 		ctx->pasid, vmf->address, offset);
+ 
+@@ -161,7 +161,7 @@ static const struct vm_operations_struct ocxl_vmops = {
+ static int check_mmap_afu_irq(struct ocxl_context *ctx,
+ 			struct vm_area_struct *vma)
+ {
+-	int irq_id = ocxl_irq_offset_to_id(ctx, vma->vm_pgoff << PAGE_SHIFT);
++	int irq_id = ocxl_irq_offset_to_id(ctx, vma->vm_pgoff << MMUPAGE_SHIFT);
+ 
+ 	/* only one page */
+ 	if (vma_pages(vma) != 1)
+@@ -197,7 +197,7 @@ int ocxl_context_mmap(struct ocxl_context *ctx, struct vm_area_struct *vma)
+ {
+ 	int rc;
+ 
+-	if ((vma->vm_pgoff << PAGE_SHIFT) < ctx->afu->irq_base_offset)
++	if ((vma->vm_pgoff << MMUPAGE_SHIFT) < ctx->afu->irq_base_offset)
+ 		rc = check_mmap_mmio(ctx, vma);
+ 	else
+ 		rc = check_mmap_afu_irq(ctx, vma);
+diff --git a/drivers/parisc/ccio-dma.c b/drivers/parisc/ccio-dma.c
+index dc1b6d11f9ab..2d92e89c25e8 100644
+--- a/drivers/parisc/ccio-dma.c
++++ b/drivers/parisc/ccio-dma.c
+@@ -264,9 +264,12 @@ static int ioc_count;
+ *   match the I/O TLB replacement policy.
+ *
+ ***************************************************************/
+-#define IOVP_SIZE PAGE_SIZE
+-#define IOVP_SHIFT PAGE_SHIFT
+-#define IOVP_MASK PAGE_MASK
++/* IOMMU hardware page granularity: matches the MMU page (4K on parisc).
++ * Under PGCL the kernel PAGE_SIZE may exceed what the IOMMU TLB can program,
++ * so use MMUPAGE_SIZE explicitly. */
++#define IOVP_SIZE MMUPAGE_SIZE
++#define IOVP_SHIFT MMUPAGE_SHIFT
++#define IOVP_MASK MMUPAGE_MASK
+ 
+ /* Convert from IOVP to IOVA and vice versa. */
+ #define CCIO_IOVA(iovp,offset) ((iovp) | (offset))
+diff --git a/drivers/parisc/sba_iommu.c b/drivers/parisc/sba_iommu.c
+index d9339dd50826..eeea81f31fb3 100644
+--- a/drivers/parisc/sba_iommu.c
++++ b/drivers/parisc/sba_iommu.c
+@@ -1342,15 +1342,15 @@ sba_ioc_init_pluto(struct parisc_device *sba, struct ioc *ioc, int ioc_num)
+ 	ioc->imask |= 0xFFFFFFFF00000000UL;
+ #endif
+ 
+-	/* Set I/O PDIR Page size to system page size */
+-	switch (PAGE_SHIFT) {
++	/* Set I/O PDIR Page size to MMU page size — IOMMU TLB programs HW page granularity, not the (possibly larger) kernel PAGE_SIZE under PGCL. */
++	switch (MMUPAGE_SHIFT) {
+ 		case 12: tcnfg = 0; break;	/*  4K */
+ 		case 13: tcnfg = 1; break;	/*  8K */
+ 		case 14: tcnfg = 2; break;	/* 16K */
+ 		case 16: tcnfg = 3; break;	/* 64K */
+ 		default:
+ 			panic(__FILE__ "Unsupported system page size %d",
+-				1 << PAGE_SHIFT);
++				1 << MMUPAGE_SHIFT);
+ 			break;
+ 	}
+ 	WRITE_REG(tcnfg, ioc->ioc_hpa + IOC_TCNFG);
+@@ -1484,15 +1484,15 @@ sba_ioc_init(struct parisc_device *sba, struct ioc *ioc, int ioc_num)
+ 	WRITE_REG(ioc->ibase | 1, ioc->ioc_hpa+IOC_IBASE);
+ 	WRITE_REG(ioc->imask, ioc->ioc_hpa+IOC_IMASK);
+ 
+-	/* Set I/O PDIR Page size to system page size */
+-	switch (PAGE_SHIFT) {
++	/* Set I/O PDIR Page size to MMU page size — IOMMU TLB programs HW page granularity, not the (possibly larger) kernel PAGE_SIZE under PGCL. */
++	switch (MMUPAGE_SHIFT) {
+ 		case 12: tcnfg = 0; break;	/*  4K */
+ 		case 13: tcnfg = 1; break;	/*  8K */
+ 		case 14: tcnfg = 2; break;	/* 16K */
+ 		case 16: tcnfg = 3; break;	/* 64K */
+ 		default:
+ 			panic(__FILE__ "Unsupported system page size %d",
+-				1 << PAGE_SHIFT);
++				1 << MMUPAGE_SHIFT);
+ 			break;
+ 	}
+ 	/* Set I/O PDIR Page size to PAGE_SIZE (4k/16k/...) */
+diff --git a/drivers/rapidio/devices/rio_mport_cdev.c b/drivers/rapidio/devices/rio_mport_cdev.c
+index 009b3b595bbf..75437729f4f9 100644
+--- a/drivers/rapidio/devices/rio_mport_cdev.c
++++ b/drivers/rapidio/devices/rio_mport_cdev.c
+@@ -2189,7 +2189,7 @@ static int mport_cdev_mmap(struct file *filp, struct vm_area_struct *vma)
+ 		   (unsigned int)size, vma->vm_pgoff);
+ 
+ 	md = priv->md;
+-	baddr = ((dma_addr_t)vma->vm_pgoff << PAGE_SHIFT);
++	baddr = ((dma_addr_t)vma->vm_pgoff << MMUPAGE_SHIFT);
+ 
+ 	mutex_lock(&md->buf_mutex);
+ 	list_for_each_entry(map, &md->mappings, node) {
+diff --git a/drivers/s390/char/sclp.h b/drivers/s390/char/sclp.h
+index b31a680e0871..2c75643933a7 100644
+--- a/drivers/s390/char/sclp.h
++++ b/drivers/s390/char/sclp.h
+@@ -144,11 +144,11 @@ struct read_cpu_info_sccb {
+ 	u16	nr_standby;
+ 	u16	offset_standby;
+ 	/*
+-	 * Without ext sccb, struct size is PAGE_SIZE.
++	 * Without ext sccb, struct size is MMUPAGE_SIZE.
+ 	 * With ext sccb, struct size is EXT_SCCB_READ_CPU.
+ 	 */
+ 	u8	reserved[];
+-} __attribute__((packed, aligned(PAGE_SIZE)));
++} __attribute__((packed, aligned(MMUPAGE_SIZE)));
+ 
+ struct read_info_sccb {
+ 	struct	sccb_header header;	/* 0-7 */
+@@ -193,7 +193,7 @@ struct read_info_sccb {
+ 	u8	byte_138;		/* 138 */
+ 	u8	byte_139;		/* 139 */
+ 	u8	_pad_140[EXT_SCCB_READ_SCP - 140];
+-} __packed __aligned(PAGE_SIZE);
++} __packed __aligned(MMUPAGE_SIZE);
+ 
+ struct read_storage_sccb {
+ 	struct sccb_header header;
+diff --git a/drivers/s390/char/sclp_cmd.c b/drivers/s390/char/sclp_cmd.c
+index 1dc93d945be6..15b81f5d241c 100644
+--- a/drivers/s390/char/sclp_cmd.c
++++ b/drivers/s390/char/sclp_cmd.c
+@@ -101,7 +101,7 @@ int _sclp_get_core_info(struct sclp_core_info *info)
+ 	if (!SCLP_HAS_CPU_INFO)
+ 		return -EOPNOTSUPP;
+ 
+-	length = test_facility(140) ? EXT_SCCB_READ_CPU : PAGE_SIZE;
++	length = test_facility(140) ? EXT_SCCB_READ_CPU : MMUPAGE_SIZE;
+ 	sccb = (void *)__get_free_pages(GFP_KERNEL | GFP_DMA | __GFP_ZERO, get_order(length));
+ 	if (!sccb)
+ 		return -ENOMEM;
+diff --git a/drivers/s390/char/sclp_early.c b/drivers/s390/char/sclp_early.c
+index 6bf501ad8ff0..10d97f76511c 100644
+--- a/drivers/s390/char/sclp_early.c
++++ b/drivers/s390/char/sclp_early.c
+@@ -126,7 +126,7 @@ void __init sclp_early_get_ipl_info(struct sclp_ipl_info *info)
+ int __init sclp_early_get_core_info(struct sclp_core_info *info)
+ {
+ 	struct read_cpu_info_sccb *sccb;
+-	int length = test_facility(140) ? EXT_SCCB_READ_CPU : PAGE_SIZE;
++	int length = test_facility(140) ? EXT_SCCB_READ_CPU : MMUPAGE_SIZE;
+ 	int rc = 0;
+ 
+ 	if (!SCLP_HAS_CPU_INFO)
+diff --git a/drivers/s390/char/sclp_early_core.c b/drivers/s390/char/sclp_early_core.c
+index 55e50d428aab..4ad4fa79ab9c 100644
+--- a/drivers/s390/char/sclp_early_core.c
++++ b/drivers/s390/char/sclp_early_core.c
+@@ -278,7 +278,7 @@ void sclp_emergency_printk(const char *str)
+ int __init sclp_early_read_info(void)
+ {
+ 	int i;
+-	int length = test_facility(140) ? EXT_SCCB_READ_SCP : PAGE_SIZE;
++	int length = test_facility(140) ? EXT_SCCB_READ_SCP : MMUPAGE_SIZE;
+ 	struct read_info_sccb *sccb = (struct read_info_sccb *)sclp_early_sccb;
+ 	sclp_cmdw_t commands[] = {SCLP_CMDW_READ_SCP_INFO_FORCED,
+ 				  SCLP_CMDW_READ_SCP_INFO};
+diff --git a/drivers/sbus/char/flash.c b/drivers/sbus/char/flash.c
+index 6524a4a19109..c99b9c3e0744 100644
+--- a/drivers/sbus/char/flash.c
++++ b/drivers/sbus/char/flash.c
+@@ -59,12 +59,12 @@ flash_mmap(struct file *file, struct vm_area_struct *vma)
+ 	}
+ 	spin_unlock(&flash_lock);
+ 
+-	if ((vma->vm_pgoff << PAGE_SHIFT) > size)
++	if ((vma->vm_pgoff << MMUPAGE_SHIFT) > size)
+ 		return -ENXIO;
+ 	addr = vma->vm_pgoff + (addr >> PAGE_SHIFT);
+ 
+-	if (vma->vm_end - (vma->vm_start + (vma->vm_pgoff << PAGE_SHIFT)) > size)
+-		size = vma->vm_end - (vma->vm_start + (vma->vm_pgoff << PAGE_SHIFT));
++	if (vma->vm_end - (vma->vm_start + (vma->vm_pgoff << MMUPAGE_SHIFT)) > size)
++		size = vma->vm_end - (vma->vm_start + (vma->vm_pgoff << MMUPAGE_SHIFT));
+ 
+ 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+ 
+diff --git a/drivers/scsi/sg.c b/drivers/scsi/sg.c
+index 74cd4e8a61c2..74fdeed3f8be 100644
+--- a/drivers/scsi/sg.c
++++ b/drivers/scsi/sg.c
+@@ -1225,7 +1225,7 @@ sg_vma_fault(struct vm_fault *vmf)
+ 	if ((NULL == vma) || (!(sfp = (Sg_fd *) vma->vm_private_data)))
+ 		return VM_FAULT_SIGBUS;
+ 	rsv_schp = &sfp->reserve;
+-	offset = vmf->pgoff << PAGE_SHIFT;
++	offset = vmf->pgoff << MMUPAGE_SHIFT;
+ 	if (offset >= rsv_schp->bufflen)
+ 		return VM_FAULT_SIGBUS;
+ 	SCSI_LOG_TIMEOUT(3, sg_printk(KERN_INFO, sfp->parentdp,
+diff --git a/drivers/staging/vme_user/vme.c b/drivers/staging/vme_user/vme.c
+index 7220aba7b919..37350413b618 100644
+--- a/drivers/staging/vme_user/vme.c
++++ b/drivers/staging/vme_user/vme.c
+@@ -759,7 +759,7 @@ int vme_master_mmap_prepare(struct vme_resource *resource,
+ 	}
+ 
+ 	image = list_entry(resource->entry, struct vme_master_resource, list);
+-	phys_addr = image->bus_resource.start + (desc->pgoff << PAGE_SHIFT);
++	phys_addr = image->bus_resource.start + (desc->pgoff << MMUPAGE_SHIFT);
+ 
+ 	if (phys_addr + vma_size > image->bus_resource.end + 1) {
+ 		dev_err(bridge->parent, "Map size cannot exceed the window size\n");
+diff --git a/drivers/usb/mon/mon_bin.c b/drivers/usb/mon/mon_bin.c
+index 687f6a8981f3..43dfd9c8513c 100644
+--- a/drivers/usb/mon/mon_bin.c
++++ b/drivers/usb/mon/mon_bin.c
+@@ -1254,7 +1254,7 @@ static vm_fault_t mon_bin_vma_fault(struct vm_fault *vmf)
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&rp->b_lock, flags);
+-	offset = vmf->pgoff << PAGE_SHIFT;
++	offset = vmf->pgoff << MMUPAGE_SHIFT;
+ 	if (offset >= rp->b_size) {
+ 		spin_unlock_irqrestore(&rp->b_lock, flags);
+ 		return VM_FAULT_SIGBUS;
+diff --git a/drivers/vdpa/vdpa_user/iova_domain.c b/drivers/vdpa/vdpa_user/iova_domain.c
+index 806cec32c4bc..456af1dd215b 100644
+--- a/drivers/vdpa/vdpa_user/iova_domain.c
++++ b/drivers/vdpa/vdpa_user/iova_domain.c
+@@ -546,7 +546,7 @@ void vduse_domain_free_coherent(struct vduse_iova_domain *domain, size_t size,
+ static vm_fault_t vduse_domain_mmap_fault(struct vm_fault *vmf)
+ {
+ 	struct vduse_iova_domain *domain = vmf->vma->vm_private_data;
+-	unsigned long iova = vmf->pgoff << PAGE_SHIFT;
++	unsigned long iova = vmf->pgoff << MMUPAGE_SHIFT;
+ 	struct page *page;
+ 
+ 	if (!domain)
+diff --git a/drivers/vfio/cdx/main.c b/drivers/vfio/cdx/main.c
+index b31ed4be7bdc..bf9cd0a50af6 100644
+--- a/drivers/vfio/cdx/main.c
++++ b/drivers/vfio/cdx/main.c
+@@ -254,7 +254,7 @@ static int vfio_cdx_mmap_mmio(struct vfio_cdx_region region,
+ 	if (base + size > region.size)
+ 		return -EINVAL;
+ 
+-	vma->vm_pgoff = (region.addr >> PAGE_SHIFT) + pgoff;
++	vma->vm_pgoff = (region.addr >> MMUPAGE_SHIFT) + pgoff;
+ 	vma->vm_page_prot = pgprot_device(vma->vm_page_prot);
+ 
+ 	return io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
+@@ -269,7 +269,7 @@ static int vfio_cdx_mmap(struct vfio_device *core_vdev,
+ 	struct cdx_device *cdx_dev = to_cdx_device(core_vdev->dev);
+ 	unsigned int index;
+ 
+-	index = vma->vm_pgoff >> (VFIO_CDX_OFFSET_SHIFT - PAGE_SHIFT);
++	index = vma->vm_pgoff >> (VFIO_CDX_OFFSET_SHIFT - MMUPAGE_SHIFT);
+ 
+ 	if (index >= cdx_dev->res_count)
+ 		return -EINVAL;
+diff --git a/drivers/vfio/fsl-mc/vfio_fsl_mc.c b/drivers/vfio/fsl-mc/vfio_fsl_mc.c
+index b4c3958201b2..326739e92144 100644
+--- a/drivers/vfio/fsl-mc/vfio_fsl_mc.c
++++ b/drivers/vfio/fsl-mc/vfio_fsl_mc.c
+@@ -369,7 +369,7 @@ static int vfio_fsl_mc_mmap_mmio(struct vfio_fsl_mc_region region,
+ 	if (!region_cacheable)
+ 		vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+ 
+-	vma->vm_pgoff = (region.addr >> PAGE_SHIFT) + pgoff;
++	vma->vm_pgoff = (region.addr >> MMUPAGE_SHIFT) + pgoff;
+ 
+ 	return remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
+ 			       size, vma->vm_page_prot);
+@@ -383,7 +383,7 @@ static int vfio_fsl_mc_mmap(struct vfio_device *core_vdev,
+ 	struct fsl_mc_device *mc_dev = vdev->mc_dev;
+ 	unsigned int index;
+ 
+-	index = vma->vm_pgoff >> (VFIO_FSL_MC_OFFSET_SHIFT - PAGE_SHIFT);
++	index = vma->vm_pgoff >> (VFIO_FSL_MC_OFFSET_SHIFT - MMUPAGE_SHIFT);
+ 
+ 	if (vma->vm_end < vma->vm_start)
+ 		return -EINVAL;
+diff --git a/drivers/vfio/pci/hisilicon/hisi_acc_vfio_pci.c b/drivers/vfio/pci/hisilicon/hisi_acc_vfio_pci.c
+index bb121f635b9f..c45986a1c2a0 100644
+--- a/drivers/vfio/pci/hisilicon/hisi_acc_vfio_pci.c
++++ b/drivers/vfio/pci/hisilicon/hisi_acc_vfio_pci.c
+@@ -1356,7 +1356,7 @@ static int hisi_acc_vfio_pci_mmap(struct vfio_device *core_vdev,
+ 		container_of(core_vdev, struct vfio_pci_core_device, vdev);
+ 	unsigned int index;
+ 
+-	index = vma->vm_pgoff >> (VFIO_PCI_OFFSET_SHIFT - PAGE_SHIFT);
++	index = vma->vm_pgoff >> (VFIO_PCI_OFFSET_SHIFT - MMUPAGE_SHIFT);
+ 	if (index == VFIO_PCI_BAR2_REGION_INDEX) {
+ 		u64 req_len, pgoff, req_start;
+ 		resource_size_t end;
+diff --git a/drivers/vfio/pci/nvgrace-gpu/main.c b/drivers/vfio/pci/nvgrace-gpu/main.c
+index fa056b69f899..ecfe4af6c7ce 100644
+--- a/drivers/vfio/pci/nvgrace-gpu/main.c
++++ b/drivers/vfio/pci/nvgrace-gpu/main.c
+@@ -300,7 +300,7 @@ static vm_fault_t nvgrace_gpu_vfio_pci_huge_fault(struct vm_fault *vmf,
+ 	struct nvgrace_gpu_pci_core_device *nvdev = vma->vm_private_data;
+ 	struct vfio_pci_core_device *vdev = &nvdev->core_device;
+ 	unsigned int index =
+-		vma->vm_pgoff >> (VFIO_PCI_OFFSET_SHIFT - PAGE_SHIFT);
++		vma->vm_pgoff >> (VFIO_PCI_OFFSET_SHIFT - MMUPAGE_SHIFT);
+ 	vm_fault_t ret = VM_FAULT_FALLBACK;
+ 	struct mem_region *memregion;
+ 	unsigned long pfn, addr;
+@@ -362,7 +362,7 @@ static int nvgrace_gpu_mmap(struct vfio_device *core_vdev,
+ 	u64 req_len, pgoff, end;
+ 	unsigned int index;
+ 
+-	index = vma->vm_pgoff >> (VFIO_PCI_OFFSET_SHIFT - PAGE_SHIFT);
++	index = vma->vm_pgoff >> (VFIO_PCI_OFFSET_SHIFT - MMUPAGE_SHIFT);
+ 
+ 	memregion = nvgrace_gpu_memregion(index, nvdev);
+ 	if (!memregion)
+diff --git a/drivers/vfio/pci/vfio_pci_core.c b/drivers/vfio/pci/vfio_pci_core.c
+index 050e7542952e..9b12bc63f896 100644
+--- a/drivers/vfio/pci/vfio_pci_core.c
++++ b/drivers/vfio/pci/vfio_pci_core.c
+@@ -1686,7 +1686,7 @@ void vfio_pci_memory_unlock_and_restore(struct vfio_pci_core_device *vdev, u16 c
+ static unsigned long vma_to_pfn(struct vm_area_struct *vma)
+ {
+ 	struct vfio_pci_core_device *vdev = vma->vm_private_data;
+-	int index = vma->vm_pgoff >> (VFIO_PCI_OFFSET_SHIFT - PAGE_SHIFT);
++	int index = vma->vm_pgoff >> (VFIO_PCI_OFFSET_SHIFT - MMUPAGE_SHIFT);
+ 	u64 pgoff;
+ 
+ 	pgoff = vma->vm_pgoff &
+@@ -1764,7 +1764,7 @@ int vfio_pci_core_mmap(struct vfio_device *core_vdev, struct vm_area_struct *vma
+ 	u64 phys_len, req_len, pgoff, req_start;
+ 	int ret;
+ 
+-	index = vma->vm_pgoff >> (VFIO_PCI_OFFSET_SHIFT - PAGE_SHIFT);
++	index = vma->vm_pgoff >> (VFIO_PCI_OFFSET_SHIFT - MMUPAGE_SHIFT);
+ 
+ 	if (index >= VFIO_PCI_NUM_REGIONS + vdev->num_regions)
+ 		return -EINVAL;
+diff --git a/drivers/vfio/platform/vfio_platform_common.c b/drivers/vfio/platform/vfio_platform_common.c
+index c72db5a99ebd..e22d0fc2f2d1 100644
+--- a/drivers/vfio/platform/vfio_platform_common.c
++++ b/drivers/vfio/platform/vfio_platform_common.c
+@@ -559,7 +559,7 @@ static int vfio_platform_mmap_mmio(struct vfio_platform_region region,
+ 		return -EINVAL;
+ 
+ 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+-	vma->vm_pgoff = (region.addr >> PAGE_SHIFT) + pgoff;
++	vma->vm_pgoff = (region.addr >> MMUPAGE_SHIFT) + pgoff;
+ 
+ 	return remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
+ 			       req_len, vma->vm_page_prot);
+@@ -571,7 +571,7 @@ int vfio_platform_mmap(struct vfio_device *core_vdev, struct vm_area_struct *vma
+ 		container_of(core_vdev, struct vfio_platform_device, vdev);
+ 	unsigned int index;
+ 
+-	index = vma->vm_pgoff >> (VFIO_PLATFORM_OFFSET_SHIFT - PAGE_SHIFT);
++	index = vma->vm_pgoff >> (VFIO_PLATFORM_OFFSET_SHIFT - MMUPAGE_SHIFT);
+ 
+ 	if (vma->vm_end < vma->vm_start)
+ 		return -EINVAL;
+diff --git a/drivers/vhost/vdpa.c b/drivers/vhost/vdpa.c
+index 692564b1bcbb..a1bedab1893f 100644
+--- a/drivers/vhost/vdpa.c
++++ b/drivers/vhost/vdpa.c
+@@ -1069,7 +1069,7 @@ static int vhost_vdpa_va_map(struct vhost_vdpa *v,
+ 			ret = -ENOMEM;
+ 			break;
+ 		}
+-		offset = (vma->vm_pgoff << PAGE_SHIFT) + uaddr - vma->vm_start;
++		offset = (vma->vm_pgoff << MMUPAGE_SHIFT) + uaddr - vma->vm_start;
+ 		map_file->offset = offset;
+ 		map_file->file = get_file(vma->vm_file);
+ 		ret = vhost_vdpa_map(v, iotlb, map_iova, map_size, uaddr,
+diff --git a/drivers/video/fbdev/aty/atyfb_base.c b/drivers/video/fbdev/aty/atyfb_base.c
+index 9fc5af09f86c..5380fcdcb99b 100644
+--- a/drivers/video/fbdev/aty/atyfb_base.c
++++ b/drivers/video/fbdev/aty/atyfb_base.c
+@@ -1946,7 +1946,7 @@ static int atyfb_mmap(struct fb_info *info, struct vm_area_struct *vma)
+ 	if (vma->vm_pgoff > (~0UL >> PAGE_SHIFT))
+ 		return -EINVAL;
+ 
+-	off = vma->vm_pgoff << PAGE_SHIFT;
++	off = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	size = vma->vm_end - vma->vm_start;
+ 
+ 	/* VM_IO | VM_DONTEXPAND | VM_DONTDUMP are set by remap_pfn_range() */
+diff --git a/drivers/video/fbdev/core/fb_defio.c b/drivers/video/fbdev/core/fb_defio.c
+index fd00b86e1ae6..491b3ecc560f 100644
+--- a/drivers/video/fbdev/core/fb_defio.c
++++ b/drivers/video/fbdev/core/fb_defio.c
+@@ -235,7 +235,7 @@ static vm_fault_t fb_deferred_io_fault(struct vm_fault *vmf)
+ 		goto err_mutex_unlock;
+ 	}
+ 
+-	offset = vmf->pgoff << PAGE_SHIFT;
++	offset = vmf->pgoff << MMUPAGE_SHIFT;
+ 	if (offset >= info->fix.smem_len) {
+ 		ret = VM_FAULT_SIGBUS;
+ 		goto err_mutex_unlock;
+@@ -336,7 +336,7 @@ static vm_fault_t fb_deferred_io_track_page(struct fb_deferred_io_state *fbdefio
+ static vm_fault_t fb_deferred_io_page_mkwrite(struct fb_deferred_io_state *fbdefio_state,
+ 					      struct vm_fault *vmf)
+ {
+-	unsigned long offset = vmf->pgoff << PAGE_SHIFT;
++	unsigned long offset = vmf->pgoff << MMUPAGE_SHIFT;
+ 	struct page *page = vmf->page;
+ 
+ 	file_update_time(vmf->vma->vm_file);
+diff --git a/drivers/video/fbdev/efifb.c b/drivers/video/fbdev/efifb.c
+index 47ebc0107209..e6743af401b1 100644
+--- a/drivers/video/fbdev/efifb.c
++++ b/drivers/video/fbdev/efifb.c
+@@ -433,8 +433,8 @@ static int efifb_probe(struct platform_device *dev)
+ 	size_remap  = size_vmode * 2;
+ 	if (size_remap > size_total)
+ 		size_remap = size_total;
+-	if (size_remap % PAGE_SIZE)
+-		size_remap += PAGE_SIZE - (size_remap % PAGE_SIZE);
++	if (size_remap % MMUPAGE_SIZE)
++		size_remap += MMUPAGE_SIZE - (size_remap % MMUPAGE_SIZE);
+ 	efifb_fix.smem_len = size_remap;
+ 
+ 	if (request_mem_region(efifb_fix.smem_start, size_remap, "efifb")) {
+diff --git a/drivers/video/fbdev/ep93xx-fb.c b/drivers/video/fbdev/ep93xx-fb.c
+index 801ef427f1ba..e63a41a9be81 100644
+--- a/drivers/video/fbdev/ep93xx-fb.c
++++ b/drivers/video/fbdev/ep93xx-fb.c
+@@ -309,7 +309,7 @@ static int ep93xxfb_check_var(struct fb_var_screeninfo *var,
+ 
+ static int ep93xxfb_mmap(struct fb_info *info, struct vm_area_struct *vma)
+ {
+-	unsigned int offset = vma->vm_pgoff << PAGE_SHIFT;
++	unsigned int offset = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 
+ 	vma->vm_page_prot = pgprot_decrypted(vma->vm_page_prot);
+ 
+diff --git a/drivers/video/fbdev/gbefb.c b/drivers/video/fbdev/gbefb.c
+index cb6ff15a21db..33a5a211611a 100644
+--- a/drivers/video/fbdev/gbefb.c
++++ b/drivers/video/fbdev/gbefb.c
+@@ -996,7 +996,7 @@ static int gbefb_mmap(struct fb_info *info,
+ 			struct vm_area_struct *vma)
+ {
+ 	unsigned long size = vma->vm_end - vma->vm_start;
+-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
++	unsigned long offset = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	unsigned long addr;
+ 	unsigned long phys_addr, phys_size;
+ 	u16 *tile;
+diff --git a/drivers/video/fbdev/omap2/omapfb/omapfb-main.c b/drivers/video/fbdev/omap2/omapfb/omapfb-main.c
+index d70deb6a9150..2284ebaca5af 100644
+--- a/drivers/video/fbdev/omap2/omapfb/omapfb-main.c
++++ b/drivers/video/fbdev/omap2/omapfb/omapfb-main.c
+@@ -1103,7 +1103,7 @@ static int omapfb_mmap(struct fb_info *fbi, struct vm_area_struct *vma)
+ 	len = fix->smem_len;
+ 
+ 	DBG("user mmap region start %lx, len %d, off %lx\n", start, len,
+-			vma->vm_pgoff << PAGE_SHIFT);
++			vma->vm_pgoff << MMUPAGE_SHIFT);
+ 
+ 	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+ 	vma->vm_ops = &mmap_user_ops;
+diff --git a/drivers/video/fbdev/ps3fb.c b/drivers/video/fbdev/ps3fb.c
+index dbcda307f6a6..25bcc71f7f30 100644
+--- a/drivers/video/fbdev/ps3fb.c
++++ b/drivers/video/fbdev/ps3fb.c
+@@ -713,7 +713,7 @@ static int ps3fb_mmap(struct fb_info *info, struct vm_area_struct *vma)
+ 	r = vm_iomap_memory(vma, info->fix.smem_start, info->fix.smem_len);
+ 
+ 	dev_dbg(info->device, "ps3fb: mmap framebuffer P(%lx)->V(%lx)\n",
+-		info->fix.smem_start + (vma->vm_pgoff << PAGE_SHIFT),
++		info->fix.smem_start + (vma->vm_pgoff << MMUPAGE_SHIFT),
+ 		vma->vm_start);
+ 
+ 	return r;
+diff --git a/drivers/video/fbdev/sa1100fb.c b/drivers/video/fbdev/sa1100fb.c
+index 0d362d2bf0e3..83a94f9b3b22 100644
+--- a/drivers/video/fbdev/sa1100fb.c
++++ b/drivers/video/fbdev/sa1100fb.c
+@@ -560,7 +560,7 @@ static int sa1100fb_mmap(struct fb_info *info,
+ {
+ 	struct sa1100fb_info *fbi =
+ 		container_of(info, struct sa1100fb_info, fb);
+-	unsigned long off = vma->vm_pgoff << PAGE_SHIFT;
++	unsigned long off = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 
+ 	vma->vm_page_prot = pgprot_decrypted(vma->vm_page_prot);
+ 
+diff --git a/drivers/video/fbdev/sbuslib.c b/drivers/video/fbdev/sbuslib.c
+index dd2002d0810f..06cff8bec6c1 100644
+--- a/drivers/video/fbdev/sbuslib.c
++++ b/drivers/video/fbdev/sbuslib.c
+@@ -57,7 +57,7 @@ int sbusfb_mmap_helper(const struct sbus_mmap_map *map,
+ 	if (vma->vm_pgoff > (~0UL >> PAGE_SHIFT))
+ 		return -EINVAL;
+ 
+-	off = vma->vm_pgoff << PAGE_SHIFT;
++	off = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 
+ 	/* VM_IO | VM_DONTEXPAND | VM_DONTDUMP are set by remap_pfn_range() */
+ 
+diff --git a/drivers/video/fbdev/smscufx.c b/drivers/video/fbdev/smscufx.c
+index 5704f60e1741..b65091f948c3 100644
+--- a/drivers/video/fbdev/smscufx.c
++++ b/drivers/video/fbdev/smscufx.c
+@@ -777,7 +777,7 @@ static int ufx_ops_mmap(struct fb_info *info, struct vm_area_struct *vma)
+ {
+ 	unsigned long start = vma->vm_start;
+ 	unsigned long size = vma->vm_end - vma->vm_start;
+-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
++	unsigned long offset = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	unsigned long page, pos;
+ 
+ 	if (info->fbdefio)
+diff --git a/drivers/video/fbdev/udlfb.c b/drivers/video/fbdev/udlfb.c
+index fdbb8671a810..77dea44ac7e6 100644
+--- a/drivers/video/fbdev/udlfb.c
++++ b/drivers/video/fbdev/udlfb.c
+@@ -344,7 +344,7 @@ static int dlfb_ops_mmap(struct fb_info *info, struct vm_area_struct *vma)
+ {
+ 	unsigned long start = vma->vm_start;
+ 	unsigned long size = vma->vm_end - vma->vm_start;
+-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
++	unsigned long offset = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	unsigned long page, pos;
+ 	struct dlfb_data *dlfb = info->par;
+ 
+diff --git a/drivers/xen/balloon.c b/drivers/xen/balloon.c
+index e7f1d4ca6d75..fb4104515568 100644
+--- a/drivers/xen/balloon.c
++++ b/drivers/xen/balloon.c
+@@ -291,7 +291,7 @@ static enum bp_state reserve_additional_memory(void)
+ 	 * We don't support PV MMU when Linux and Xen is using
+ 	 * different page granularity.
+ 	 */
+-	BUILD_BUG_ON(XEN_PAGE_SIZE != PAGE_SIZE);
++	BUILD_BUG_ON(XEN_PAGE_SIZE != MMUPAGE_SIZE);
+ 
+         /*
+          * add_memory() will build page tables for the new memory so
+@@ -624,7 +624,7 @@ int xen_alloc_ballooned_pages(unsigned int nr_pages, struct page **pages)
+ 			 * We don't support PV MMU when Linux and Xen is using
+ 			 * different page granularity.
+ 			 */
+-			BUILD_BUG_ON(XEN_PAGE_SIZE != PAGE_SIZE);
++			BUILD_BUG_ON(XEN_PAGE_SIZE != MMUPAGE_SIZE);
+ 
+ 			if (xen_pv_domain()) {
+ 				ret = xen_alloc_p2m_entry(page_to_pfn(page));
+diff --git a/drivers/xen/gntalloc.c b/drivers/xen/gntalloc.c
+index eadedd1e963e..c2312c2e3316 100644
+--- a/drivers/xen/gntalloc.c
++++ b/drivers/xen/gntalloc.c
+@@ -510,7 +510,7 @@ static int gntalloc_mmap(struct file *filp, struct vm_area_struct *vma)
+ 	pr_debug("%s: priv %p,%p, page %lu+%d\n", __func__,
+ 		       priv, vm_priv, vma->vm_pgoff, count);
+ 
+-	gref = find_grefs(priv, vma->vm_pgoff << PAGE_SHIFT, count);
++	gref = find_grefs(priv, vma->vm_pgoff << MMUPAGE_SHIFT, count);
+ 	if (gref == NULL) {
+ 		rv = -ENOENT;
+ 		pr_debug("%s: Could not find grant reference",
+diff --git a/drivers/xen/mem-reservation.c b/drivers/xen/mem-reservation.c
+index 24648836e0d4..a9942366349c 100644
+--- a/drivers/xen/mem-reservation.c
++++ b/drivers/xen/mem-reservation.c
+@@ -43,7 +43,7 @@ void __xenmem_reservation_va_mapping_update(unsigned long count,
+ 		 * We don't support PV MMU when Linux and Xen is using
+ 		 * different page granularity.
+ 		 */
+-		BUILD_BUG_ON(XEN_PAGE_SIZE != PAGE_SIZE);
++		BUILD_BUG_ON(XEN_PAGE_SIZE != MMUPAGE_SIZE);
+ 
+ 		set_phys_to_machine(pfn, frames[i]);
+ 
+@@ -69,7 +69,7 @@ void __xenmem_reservation_va_mapping_reset(unsigned long count,
+ 		 * We don't support PV MMU when Linux and Xen are using
+ 		 * different page granularity.
+ 		 */
+-		BUILD_BUG_ON(XEN_PAGE_SIZE != PAGE_SIZE);
++		BUILD_BUG_ON(XEN_PAGE_SIZE != MMUPAGE_SIZE);
+ 
+ 		ret = HYPERVISOR_update_va_mapping(
+ 				(unsigned long)__va(pfn << PAGE_SHIFT),
+-- 
+2.54.0
+

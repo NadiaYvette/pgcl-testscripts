@@ -1,0 +1,865 @@
+From 651b85837ac2fc1a3f59f688cd6740c8e9be1f28 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:28 +0200
+Subject: [RFC PATCH 08/28] fs: page clustering support under PGCL
+
+---
+ fs/9p/vfs_file.c       |  4 +-
+ fs/binfmt_elf.c        | 22 ++++++----
+ fs/btrfs/compression.h |  4 +-
+ fs/btrfs/defrag.c      |  4 +-
+ fs/exec.c              |  4 +-
+ fs/exfat/file.c        |  2 +-
+ fs/fat/dir.c           | 25 ++++++++++-
+ fs/fat/fatent.c        | 22 +++++++++-
+ fs/netfs/iterator.c    | 25 ++++++++---
+ fs/proc/meminfo.c      |  3 ++
+ fs/proc/task_mmu.c     | 96 ++++++++++++++++++++++++------------------
+ fs/proc/task_nommu.c   |  2 +-
+ fs/proc/vmcore.c       |  2 +-
+ fs/splice.c            | 34 ++++++++++++---
+ fs/userfaultfd.c       | 13 +++++-
+ 15 files changed, 185 insertions(+), 77 deletions(-)
+
+diff --git a/fs/9p/vfs_file.c b/fs/9p/vfs_file.c
+index c5e73c37baea..cf12c203dbc3 100644
+--- a/fs/9p/vfs_file.c
++++ b/fs/9p/vfs_file.c
+@@ -494,8 +494,8 @@ static void v9fs_mmap_vm_close(struct vm_area_struct *vma)
+ 	p9_debug(P9_DEBUG_VFS, "9p VMA close, %p, flushing", vma);
+ 
+ 	filemap_fdatawrite_range(file_inode(vma->vm_file)->i_mapping,
+-			(loff_t)vma->vm_pgoff * PAGE_SIZE,
+-			(loff_t)vma->vm_pgoff * PAGE_SIZE +
++			(loff_t)vma->vm_pgoff * MMUPAGE_SIZE,
++			(loff_t)vma->vm_pgoff * MMUPAGE_SIZE +
+ 				(vma->vm_end - vma->vm_start - 1));
+ }
+ 
+diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+index 16a56b6b3f6c..9c054c77cdba 100644
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@ -79,10 +79,10 @@ static int elf_core_dump(struct coredump_params *cprm);
+ #define elf_core_dump	NULL
+ #endif
+ 
+-#if ELF_EXEC_PAGESIZE > PAGE_SIZE
++#if ELF_EXEC_PAGESIZE > MMUPAGE_SIZE
+ #define ELF_MIN_ALIGN	ELF_EXEC_PAGESIZE
+ #else
+-#define ELF_MIN_ALIGN	PAGE_SIZE
++#define ELF_MIN_ALIGN	MMUPAGE_SIZE
+ #endif
+ 
+ #ifndef ELF_CORE_EFLAGS
+@@ -399,6 +399,7 @@ static unsigned long elf_map(struct file *filep, unsigned long addr,
+ 	} else
+ 		map_addr = vm_mmap(filep, addr, size, prot, type, off);
+ 
++
+ 	if ((type & MAP_FIXED_NOREPLACE) &&
+ 	    PTR_ERR((void *)map_addr) == -EEXIST)
+ 		pr_info("%d (%s): Uhuuh, elf segment at %px requested but the memory is mapped already\n",
+@@ -421,8 +422,9 @@ static unsigned long elf_load(struct file *filep, unsigned long addr,
+ 
+ 	if (eppnt->p_filesz) {
+ 		map_addr = elf_map(filep, addr, eppnt, prot, type, total_size);
+-		if (BAD_ADDR(map_addr))
++		if (BAD_ADDR(map_addr)) {
+ 			return map_addr;
++		}
+ 		if (eppnt->p_memsz > eppnt->p_filesz) {
+ 			zero_start = map_addr + ELF_PAGEOFFSET(eppnt->p_vaddr) +
+ 				eppnt->p_filesz;
+@@ -433,8 +435,9 @@ static unsigned long elf_load(struct file *filep, unsigned long addr,
+ 			 * Zero the end of the last mapped page but ignore
+ 			 * any errors if the segment isn't writable.
+ 			 */
+-			if (padzero(zero_start) && (prot & PROT_WRITE))
++			if (padzero(zero_start) && (prot & PROT_WRITE)) {
+ 				return -EFAULT;
++			}
+ 		}
+ 	} else {
+ 		map_addr = zero_start = ELF_PAGESTART(addr);
+@@ -1027,8 +1030,9 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 	   change some of these later */
+ 	retval = setup_arg_pages(bprm, randomize_stack_top(STACK_TOP),
+ 				 executable_stack);
+-	if (retval < 0)
++	if (retval < 0) {
+ 		goto out_free_dentry;
++	}
+ 
+ 	elf_brk = 0;
+ 
+@@ -1335,7 +1339,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 		 * leave a gap between .bss and brk.
+ 		 */
+ 		if (!brk_moved)
+-			mm->brk = mm->start_brk = mm->brk + PAGE_SIZE;
++			mm->brk = mm->start_brk = mm->brk + MMUPAGE_SIZE;
+ 
+ 		mm->brk = mm->start_brk = arch_randomize_brk(mm);
+ 		brk_moved = true;
+@@ -1351,10 +1355,10 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 		   and some applications "depend" upon this behavior.
+ 		   Since we do not have the power to recompile these, we
+ 		   emulate the SVr4 behavior. Sigh. */
+-		error = vm_mmap(NULL, 0, PAGE_SIZE, PROT_READ | PROT_EXEC,
++		error = vm_mmap(NULL, 0, MMUPAGE_SIZE, PROT_READ | PROT_EXEC,
+ 				MAP_FIXED | MAP_PRIVATE, 0);
+ 
+-		retval = do_mseal(0, PAGE_SIZE, 0);
++		retval = do_mseal(0, MMUPAGE_SIZE, 0);
+ 		if (retval)
+ 			pr_warn_ratelimited("pid=%d, couldn't seal address 0, ret=%d.\n",
+ 					    task_pid_nr(current), retval);
+@@ -1658,7 +1662,7 @@ static int fill_files_note(struct memelfnote *note, struct coredump_params *cprm
+ 
+ 	/* Now we know exact count of files, can store it */
+ 	data[0] = count;
+-	data[1] = PAGE_SIZE;
++	data[1] = ELF_EXEC_PAGESIZE;
+ 	/*
+ 	 * Count usually is less than mm->map_count,
+ 	 * we need to move filenames down.
+diff --git a/fs/btrfs/compression.h b/fs/btrfs/compression.h
+index 1022dc53ec51..6d386bda94d7 100644
+--- a/fs/btrfs/compression.h
++++ b/fs/btrfs/compression.h
+@@ -33,8 +33,8 @@ struct btrfs_ordered_extent;
+ 
+ /* Maximum length of compressed data stored on disk */
+ #define BTRFS_MAX_COMPRESSED		(SZ_128K)
+-#define BTRFS_MAX_COMPRESSED_PAGES	(BTRFS_MAX_COMPRESSED / PAGE_SIZE)
+-static_assert((BTRFS_MAX_COMPRESSED % PAGE_SIZE) == 0);
++#define BTRFS_MAX_COMPRESSED_PAGES	(BTRFS_MAX_COMPRESSED / MMUPAGE_SIZE)
++static_assert((BTRFS_MAX_COMPRESSED % MMUPAGE_SIZE) == 0);
+ 
+ /* The max size for a single worker to compress. */
+ #define BTRFS_COMPRESSION_CHUNK_SIZE	(SZ_512K)
+diff --git a/fs/btrfs/defrag.c b/fs/btrfs/defrag.c
+index 7e2db5d3a4d4..fc303bbc35ca 100644
+--- a/fs/btrfs/defrag.c
++++ b/fs/btrfs/defrag.c
+@@ -1129,7 +1129,7 @@ static int defrag_collect_targets(struct btrfs_inode *inode,
+ }
+ 
+ #define CLUSTER_SIZE	(SZ_256K)
+-static_assert(PAGE_ALIGNED(CLUSTER_SIZE));
++static_assert(MMUPAGE_ALIGNED(CLUSTER_SIZE));
+ 
+ /*
+  * Defrag one contiguous target range.
+@@ -1203,7 +1203,7 @@ static int defrag_one_range(struct btrfs_inode *inode, u64 start, u32 len,
+ 				      (start >> PAGE_SHIFT) + 1;
+ 	int ret = 0;
+ 
+-	ASSERT(nr_pages <= CLUSTER_SIZE / PAGE_SIZE);
++	ASSERT(nr_pages <= DIV_ROUND_UP(CLUSTER_SIZE, PAGE_SIZE));
+ 	ASSERT(IS_ALIGNED(start, sectorsize) && IS_ALIGNED(len, sectorsize));
+ 
+ 	folios = kzalloc_objs(struct folio *, nr_pages, GFP_NOFS);
+diff --git a/fs/exec.c b/fs/exec.c
+index ba12b4c466f6..6017b09603dd 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -626,14 +626,14 @@ int setup_arg_pages(struct linux_binprm *bprm,
+ 	if (vma->vm_end - vma->vm_start > stack_base)
+ 		return -ENOMEM;
+ 
+-	stack_base = PAGE_ALIGN(stack_top - stack_base);
++	stack_base = MMUPAGE_ALIGN(stack_top - stack_base);
+ 
+ 	stack_shift = vma->vm_start - stack_base;
+ 	mm->arg_start = bprm->p - stack_shift;
+ 	bprm->p = vma->vm_end - stack_shift;
+ #else
+ 	stack_top = arch_align_stack(stack_top);
+-	stack_top = PAGE_ALIGN(stack_top);
++	stack_top = MMUPAGE_ALIGN(stack_top);
+ 
+ 	if (unlikely(stack_top < mmap_min_addr) ||
+ 	    unlikely(vma->vm_end - vma->vm_start >= stack_top - mmap_min_addr))
+diff --git a/fs/exfat/file.c b/fs/exfat/file.c
+index 354bdcfe4abc..30aa2c725449 100644
+--- a/fs/exfat/file.c
++++ b/fs/exfat/file.c
+@@ -757,7 +757,7 @@ static vm_fault_t exfat_page_mkwrite(struct vm_fault *vmf)
+ 	if (!inode_trylock(inode))
+ 		return VM_FAULT_RETRY;
+ 
+-	new_valid_size = ((loff_t)vmf->pgoff + 1) << PAGE_SHIFT;
++	new_valid_size = ((loff_t)vmf->pgoff + 1) << MMUPAGE_SHIFT;
+ 	new_valid_size = min(new_valid_size, i_size_read(inode));
+ 
+ 	if (ei->valid_size < new_valid_size) {
+diff --git a/fs/fat/dir.c b/fs/fat/dir.c
+index 4f6f42f33613..fc6d3d4060be 100644
+--- a/fs/fat/dir.c
++++ b/fs/fat/dir.c
+@@ -1149,13 +1149,22 @@ int fat_alloc_new_dir(struct inode *dir, struct timespec64 *ts)
+ {
+ 	struct super_block *sb = dir->i_sb;
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+-	struct buffer_head *bhs[MAX_BUF_PER_PAGE];
++	struct buffer_head **bhs;
+ 	struct msdos_dir_entry *de;
+ 	sector_t blknr;
+ 	__le16 date, time;
+ 	u8 time_cs;
+ 	int err, cluster;
+ 
++	/*
++	 * MAX_BUF_PER_PAGE scales with PAGE_SIZE (PAGE_SIZE / 512), so
++	 * a stack array can blow the 2 KiB frame budget under PGCL with
++	 * PAGE_MMUSHIFT >= 4.  Heap-allocate instead.
++	 */
++	bhs = kmalloc_array(MAX_BUF_PER_PAGE, sizeof(*bhs), GFP_KERNEL);
++	if (!bhs)
++		return -ENOMEM;
++
+ 	err = fat_alloc_clusters(dir, &cluster, 1);
+ 	if (err)
+ 		goto error;
+@@ -1201,11 +1210,13 @@ int fat_alloc_new_dir(struct inode *dir, struct timespec64 *ts)
+ 	if (err)
+ 		goto error_free;
+ 
++	kfree(bhs);
+ 	return cluster;
+ 
+ error_free:
+ 	fat_free_clusters(dir, cluster);
+ error:
++	kfree(bhs);
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(fat_alloc_new_dir);
+@@ -1216,11 +1227,19 @@ static int fat_add_new_entries(struct inode *dir, void *slots, int nr_slots,
+ {
+ 	struct super_block *sb = dir->i_sb;
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+-	struct buffer_head *bhs[MAX_BUF_PER_PAGE];
++	struct buffer_head **bhs;
+ 	sector_t blknr, start_blknr, last_blknr;
+ 	unsigned long size, copy;
+ 	int err, i, n, offset, cluster[2];
+ 
++	/*
++	 * MAX_BUF_PER_PAGE scales with PAGE_SIZE; heap-allocate to avoid
++	 * blowing the 2 KiB stack frame budget under PGCL.
++	 */
++	bhs = kmalloc_array(MAX_BUF_PER_PAGE, sizeof(*bhs), GFP_KERNEL);
++	if (!bhs)
++		return -ENOMEM;
++
+ 	/*
+ 	 * The minimum cluster size is 512bytes, and maximum entry
+ 	 * size is 32*slots (672bytes).  So, iff the cluster size is
+@@ -1279,6 +1298,7 @@ static int fat_add_new_entries(struct inode *dir, void *slots, int nr_slots,
+ 	if (err)
+ 		goto error_free;
+ 
++	kfree(bhs);
+ 	return cluster[0];
+ 
+ error_free:
+@@ -1290,6 +1310,7 @@ static int fat_add_new_entries(struct inode *dir, void *slots, int nr_slots,
+ 		bforget(bhs[i]);
+ 	fat_free_clusters(dir, cluster[0]);
+ error:
++	kfree(bhs);
+ 	return err;
+ }
+ 
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index f0801d99dd62..a75fe3af9b8d 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -474,11 +474,19 @@ int fat_alloc_clusters(struct inode *inode, int *cluster, int nr_cluster)
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+ 	const struct fatent_operations *ops = sbi->fatent_ops;
+ 	struct fat_entry fatent, prev_ent;
+-	struct buffer_head *bhs[MAX_BUF_PER_PAGE];
++	struct buffer_head **bhs;
+ 	int i, count, err, nr_bhs, idx_clus;
+ 
+ 	BUG_ON(nr_cluster > (MAX_BUF_PER_PAGE / 2));	/* fixed limit */
+ 
++	/*
++	 * MAX_BUF_PER_PAGE scales with PAGE_SIZE; heap-allocate to avoid
++	 * blowing the 2 KiB stack frame budget under PGCL.
++	 */
++	bhs = kmalloc_array(MAX_BUF_PER_PAGE, sizeof(*bhs), GFP_KERNEL);
++	if (!bhs)
++		return -ENOMEM;
++
+ 	lock_fat(sbi);
+ 	if (sbi->free_clusters != -1 && sbi->free_clus_valid &&
+ 	    sbi->free_clusters < nr_cluster) {
+@@ -553,6 +561,7 @@ int fat_alloc_clusters(struct inode *inode, int *cluster, int nr_cluster)
+ 	if (err && idx_clus)
+ 		fat_free_clusters(inode, cluster[0]);
+ 
++	kfree(bhs);
+ 	return err;
+ }
+ 
+@@ -562,10 +571,18 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+ 	const struct fatent_operations *ops = sbi->fatent_ops;
+ 	struct fat_entry fatent;
+-	struct buffer_head *bhs[MAX_BUF_PER_PAGE];
++	struct buffer_head **bhs;
+ 	int i, err, nr_bhs;
+ 	int first_cl = cluster, dirty_fsinfo = 0;
+ 
++	/*
++	 * MAX_BUF_PER_PAGE scales with PAGE_SIZE; heap-allocate to avoid
++	 * blowing the 2 KiB stack frame budget under PGCL.
++	 */
++	bhs = kmalloc_array(MAX_BUF_PER_PAGE, sizeof(*bhs), GFP_KERNEL);
++	if (!bhs)
++		return -ENOMEM;
++
+ 	nr_bhs = 0;
+ 	fatent_init(&fatent);
+ 	lock_fat(sbi);
+@@ -635,6 +652,7 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 	if (dirty_fsinfo)
+ 		mark_fsinfo_dirty(sb);
+ 
++	kfree(bhs);
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(fat_free_clusters);
+diff --git a/fs/netfs/iterator.c b/fs/netfs/iterator.c
+index b375567e0520..c93f101683e1 100644
+--- a/fs/netfs/iterator.c
++++ b/fs/netfs/iterator.c
+@@ -64,6 +64,8 @@ ssize_t netfs_extract_user_iter(struct iov_iter *orig, size_t orig_len,
+ 	pages = (void *)bv + bv_size - pg_size;
+ 
+ 	while (count && npages < max_pages) {
++		size_t page_off;
++
+ 		ret = iov_iter_extract_pages(orig, &pages, count,
+ 					     max_pages - npages, extraction_flags,
+ 					     &offset);
+@@ -79,7 +81,11 @@ ssize_t netfs_extract_user_iter(struct iov_iter *orig, size_t orig_len,
+ 			break;
+ 		}
+ 
+-		cur_npages = DIV_ROUND_UP(offset + ret, PAGE_SIZE);
++		/*
++		 * GUP returns one entry per MMUPAGE, not per kernel PAGE.
++		 * Count and bound-check in MMUPAGE units.
++		 */
++		cur_npages = DIV_ROUND_UP(offset + ret, MMUPAGE_SIZE);
+ 		if (WARN(cur_npages > max_pages - npages,
+ 			 "%s: extract_pages overrun %u > %u pages\n",
+ 			 __func__, npages + cur_npages, max_pages)) {
+@@ -88,13 +94,22 @@ ssize_t netfs_extract_user_iter(struct iov_iter *orig, size_t orig_len,
+ 		}
+ 
+ 		count -= ret;
+-		ret += offset;
+ 
++		/*
++		 * Set up bvecs with the correct offset within each kernel
++		 * page.  The first entry starts at the kernel-page offset
++		 * of the original address; subsequent entries advance by
++		 * MMUPAGE_SIZE, wrapping at PAGE_SIZE boundaries.
++		 */
++		page_off = offset;
+ 		for (i = 0; i < cur_npages; i++) {
+-			len = ret > PAGE_SIZE ? PAGE_SIZE : ret;
+-			bvec_set_page(bv + npages + i, *pages++, len - offset, offset);
++			len = min_t(size_t, ret, MMUPAGE_SIZE);
++			if (i == 0)
++				len = min_t(size_t, len,
++					    MMUPAGE_SIZE - (offset & ~MMUPAGE_MASK));
++			bvec_set_page(bv + npages + i, *pages++, len, page_off);
+ 			ret -= len;
+-			offset = 0;
++			page_off = (page_off + len) & (PAGE_SIZE - 1);
+ 		}
+ 
+ 		npages += cur_npages;
+diff --git a/fs/proc/meminfo.c b/fs/proc/meminfo.c
+index b2813ff13cb2..cf845b1385d6 100644
+--- a/fs/proc/meminfo.c
++++ b/fs/proc/meminfo.c
+@@ -170,6 +170,9 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
+ 	show_val_kb(m, "GPUReclaim:     ",
+ 		    global_node_page_state(NR_GPU_RECLAIM));
+ 
++	seq_printf(m, "PageSize:       %8lu kB\n", PAGE_SIZE >> 10);
++	seq_printf(m, "BasePageSize:   %8lu kB\n", MMUPAGE_SIZE >> 10);
++
+ 	hugetlb_report_meminfo(m);
+ 
+ 	arch_report_meminfo(m);
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 751b9ba160fb..20596ede0b93 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -33,7 +33,7 @@
+ #define SENTINEL_VMA_GATE	-2
+ 
+ #define SEQ_PUT_DEC(str, val) \
+-		seq_put_decimal_ull_width(m, str, (val) << (PAGE_SHIFT-10), 8)
++		seq_put_decimal_ull_width(m, str, (val) << (MMUPAGE_SHIFT-10), 8)
+ void task_mem(struct seq_file *m, struct mm_struct *mm)
+ {
+ 	unsigned long text, lib, swap, anon, file, shmem;
+@@ -58,9 +58,9 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
+ 		hiwater_rss = mm->hiwater_rss;
+ 
+ 	/* split executable areas between text and lib */
+-	text = PAGE_ALIGN(mm->end_code) - (mm->start_code & PAGE_MASK);
+-	text = min(text, mm->exec_vm << PAGE_SHIFT);
+-	lib = (mm->exec_vm << PAGE_SHIFT) - text;
++	text = MMUPAGE_ALIGN(mm->end_code) - (mm->start_code & MMUPAGE_MASK);
++	text = min(text, mm->exec_vm << MMUPAGE_SHIFT);
++	lib = (mm->exec_vm << MMUPAGE_SHIFT) - text;
+ 
+ 	swap = get_mm_counter_sum(mm, MM_SWAPENTS);
+ 	SEQ_PUT_DEC("VmPeak:\t", hiwater_vm);
+@@ -88,7 +88,7 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
+ 
+ unsigned long task_vsize(struct mm_struct *mm)
+ {
+-	return PAGE_SIZE * mm->total_vm;
++	return MMUPAGE_SIZE * mm->total_vm;
+ }
+ 
+ unsigned long task_statm(struct mm_struct *mm,
+@@ -97,8 +97,8 @@ unsigned long task_statm(struct mm_struct *mm,
+ {
+ 	*shared = get_mm_counter_sum(mm, MM_FILEPAGES) +
+ 			get_mm_counter_sum(mm, MM_SHMEMPAGES);
+-	*text = (PAGE_ALIGN(mm->end_code) - (mm->start_code & PAGE_MASK))
+-								>> PAGE_SHIFT;
++	*text = (MMUPAGE_ALIGN(mm->end_code) - (mm->start_code & MMUPAGE_MASK))
++								>> MMUPAGE_SHIFT;
+ 	*data = mm->data_vm + mm->stack_vm;
+ 	*resident = *shared + get_mm_counter_sum(mm, MM_ANONPAGES);
+ 	return mm->total_vm;
+@@ -475,7 +475,7 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
+ 
+ 		dev = inode->i_sb->s_dev;
+ 		ino = inode->i_ino;
+-		pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
++		pgoff = ((loff_t)vma->vm_pgoff) << MMUPAGE_SHIFT;
+ 	}
+ 
+ 	start = vma->vm_start;
+@@ -717,7 +717,7 @@ static int do_procmap_query(struct mm_struct *mm, void __user *uarg)
+ 	if (vma->vm_file) {
+ 		const struct inode *inode = file_user_inode(vma->vm_file);
+ 
+-		karg.vma_offset = ((__u64)vma->vm_pgoff) << PAGE_SHIFT;
++		karg.vma_offset = ((__u64)vma->vm_pgoff) << MMUPAGE_SHIFT;
+ 		karg.dev_major = MAJOR(inode->i_sb->s_dev);
+ 		karg.dev_minor = MINOR(inode->i_sb->s_dev);
+ 		karg.inode = inode->i_ino;
+@@ -919,7 +919,12 @@ static void smaps_account(struct mem_size_stats *mss, struct page *page,
+ {
+ 	struct folio *folio = page_folio(page);
+ 	int i, nr = compound ? compound_nr(page) : 1;
+-	unsigned long size = nr * PAGE_SIZE;
++	/*
++	 * For PTE-level entries (compound=false), each call represents one
++	 * MMUPAGE of virtual address space.  For PMD-level entries
++	 * (compound=true), nr is in kernel pages.
++	 */
++	unsigned long size = compound ? nr * PAGE_SIZE : MMUPAGE_SIZE;
+ 	bool exclusive;
+ 	int mapcount;
+ 
+@@ -974,16 +979,25 @@ static void smaps_account(struct mem_size_stats *mss, struct page *page,
+ 	 * mapcount atomically.
+ 	 */
+ 	for (i = 0; i < nr; i++, page++) {
+-		unsigned long pss = PAGE_SIZE << PSS_SHIFT;
++		unsigned long pss = MMUPAGE_SIZE << PSS_SHIFT;
+ 
+ 		if (IS_ENABLED(CONFIG_PAGE_MAPCOUNT)) {
+ 			mapcount = folio_precise_page_mapcount(folio, page);
++			/*
++			 * With PGCL, non-large folios have one struct page
++			 * mapped by PAGE_MMUCOUNT PTEs per process.  The raw
++			 * mapcount counts PTEs, not processes.  Normalize to
++			 * approximate the number of sharing processes.
++			 */
++			if (!folio_test_large(folio))
++				mapcount = DIV_ROUND_UP(mapcount,
++							PAGE_MMUCOUNT);
+ 			exclusive = mapcount < 2;
+ 		}
+ 
+ 		if (mapcount >= 2)
+ 			pss /= mapcount;
+-		smaps_page_accumulate(mss, folio, PAGE_SIZE, pss,
++		smaps_page_accumulate(mss, folio, MMUPAGE_SIZE, pss,
+ 				dirty, locked, exclusive);
+ 	}
+ }
+@@ -1010,7 +1024,7 @@ static void smaps_pte_hole_lookup(unsigned long addr, struct mm_walk *walk)
+ #ifdef CONFIG_SHMEM
+ 	if (walk->ops->pte_hole) {
+ 		/* depth is not used */
+-		smaps_pte_hole(addr, addr + PAGE_SIZE, 0, walk);
++		smaps_pte_hole(addr, addr + MMUPAGE_SIZE, 0, walk);
+ 	}
+ #endif
+ }
+@@ -1038,15 +1052,15 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
+ 		if (softleaf_is_swap(entry)) {
+ 			int mapcount;
+ 
+-			mss->swap += PAGE_SIZE;
++			mss->swap += MMUPAGE_SIZE;
+ 			mapcount = swp_swapcount(entry);
+ 			if (mapcount >= 2) {
+-				u64 pss_delta = (u64)PAGE_SIZE << PSS_SHIFT;
++				u64 pss_delta = (u64)MMUPAGE_SIZE << PSS_SHIFT;
+ 
+ 				do_div(pss_delta, mapcount);
+ 				mss->swap_pss += pss_delta;
+ 			} else {
+-				mss->swap_pss += (u64)PAGE_SIZE << PSS_SHIFT;
++				mss->swap_pss += (u64)MMUPAGE_SIZE << PSS_SHIFT;
+ 			}
+ 		} else if (softleaf_has_pfn(entry)) {
+ 			if (softleaf_is_device_private(entry))
+@@ -1124,7 +1138,7 @@ static int smaps_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
+ 		walk->action = ACTION_AGAIN;
+ 		return 0;
+ 	}
+-	for (; addr != end; pte++, addr += PAGE_SIZE)
++	for (; addr != end; pte++, addr += MMUPAGE_SIZE)
+ 		smaps_pte_entry(pte, addr, walk);
+ 	pte_unmap_unlock(pte - 1, ptl);
+ out:
+@@ -1712,7 +1726,7 @@ static int clear_refs_pte_range(pmd_t *pmd, unsigned long addr,
+ 		walk->action = ACTION_AGAIN;
+ 		return 0;
+ 	}
+-	for (; addr != end; pte++, addr += PAGE_SIZE) {
++	for (; addr != end; pte++, addr += MMUPAGE_SIZE) {
+ 		ptent = ptep_get(pte);
+ 
+ 		if (cp->type == CLEAR_REFS_SOFT_DIRTY) {
+@@ -1909,7 +1923,7 @@ static int pagemap_pte_hole(unsigned long start, unsigned long end,
+ 		else
+ 			hole_end = end;
+ 
+-		for (; addr < hole_end; addr += PAGE_SIZE) {
++		for (; addr < hole_end; addr += MMUPAGE_SIZE) {
+ 			err = add_to_pagemap(&pme, pm);
+ 			if (err)
+ 				goto out;
+@@ -1921,7 +1935,7 @@ static int pagemap_pte_hole(unsigned long start, unsigned long end,
+ 		/* Addresses in the VMA. */
+ 		if (vma->vm_flags & VM_SOFTDIRTY)
+ 			pme = make_pme(0, PM_SOFT_DIRTY);
+-		for (; addr < min(end, vma->vm_end); addr += PAGE_SIZE) {
++		for (; addr < min(end, vma->vm_end); addr += MMUPAGE_SIZE) {
+ 			err = add_to_pagemap(&pme, pm);
+ 			if (err)
+ 				goto out;
+@@ -2002,7 +2016,7 @@ static int pagemap_pmd_range_thp(pmd_t *pmdp, unsigned long addr,
+ 		unsigned long end, struct vm_area_struct *vma,
+ 		struct pagemapread *pm)
+ {
+-	unsigned int idx = (addr & ~PMD_MASK) >> PAGE_SHIFT;
++	unsigned int idx = (addr & ~PMD_MASK) >> MMUPAGE_SHIFT;
+ 	u64 flags = 0, frame = 0;
+ 	pmd_t pmd = *pmdp;
+ 	struct page *page = NULL;
+@@ -2053,7 +2067,7 @@ static int pagemap_pmd_range_thp(pmd_t *pmdp, unsigned long addr,
+ 	}
+ 
+ populate_pagemap:
+-	for (; addr != end; addr += PAGE_SIZE, idx++) {
++	for (; addr != end; addr += MMUPAGE_SIZE, idx++) {
+ 		u64 cur_flags = flags;
+ 		pagemap_entry_t pme;
+ 
+@@ -2103,7 +2117,7 @@ static int pagemap_pmd_range(pmd_t *pmdp, unsigned long addr, unsigned long end,
+ 		walk->action = ACTION_AGAIN;
+ 		return err;
+ 	}
+-	for (; addr < end; pte++, addr += PAGE_SIZE) {
++	for (; addr < end; pte++, addr += MMUPAGE_SIZE) {
+ 		pagemap_entry_t pme;
+ 
+ 		pme = pte_to_pagemap_entry(pm, vma, addr, ptep_get(pte));
+@@ -2157,7 +2171,7 @@ static int pagemap_hugetlb_range(pte_t *ptep, unsigned long hmask,
+ 		flags |= PM_UFFD_WP;
+ 	}
+ 
+-	for (; addr != end; addr += PAGE_SIZE) {
++	for (; addr != end; addr += MMUPAGE_SIZE) {
+ 		pagemap_entry_t pme = make_pme(frame, flags);
+ 
+ 		err = add_to_pagemap(&pme, pm);
+@@ -2237,7 +2251,7 @@ static ssize_t pagemap_read(struct file *file, char __user *buf,
+ 	/* do not disclose physical addresses: attack vector */
+ 	pm.show_pfn = file_ns_capable(file, &init_user_ns, CAP_SYS_ADMIN);
+ 
+-	pm.len = (PAGEMAP_WALK_SIZE >> PAGE_SHIFT);
++	pm.len = (PAGEMAP_WALK_SIZE >> MMUPAGE_SHIFT);
+ 	pm.buffer = kmalloc_array(pm.len, PM_ENTRY_BYTES, GFP_KERNEL);
+ 	ret = -ENOMEM;
+ 	if (!pm.buffer)
+@@ -2249,16 +2263,16 @@ static ssize_t pagemap_read(struct file *file, char __user *buf,
+ 
+ 	/* watch out for wraparound */
+ 	start_vaddr = end_vaddr;
+-	if (svpfn <= (ULONG_MAX >> PAGE_SHIFT)) {
++	if (svpfn <= (ULONG_MAX >> MMUPAGE_SHIFT)) {
+ 		unsigned long end;
+ 
+ 		ret = mmap_read_lock_killable(mm);
+ 		if (ret)
+ 			goto out_free;
+-		start_vaddr = untagged_addr_remote(mm, svpfn << PAGE_SHIFT);
++		start_vaddr = untagged_addr_remote(mm, svpfn << MMUPAGE_SHIFT);
+ 		mmap_read_unlock(mm);
+ 
+-		end = start_vaddr + ((count / PM_ENTRY_BYTES) << PAGE_SHIFT);
++		end = start_vaddr + ((count / PM_ENTRY_BYTES) << MMUPAGE_SHIFT);
+ 		if (end >= start_vaddr && end < mm->task_size)
+ 			end_vaddr = end;
+ 	}
+@@ -2546,7 +2560,7 @@ static void pagemap_scan_backout_range(struct pagemap_scan_private *p,
+ 	else
+ 		cur_buf->start = cur_buf->end = 0;
+ 
+-	p->found_pages -= (end - addr) / PAGE_SIZE;
++	p->found_pages -= (end - addr) / MMUPAGE_SIZE;
+ }
+ #endif
+ 
+@@ -2658,11 +2672,11 @@ static int pagemap_scan_output(unsigned long categories,
+ 
+ 	categories &= p->arg.return_mask;
+ 
+-	n_pages = (*end - addr) / PAGE_SIZE;
++	n_pages = (*end - addr) / MMUPAGE_SIZE;
+ 	if (check_add_overflow(p->found_pages, n_pages, &total_pages) ||
+ 	    total_pages > p->arg.max_pages) {
+ 		size_t n_too_much = total_pages - p->arg.max_pages;
+-		*end -= n_too_much * PAGE_SIZE;
++		*end -= n_too_much * MMUPAGE_SIZE;
+ 		n_pages -= n_too_much;
+ 		ret = -ENOSPC;
+ 	}
+@@ -2756,7 +2770,7 @@ static int pagemap_scan_pmd_entry(pmd_t *pmd, unsigned long start,
+ 
+ 	if ((p->arg.flags & PM_SCAN_WP_MATCHING) && !p->vec_out) {
+ 		/* Fast path for performing exclusive WP */
+-		for (addr = start; addr != end; pte++, addr += PAGE_SIZE) {
++		for (addr = start; addr != end; pte++, addr += MMUPAGE_SIZE) {
+ 			pte_t ptent = ptep_get(pte);
+ 
+ 			if ((pte_present(ptent) && pte_uffd_wp(ptent)) ||
+@@ -2765,7 +2779,7 @@ static int pagemap_scan_pmd_entry(pmd_t *pmd, unsigned long start,
+ 			make_uffd_wp_pte(vma, addr, pte, ptent);
+ 			if (!flush_end)
+ 				start = addr;
+-			flush_end = addr + PAGE_SIZE;
++			flush_end = addr + MMUPAGE_SIZE;
+ 		}
+ 		goto flush_and_return;
+ 	}
+@@ -2773,8 +2787,8 @@ static int pagemap_scan_pmd_entry(pmd_t *pmd, unsigned long start,
+ 	if (!p->arg.category_anyof_mask && !p->arg.category_inverted &&
+ 	    p->arg.category_mask == PAGE_IS_WRITTEN &&
+ 	    p->arg.return_mask == PAGE_IS_WRITTEN) {
+-		for (addr = start; addr < end; pte++, addr += PAGE_SIZE) {
+-			unsigned long next = addr + PAGE_SIZE;
++		for (addr = start; addr < end; pte++, addr += MMUPAGE_SIZE) {
++			unsigned long next = addr + MMUPAGE_SIZE;
+ 			pte_t ptent = ptep_get(pte);
+ 
+ 			if ((pte_present(ptent) && pte_uffd_wp(ptent)) ||
+@@ -2794,11 +2808,11 @@ static int pagemap_scan_pmd_entry(pmd_t *pmd, unsigned long start,
+ 		goto flush_and_return;
+ 	}
+ 
+-	for (addr = start; addr != end; pte++, addr += PAGE_SIZE) {
++	for (addr = start; addr != end; pte++, addr += MMUPAGE_SIZE) {
+ 		pte_t ptent = ptep_get(pte);
+ 		unsigned long categories = p->cur_vma_category |
+ 					   pagemap_page_category(p, vma, addr, ptent);
+-		unsigned long next = addr + PAGE_SIZE;
++		unsigned long next = addr + MMUPAGE_SIZE;
+ 
+ 		if (!pagemap_scan_is_interesting_page(categories, p))
+ 			continue;
+@@ -2942,7 +2956,7 @@ static int pagemap_scan_get_args(struct pm_scan_arg *arg,
+ 	arg->vec = untagged_addr((unsigned long)arg->vec);
+ 
+ 	/* Validate memory pointers */
+-	if (!IS_ALIGNED(arg->start, PAGE_SIZE))
++	if (!IS_ALIGNED(arg->start, MMUPAGE_SIZE))
+ 		return -EINVAL;
+ 	if (!access_ok((void __user *)(long)arg->start, arg->end - arg->start))
+ 		return -EFAULT;
+@@ -2955,7 +2969,7 @@ static int pagemap_scan_get_args(struct pm_scan_arg *arg,
+ 		return -EFAULT;
+ 
+ 	/* Fixup default values */
+-	arg->end = ALIGN(arg->end, PAGE_SIZE);
++	arg->end = ALIGN(arg->end, MMUPAGE_SIZE);
+ 	arg->walk_end = 0;
+ 	if (!arg->max_pages)
+ 		arg->max_pages = ULONG_MAX;
+@@ -2979,7 +2993,7 @@ static int pagemap_scan_init_bounce_buffer(struct pagemap_scan_private *p)
+ 	if (!p->arg.vec_len)
+ 		return 0;
+ 
+-	p->vec_buf_len = min_t(size_t, PAGEMAP_WALK_SIZE >> PAGE_SHIFT,
++	p->vec_buf_len = min_t(size_t, PAGEMAP_WALK_SIZE >> MMUPAGE_SHIFT,
+ 			       p->arg.vec_len);
+ 	p->vec_buf = kmalloc_objs(*p->vec_buf, p->vec_buf_len);
+ 	if (!p->vec_buf)
+@@ -3249,7 +3263,7 @@ static int gather_pte_stats(pmd_t *pmd, unsigned long addr,
+ 			continue;
+ 		gather_stats(page, md, pte_dirty(ptent), 1);
+ 
+-	} while (pte++, addr += PAGE_SIZE, addr != end);
++	} while (pte++, addr += MMUPAGE_SIZE, addr != end);
+ 	pte_unmap_unlock(orig_pte, ptl);
+ 	cond_resched();
+ 	return 0;
+diff --git a/fs/proc/task_nommu.c b/fs/proc/task_nommu.c
+index d362919f4f68..f8972eb616c6 100644
+--- a/fs/proc/task_nommu.c
++++ b/fs/proc/task_nommu.c
+@@ -140,7 +140,7 @@ static int nommu_vma_show(struct seq_file *m, struct vm_area_struct *vma)
+ 		struct inode *inode = file_inode(vma->vm_file);
+ 		dev = inode->i_sb->s_dev;
+ 		ino = inode->i_ino;
+-		pgoff = (loff_t)vma->vm_pgoff << PAGE_SHIFT;
++		pgoff = (loff_t)vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	}
+ 
+ 	seq_setwidth(m, 25 + sizeof(void *) * 6 - 1);
+diff --git a/fs/proc/vmcore.c b/fs/proc/vmcore.c
+index 44d15436439f..d07cc20f8dff 100644
+--- a/fs/proc/vmcore.c
++++ b/fs/proc/vmcore.c
+@@ -594,7 +594,7 @@ static int mmap_vmcore(struct file *file, struct vm_area_struct *vma)
+ 	u64 start, end, len, tsz;
+ 	struct vmcore_range *m;
+ 
+-	start = (u64)vma->vm_pgoff << PAGE_SHIFT;
++	start = (u64)vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	end = start + size;
+ 
+ 	if (size > vmcore_size || end > vmcore_size)
+diff --git a/fs/splice.c b/fs/splice.c
+index 9d8f63e2fd1a..fa97450224ee 100644
+--- a/fs/splice.c
++++ b/fs/splice.c
+@@ -1455,7 +1455,8 @@ static ssize_t iter_to_pipe(struct iov_iter *from,
+ 		struct page *pages[16];
+ 		ssize_t left;
+ 		size_t start;
+-		int i, n;
++		int i, n, pidx, npages;
++		bool user_pages = user_backed_iter(from);
+ 
+ 		left = iov_iter_get_pages2(from, pages, ~0UL, 16, &start);
+ 		if (left <= 0) {
+@@ -1463,21 +1464,44 @@ static ssize_t iter_to_pipe(struct iov_iter *from,
+ 			break;
+ 		}
+ 
++		/*
++		 * For user-backed iterators, pages[] is MMUPAGE-granular
++		 * (one entry per hardware page from GUP).  For bvec/folioq,
++		 * pages[] is PAGE-granular.  We create kernel-page-granular
++		 * pipe buffers in both cases, but must track and release
++		 * the extra sub-page references from GUP.
++		 */
+ 		n = DIV_ROUND_UP(left + start, PAGE_SIZE);
++		if (user_pages)
++			npages = DIV_ROUND_UP(left + (start & ~MMUPAGE_MASK),
++					      MMUPAGE_SIZE);
++		else
++			npages = n;
++		pidx = 0;
+ 		for (i = 0; i < n; i++) {
+ 			int size = umin(left, PAGE_SIZE - start);
++			int skip = user_pages ?
++				   DIV_ROUND_UP(size + (start & ~MMUPAGE_MASK),
++						MMUPAGE_SIZE) : 1;
+ 
+-			buf.page = pages[i];
++			buf.page = pages[pidx];
+ 			buf.offset = start;
+ 			buf.len = size;
+ 			ret = add_to_pipe(pipe, &buf);
+ 			if (unlikely(ret < 0)) {
++				int j;
++
+ 				iov_iter_revert(from, left);
+-				// this one got dropped by add_to_pipe()
+-				while (++i < n)
+-					put_page(pages[i]);
++				/* add_to_pipe() dropped pages[pidx] */
++				for (j = pidx + 1; j < npages; j++)
++					put_page(pages[j]);
+ 				goto out;
+ 			}
++			/* Release extra sub-page refs within this chunk;
++			 * the pipe buffer took ownership of pages[pidx]. */
++			for (int j = 1; j < skip; j++)
++				put_page(pages[pidx + j]);
++			pidx += skip;
+ 			total += ret;
+ 			left -= size;
+ 			start = 0;
+diff --git a/fs/userfaultfd.c b/fs/userfaultfd.c
+index 4b53dc4a3266..bd2059a511e9 100644
+--- a/fs/userfaultfd.c
++++ b/fs/userfaultfd.c
+@@ -1234,7 +1234,16 @@ static __always_inline int validate_unaligned_range(
+ {
+ 	__u64 task_size = mm->task_size;
+ 
+-	if (len & ~PAGE_MASK)
++	/*
++	 * Userfaultfd is a userspace-visible interface; ranges are measured
++	 * in the userspace page size, which is MMUPAGE_SIZE under PGCL
++	 * (PAGE_MMUSHIFT > 0).  Without this, mmap'd 10 * sysconf(PAGESIZE)
++	 * = 10 * MMUPAGE_SIZE is rejected as not PAGE_MASK-aligned, breaking
++	 * any uffd consumer that uses sub-PAGE-aligned ranges (e.g. the
++	 * tools/testing/selftests/mm/guard-regions.c uffd subtest).
++	 * At PAGE_MMUSHIFT == 0 the two masks coincide; no change.
++	 */
++	if (len & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 	if (!len)
+ 		return -EINVAL;
+@@ -1250,7 +1259,7 @@ static __always_inline int validate_unaligned_range(
+ static __always_inline int validate_range(struct mm_struct *mm,
+ 					  __u64 start, __u64 len)
+ {
+-	if (start & ~PAGE_MASK)
++	if (start & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 
+ 	return validate_unaligned_range(mm, start, len);
+-- 
+2.54.0
+

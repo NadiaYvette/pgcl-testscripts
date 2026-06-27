@@ -1,0 +1,1475 @@
+From 24735754c16a312540c1d6982f4001122d8d2b25 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:29 +0200
+Subject: [RFC PATCH 09/28] arm64: support page clustering (PAGE_MMUSHIFT)
+
+---
+ arch/arm64/Kconfig                      |  5 ++
+ arch/arm64/include/asm/elf.h            |  2 +-
+ arch/arm64/include/asm/fixmap.h         |  8 +--
+ arch/arm64/include/asm/hugetlb.h        |  4 +-
+ arch/arm64/include/asm/kernel-pgtable.h |  8 +--
+ arch/arm64/include/asm/memory.h         | 10 ++--
+ arch/arm64/include/asm/pgtable-hwdef.h  | 29 ++++++----
+ arch/arm64/include/asm/pgtable.h        | 48 +++++++++-------
+ arch/arm64/include/asm/shmparam.h       |  2 +-
+ arch/arm64/include/asm/tlbflush.h       | 26 ++++-----
+ arch/arm64/include/asm/vmalloc.h        | 12 ++--
+ arch/arm64/kernel/pi/map_kernel.c       |  6 +-
+ arch/arm64/kernel/pi/map_range.c        | 12 ++--
+ arch/arm64/kernel/sys.c                 |  4 +-
+ arch/arm64/kernel/sys32.c               |  4 +-
+ arch/arm64/kernel/vdso.c                | 22 ++++----
+ arch/arm64/kernel/vmlinux.lds.S         |  8 +--
+ arch/arm64/kvm/mmu.c                    | 20 ++++---
+ arch/arm64/mm/contpte.c                 | 75 ++++++++++++++-----------
+ arch/arm64/mm/fixmap.c                  | 12 ++--
+ arch/arm64/mm/hugetlbpage.c             |  7 ++-
+ arch/arm64/mm/init.c                    | 25 ++++++++-
+ arch/arm64/mm/mmu.c                     | 71 ++++++++++++-----------
+ arch/arm64/mm/proc.S                    |  4 +-
+ arch/arm64/mm/ptdump.c                  |  4 +-
+ 25 files changed, 246 insertions(+), 182 deletions(-)
+
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index fe60738e5943..314bd34bcd84 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -1638,6 +1638,11 @@ config XEN
+ # 64K |       29          |      16      |       13             |         13              |
+ config ARCH_FORCE_MAX_ORDER
+ 	int
++	# PGCL widens PAGE_SIZE by 2^PAGE_MMUSHIFT; cap MAX_PAGE_ORDER so
++	# PAGE_SHIFT + MAX_PAGE_ORDER stays under SECTION_SIZE_BITS.
++	default "5" if PAGE_MMUSHIFT >= 6
++	default "8" if PAGE_MMUSHIFT >= 4
++	default "10" if PAGE_MMUSHIFT >= 2
+ 	default "13" if ARM64_64K_PAGES
+ 	default "11" if ARM64_16K_PAGES
+ 	default "10"
+diff --git a/arch/arm64/include/asm/elf.h b/arch/arm64/include/asm/elf.h
+index d2779d604c7b..000afab86533 100644
+--- a/arch/arm64/include/asm/elf.h
++++ b/arch/arm64/include/asm/elf.h
+@@ -120,7 +120,7 @@
+ #define compat_elf_read_implies_exec(ex, stk)	(stk == EXSTACK_DEFAULT)
+ 
+ #define CORE_DUMP_USE_REGSET
+-#define ELF_EXEC_PAGESIZE	PAGE_SIZE
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ 
+ /*
+  * This is the base location for PIE (ET_DYN with INTERP) loads. On
+diff --git a/arch/arm64/include/asm/fixmap.h b/arch/arm64/include/asm/fixmap.h
+index 65555284446e..13d84069f635 100644
+--- a/arch/arm64/include/asm/fixmap.h
++++ b/arch/arm64/include/asm/fixmap.h
+@@ -43,7 +43,7 @@ enum fixed_addresses {
+ 	 * whether it crosses any page boundary.
+ 	 */
+ 	FIX_FDT_END,
+-	FIX_FDT = FIX_FDT_END + DIV_ROUND_UP(MAX_FDT_SIZE, PAGE_SIZE) + 1,
++	FIX_FDT = FIX_FDT_END + DIV_ROUND_UP(MAX_FDT_SIZE, MMUPAGE_SIZE) + 1,
+ 
+ 	FIX_EARLYCON_MEM_BASE,
+ 	FIX_TEXT_POKE0,
+@@ -79,7 +79,7 @@ enum fixed_addresses {
+ 	 * Temporary boot-time mappings, used by early_ioremap(),
+ 	 * before ioremap() is functional.
+ 	 */
+-#define NR_FIX_BTMAPS		(SZ_256K / PAGE_SIZE)
++#define NR_FIX_BTMAPS		(SZ_256K / MMUPAGE_SIZE)
+ #define FIX_BTMAPS_SLOTS	7
+ #define TOTAL_FIX_BTMAPS	(NR_FIX_BTMAPS * FIX_BTMAPS_SLOTS)
+ 
+@@ -99,9 +99,9 @@ enum fixed_addresses {
+ 	__end_of_fixed_addresses
+ };
+ 
+-#define FIXADDR_SIZE		(__end_of_permanent_fixed_addresses << PAGE_SHIFT)
++#define FIXADDR_SIZE		(__end_of_permanent_fixed_addresses << MMUPAGE_SHIFT)
+ #define FIXADDR_START		(FIXADDR_TOP - FIXADDR_SIZE)
+-#define FIXADDR_TOT_SIZE	(__end_of_fixed_addresses << PAGE_SHIFT)
++#define FIXADDR_TOT_SIZE	(__end_of_fixed_addresses << MMUPAGE_SHIFT)
+ #define FIXADDR_TOT_START	(FIXADDR_TOP - FIXADDR_TOT_SIZE)
+ 
+ #define FIXMAP_PAGE_IO     __pgprot(PROT_DEVICE_nGnRE)
+diff --git a/arch/arm64/include/asm/hugetlb.h b/arch/arm64/include/asm/hugetlb.h
+index d038ff14d16c..fdbb2c5d05f6 100644
+--- a/arch/arm64/include/asm/hugetlb.h
++++ b/arch/arm64/include/asm/hugetlb.h
+@@ -84,10 +84,10 @@ static inline void __flush_hugetlb_tlb_range(struct vm_area_struct *vma,
+ 		__flush_tlb_range(vma, start, end, PMD_SIZE, 2, flags);
+ 		break;
+ 	case CONT_PTE_SIZE:
+-		__flush_tlb_range(vma, start, end, PAGE_SIZE, 3, flags);
++		__flush_tlb_range(vma, start, end, MMUPAGE_SIZE, 3, flags);
+ 		break;
+ 	default:
+-		__flush_tlb_range(vma, start, end, PAGE_SIZE, TLBI_TTL_UNKNOWN, flags);
++		__flush_tlb_range(vma, start, end, MMUPAGE_SIZE, TLBI_TTL_UNKNOWN, flags);
+ 	}
+ }
+ 
+diff --git a/arch/arm64/include/asm/kernel-pgtable.h b/arch/arm64/include/asm/kernel-pgtable.h
+index 229ee7976f69..fb9a22cd9474 100644
+--- a/arch/arm64/include/asm/kernel-pgtable.h
++++ b/arch/arm64/include/asm/kernel-pgtable.h
+@@ -22,7 +22,7 @@
+ #define SWAPPER_BLOCK_SHIFT	PMD_SHIFT
+ #define SWAPPER_SKIP_LEVEL	1
+ #else
+-#define SWAPPER_BLOCK_SHIFT	PAGE_SHIFT
++#define SWAPPER_BLOCK_SHIFT	MMUPAGE_SHIFT
+ #define SWAPPER_SKIP_LEVEL	0
+ #endif
+ #define SWAPPER_BLOCK_SIZE	(UL(1) << SWAPPER_BLOCK_SHIFT)
+@@ -55,14 +55,14 @@
+ 	+ EARLY_LEVEL(3, (lvls), (vstart), (vend), add) /* each entry needs a next level page table */	\
+ 	+ EARLY_LEVEL(2, (lvls), (vstart), (vend), add)	/* each entry needs a next level page table */	\
+ 	+ EARLY_LEVEL(1, (lvls), (vstart), (vend), add))/* each entry needs a next level page table */
+-#define INIT_DIR_SIZE (PAGE_SIZE * (EARLY_PAGES(SWAPPER_PGTABLE_LEVELS, KIMAGE_VADDR, _end, EXTRA_PAGE) \
++#define INIT_DIR_SIZE (MMUPAGE_SIZE * (EARLY_PAGES(SWAPPER_PGTABLE_LEVELS, KIMAGE_VADDR, _end, EXTRA_PAGE) \
+ 				    + EARLY_SEGMENT_EXTRA_PAGES))
+ 
+ #define INIT_IDMAP_DIR_PAGES	(EARLY_PAGES(INIT_IDMAP_PGTABLE_LEVELS, KIMAGE_VADDR, kimage_limit, 1))
+-#define INIT_IDMAP_DIR_SIZE	((INIT_IDMAP_DIR_PAGES + EARLY_IDMAP_EXTRA_PAGES) * PAGE_SIZE)
++#define INIT_IDMAP_DIR_SIZE	((INIT_IDMAP_DIR_PAGES + EARLY_IDMAP_EXTRA_PAGES) * MMUPAGE_SIZE)
+ 
+ #define INIT_IDMAP_FDT_PAGES	(EARLY_PAGES(INIT_IDMAP_PGTABLE_LEVELS, 0UL, UL(MAX_FDT_SIZE), 1) - 1)
+-#define INIT_IDMAP_FDT_SIZE	((INIT_IDMAP_FDT_PAGES + EARLY_IDMAP_EXTRA_FDT_PAGES) * PAGE_SIZE)
++#define INIT_IDMAP_FDT_SIZE	((INIT_IDMAP_FDT_PAGES + EARLY_IDMAP_EXTRA_FDT_PAGES) * MMUPAGE_SIZE)
+ 
+ /* The number of segments in the kernel image (text, rodata, inittext, initdata, data+bss) */
+ #define KERNEL_SEGMENT_COUNT	5
+diff --git a/arch/arm64/include/asm/memory.h b/arch/arm64/include/asm/memory.h
+index a2b7a33966ff..8418f4f2c974 100644
+--- a/arch/arm64/include/asm/memory.h
++++ b/arch/arm64/include/asm/memory.h
+@@ -118,8 +118,8 @@
+  * VMAP'd stacks are allocated at page granularity, so we must ensure that such
+  * stacks are a multiple of page size.
+  */
+-#if (MIN_THREAD_SHIFT < PAGE_SHIFT)
+-#define THREAD_SHIFT		PAGE_SHIFT
++#if (MIN_THREAD_SHIFT < MMUPAGE_SHIFT)
++#define THREAD_SHIFT		MMUPAGE_SHIFT
+ #else
+ #define THREAD_SHIFT		MIN_THREAD_SHIFT
+ #endif
+@@ -141,7 +141,7 @@
+ 
+ #define OVERFLOW_STACK_SIZE	SZ_4K
+ 
+-#define NVHE_STACK_SHIFT       PAGE_SHIFT
++#define NVHE_STACK_SHIFT       MMUPAGE_SHIFT
+ #define NVHE_STACK_SIZE        (UL(1) << NVHE_STACK_SHIFT)
+ 
+ /*
+@@ -204,13 +204,13 @@
+  *  Open-coded (swapper_pg_dir - reserved_pg_dir) as this cannot be calculated
+  *  until link time.
+  */
+-#define RESERVED_SWAPPER_OFFSET	(PAGE_SIZE)
++#define RESERVED_SWAPPER_OFFSET	(MMUPAGE_SIZE)
+ 
+ /*
+  *  Open-coded (swapper_pg_dir - tramp_pg_dir) as this cannot be calculated
+  *  until link time.
+  */
+-#define TRAMP_SWAPPER_OFFSET	(2 * PAGE_SIZE)
++#define TRAMP_SWAPPER_OFFSET	(2 * MMUPAGE_SIZE)
+ 
+ #ifndef __ASSEMBLER__
+ 
+diff --git a/arch/arm64/include/asm/pgtable-hwdef.h b/arch/arm64/include/asm/pgtable-hwdef.h
+index 72f31800c703..6cda3a71cf4b 100644
+--- a/arch/arm64/include/asm/pgtable-hwdef.h
++++ b/arch/arm64/include/asm/pgtable-hwdef.h
+@@ -9,22 +9,29 @@
+ 
+ #define PTDESC_ORDER 3
+ 
+-/* Number of VA bits resolved by a single translation table level */
+-#define PTDESC_TABLE_SHIFT	(PAGE_SHIFT - PTDESC_ORDER)
++/*
++ * Number of VA bits resolved by a single translation table level.
++ *
++ * Page table pages are always MMUPAGE_SIZE (hardware MMU page size),
++ * not PAGE_SIZE (which may be larger with PGCL/page clustering).
++ * Each page table page holds MMUPAGE_SIZE/sizeof(u64) = 2^(MMUPAGE_SHIFT-3)
++ * entries, so each level resolves (MMUPAGE_SHIFT - PTDESC_ORDER) bits.
++ */
++#define PTDESC_TABLE_SHIFT	(MMUPAGE_SHIFT - PTDESC_ORDER)
+ 
+ /*
+  * Number of page-table levels required to address 'va_bits' wide
+- * address, without section mapping. We resolve the top (va_bits - PAGE_SHIFT)
++ * address, without section mapping. We resolve the top (va_bits - MMUPAGE_SHIFT)
+  * bits with PTDESC_TABLE_SHIFT bits at each page table level. Hence:
+  *
+- *  levels = DIV_ROUND_UP((va_bits - PAGE_SHIFT), PTDESC_TABLE_SHIFT)
++ *  levels = DIV_ROUND_UP((va_bits - MMUPAGE_SHIFT), PTDESC_TABLE_SHIFT)
+  *
+  * where DIV_ROUND_UP(n, d) => (((n) + (d) - 1) / (d))
+  *
+  * We cannot include linux/kernel.h which defines DIV_ROUND_UP here
+  * due to build issues. So we open code DIV_ROUND_UP here:
+  *
+- *	((((va_bits) - PAGE_SHIFT) + PTDESC_TABLE_SHIFT - 1) / PTDESC_TABLE_SHIFT)
++ *	((((va_bits) - MMUPAGE_SHIFT) + PTDESC_TABLE_SHIFT - 1) / PTDESC_TABLE_SHIFT)
+  *
+  * which gets simplified as :
+  */
+@@ -33,13 +40,13 @@
+ 
+ /*
+  * Size mapped by an entry at level n ( -1 <= n <= 3)
+- * We map PTDESC_TABLE_SHIFT at all translation levels and PAGE_SHIFT bits
++ * We map PTDESC_TABLE_SHIFT at all translation levels and MMUPAGE_SHIFT bits
+  * in the final page. The maximum number of translation levels supported by
+  * the architecture is 5. Hence, starting at level n, we have further
+  * ((4 - n) - 1) levels of translation excluding the offset within the page.
+  * So, the total number of bits mapped by an entry at level n is :
+  *
+- *  ((4 - n) - 1) * PTDESC_TABLE_SHIFT + PAGE_SHIFT
++ *  ((4 - n) - 1) * PTDESC_TABLE_SHIFT + MMUPAGE_SHIFT
+  *
+  * Rearranging it a bit we get :
+  *   (4 - n) * PTDESC_TABLE_SHIFT + PTDESC_ORDER
+@@ -87,9 +94,9 @@
+ /*
+  * Contiguous page definitions.
+  */
+-#define CONT_PTE_SHIFT		(CONFIG_ARM64_CONT_PTE_SHIFT + PAGE_SHIFT)
+-#define CONT_PTES		(1 << (CONT_PTE_SHIFT - PAGE_SHIFT))
+-#define CONT_PTE_SIZE		(CONT_PTES * PAGE_SIZE)
++#define CONT_PTE_SHIFT		(CONFIG_ARM64_CONT_PTE_SHIFT + MMUPAGE_SHIFT)
++#define CONT_PTES		(1 << (CONT_PTE_SHIFT - MMUPAGE_SHIFT))
++#define CONT_PTE_SIZE		(CONT_PTES * MMUPAGE_SIZE)
+ #define CONT_PTE_MASK		(~(CONT_PTE_SIZE - 1))
+ 
+ #define CONT_PMD_SHIFT		(CONFIG_ARM64_CONT_PMD_SHIFT + PMD_SHIFT)
+@@ -176,7 +183,7 @@
+ #define PTE_UXN			(_AT(pteval_t, 1) << 54)	/* User XN */
+ #define PTE_SWBITS_MASK		_AT(pteval_t, (BIT(63) | GENMASK(58, 55)))
+ 
+-#define PTE_ADDR_LOW		(((_AT(pteval_t, 1) << (50 - PAGE_SHIFT)) - 1) << PAGE_SHIFT)
++#define PTE_ADDR_LOW		(((_AT(pteval_t, 1) << (50 - MMUPAGE_SHIFT)) - 1) << MMUPAGE_SHIFT)
+ #ifdef CONFIG_ARM64_PA_BITS_52
+ #ifdef CONFIG_ARM64_64K_PAGES
+ #define PTE_ADDR_HIGH		(_AT(pteval_t, 0xf) << 12)
+diff --git a/arch/arm64/include/asm/pgtable.h b/arch/arm64/include/asm/pgtable.h
+index 4dfa42b7d053..2a11560af7ed 100644
+--- a/arch/arm64/include/asm/pgtable.h
++++ b/arch/arm64/include/asm/pgtable.h
+@@ -133,6 +133,7 @@ static inline pteval_t __phys_to_pte_val(phys_addr_t phys)
+ }
+ #endif
+ 
++#define __phys_to_pte_val __phys_to_pte_val
+ #define pte_pfn(pte)		(__pte_to_phys(pte) >> PAGE_SHIFT)
+ #define pfn_pte(pfn,prot)	\
+ 	__pte(__phys_to_pte_val((phys_addr_t)(pfn) << PAGE_SHIFT) | pgprot_val(prot))
+@@ -456,15 +457,24 @@ static inline void __sync_cache_and_tags(pte_t pte, unsigned int nr_pages)
+ #define pte_pgprot pte_pgprot
+ static inline pgprot_t pte_pgprot(pte_t pte)
+ {
+-	unsigned long pfn = pte_pfn(pte);
+-
+-	return __pgprot(pte_val(pfn_pte(pfn, __pgprot(0))) ^ pte_val(pte));
++	/*
++	 * Extract protection bits by XOR'ing out the address encoding.
++	 * Use __pte_to_phys + __phys_to_pte_val to get the full physical
++	 * address encoding (including sub-page bits with PGCL), rather than
++	 * pte_pfn which drops sub-page bits and would leak them into pgprot.
++	 */
++	return __pgprot(__phys_to_pte_val(__pte_to_phys(pte)) ^ pte_val(pte));
+ }
+ 
+ #define pte_advance_pfn pte_advance_pfn
+ static inline pte_t pte_advance_pfn(pte_t pte, unsigned long nr)
+ {
+-	return pfn_pte(pte_pfn(pte) + nr, pte_pgprot(pte));
++	/*
++	 * With PGCL, "pfn" units are MMUPAGE-sized (hardware page granularity).
++	 * Advance the physical address by nr * MMUPAGE_SIZE.
++	 */
++	phys_addr_t phys = __pte_to_phys(pte) + (nr << MMUPAGE_SHIFT);
++	return __pte(__phys_to_pte_val(phys) | pgprot_val(pte_pgprot(pte)));
+ }
+ 
+ /*
+@@ -674,10 +684,10 @@ static inline void __set_ptes_anysz(struct mm_struct *mm, unsigned long addr,
+ 				    pte_t *ptep, pte_t pte, unsigned int nr,
+ 				    unsigned long pgsize)
+ {
+-	unsigned long stride = pgsize >> PAGE_SHIFT;
++	unsigned long stride = pgsize >> MMUPAGE_SHIFT;
+ 
+ 	switch (pgsize) {
+-	case PAGE_SIZE:
++	case MMUPAGE_SIZE:
+ 		page_table_check_ptes_set(mm, addr, ptep, pte, nr);
+ 		break;
+ 	case PMD_SIZE:
+@@ -711,7 +721,7 @@ static inline void __set_ptes_anysz(struct mm_struct *mm, unsigned long addr,
+ static inline void __set_ptes(struct mm_struct *mm, unsigned long addr,
+ 			      pte_t *ptep, pte_t pte, unsigned int nr)
+ {
+-	__set_ptes_anysz(mm, addr, ptep, pte, nr, PAGE_SIZE);
++	__set_ptes_anysz(mm, addr, ptep, pte, nr, MMUPAGE_SIZE);
+ }
+ 
+ static inline void __set_pmds(struct mm_struct *mm, unsigned long addr,
+@@ -788,7 +798,7 @@ static inline bool pmd_leaf(pmd_t pmd)
+ #define pmd_bad(pmd)		(!pmd_table(pmd))
+ 
+ #define pmd_leaf_size(pmd)	(pmd_cont(pmd) ? CONT_PMD_SIZE : PMD_SIZE)
+-#define pte_leaf_size(pte)	(pte_cont(pte) ? CONT_PTE_SIZE : PAGE_SIZE)
++#define pte_leaf_size(pte)	(pte_cont(pte) ? CONT_PTE_SIZE : MMUPAGE_SIZE)
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ static inline int pmd_trans_huge(pmd_t pmd)
+@@ -997,7 +1007,7 @@ static inline pud_t *p4d_to_folded_pud(p4d_t *p4dp, unsigned long addr)
+ 	/* Ensure that 'p4dp' indexes a page table according to 'addr' */
+ 	VM_BUG_ON(((addr >> P4D_SHIFT) ^ ((u64)p4dp >> 3)) % PTRS_PER_P4D);
+ 
+-	return (pud_t *)PTR_ALIGN_DOWN(p4dp, PAGE_SIZE) + pud_index(addr);
++	return (pud_t *)PTR_ALIGN_DOWN(p4dp, MMUPAGE_SIZE) + pud_index(addr);
+ }
+ 
+ static inline pud_t *p4d_pgtable(p4d_t p4d)
+@@ -1125,7 +1135,7 @@ static inline p4d_t *pgd_to_folded_p4d(pgd_t *pgdp, unsigned long addr)
+ 	/* Ensure that 'pgdp' indexes a page table according to 'addr' */
+ 	VM_BUG_ON(((addr >> PGDIR_SHIFT) ^ ((u64)pgdp >> 3)) % PTRS_PER_PGD);
+ 
+-	return (p4d_t *)PTR_ALIGN_DOWN(pgdp, PAGE_SIZE) + p4d_index(addr);
++	return (p4d_t *)PTR_ALIGN_DOWN(pgdp, MMUPAGE_SIZE) + p4d_index(addr);
+ }
+ 
+ static inline phys_addr_t p4d_offset_phys(pgd_t *pgdp, unsigned long addr)
+@@ -1357,7 +1367,7 @@ static inline pte_t __ptep_get_and_clear_anysz(struct mm_struct *mm,
+ 	pte_t pte = __pte(xchg_relaxed(&pte_val(*ptep), 0));
+ 
+ 	switch (pgsize) {
+-	case PAGE_SIZE:
++	case MMUPAGE_SIZE:
+ 		page_table_check_pte_clear(mm, address, pte);
+ 		break;
+ 	case PMD_SIZE:
+@@ -1378,7 +1388,7 @@ static inline pte_t __ptep_get_and_clear_anysz(struct mm_struct *mm,
+ static inline pte_t __ptep_get_and_clear(struct mm_struct *mm,
+ 				       unsigned long address, pte_t *ptep)
+ {
+-	return __ptep_get_and_clear_anysz(mm, address, ptep, PAGE_SIZE);
++	return __ptep_get_and_clear_anysz(mm, address, ptep, MMUPAGE_SIZE);
+ }
+ 
+ static inline void __clear_full_ptes(struct mm_struct *mm, unsigned long addr,
+@@ -1389,7 +1399,7 @@ static inline void __clear_full_ptes(struct mm_struct *mm, unsigned long addr,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 	}
+ }
+ 
+@@ -1402,7 +1412,7 @@ static inline pte_t __get_and_clear_full_ptes(struct mm_struct *mm,
+ 	pte = __ptep_get_and_clear(mm, addr, ptep);
+ 	while (--nr) {
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 		tmp_pte = __ptep_get_and_clear(mm, addr, ptep);
+ 		if (pte_dirty(tmp_pte))
+ 			pte = pte_mkdirty(pte);
+@@ -1450,7 +1460,7 @@ static inline void __wrprotect_ptes(struct mm_struct *mm, unsigned long address,
+ {
+ 	unsigned int i;
+ 
+-	for (i = 0; i < nr; i++, address += PAGE_SIZE, ptep++)
++	for (i = 0; i < nr; i++, address += MMUPAGE_SIZE, ptep++)
+ 		__ptep_set_wrprotect(mm, address, ptep);
+ }
+ 
+@@ -1490,7 +1500,7 @@ static inline void __clear_young_dirty_ptes(struct vm_area_struct *vma,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 	}
+ }
+ 
+@@ -1616,11 +1626,11 @@ static inline void update_mmu_cache_range(struct vm_fault *vmf,
+  * entry), and HPA can coalesce it (4 pages into 1 TLB entry) when 16K base
+  * pages are in use.
+  */
+-#define exec_folio_order() ilog2(SZ_64K >> PAGE_SHIFT)
++#define exec_folio_order() ilog2(SZ_64K >> MMUPAGE_SHIFT)
+ 
+ static inline bool pud_sect_supported(void)
+ {
+-	return PAGE_SIZE == SZ_4K;
++	return MMUPAGE_SIZE == SZ_4K;
+ }
+ 
+ 
+@@ -1689,7 +1699,7 @@ static __always_inline void contpte_try_fold(struct mm_struct *mm,
+ 	 */
+ 
+ 	const unsigned long contmask = CONT_PTES - 1;
+-	bool valign = ((addr >> PAGE_SHIFT) & contmask) == contmask;
++	bool valign = ((addr >> MMUPAGE_SHIFT) & contmask) == contmask;
+ 
+ 	if (unlikely(valign)) {
+ 		bool palign = (pte_pfn(pte) & contmask) == contmask;
+diff --git a/arch/arm64/include/asm/shmparam.h b/arch/arm64/include/asm/shmparam.h
+index f920e22ec677..23cd7bbafe24 100644
+--- a/arch/arm64/include/asm/shmparam.h
++++ b/arch/arm64/include/asm/shmparam.h
+@@ -10,7 +10,7 @@
+  * alignment value. Since we don't have aliasing D-caches, the rest of
+  * the time we can safely use PAGE_SIZE.
+  */
+-#define COMPAT_SHMLBA	(4 * PAGE_SIZE)
++#define COMPAT_SHMLBA	(4 * MMUPAGE_SIZE)
+ 
+ #include <asm-generic/shmparam.h>
+ 
+diff --git a/arch/arm64/include/asm/tlbflush.h b/arch/arm64/include/asm/tlbflush.h
+index c0bf5b398041..1a78f264393a 100644
+--- a/arch/arm64/include/asm/tlbflush.h
++++ b/arch/arm64/include/asm/tlbflush.h
+@@ -509,7 +509,7 @@ static __always_inline void __tlbi_range(tlbi_op op, u64 addr,
+ {
+ 	u64 arg = 0;
+ 
+-	arg |= FIELD_PREP(TLBIR_BADDR_MASK, addr >> (lpa2 ? 16 : PAGE_SHIFT));
++	arg |= FIELD_PREP(TLBIR_BADDR_MASK, addr >> (lpa2 ? 16 : MMUPAGE_SHIFT));
+ 	arg |= FIELD_PREP(TLBIR_TTL_MASK, level > 3 ? 0 : level);
+ 	arg |= FIELD_PREP(TLBIR_NUM_MASK, num);
+ 	arg |= FIELD_PREP(TLBIR_SCALE_MASK, scale);
+@@ -524,13 +524,13 @@ static __always_inline void __flush_tlb_range_op(tlbi_op lop, tlbi_op rop,
+ 						 u64 stride, u16 asid,
+ 						 u32 level, bool lpa2)
+ {
+-	u64 addr = start, end = start + pages * PAGE_SIZE;
++	u64 addr = start, end = start + pages * MMUPAGE_SIZE;
+ 	int scale = 3;
+ 
+ 	while (addr != end) {
+ 		int num;
+ 
+-		pages = (end - addr) >> PAGE_SHIFT;
++		pages = (end - addr) >> MMUPAGE_SHIFT;
+ 
+ 		if (!system_supports_tlb_range() || pages == 1)
+ 			goto invalidate_one;
+@@ -541,7 +541,7 @@ static __always_inline void __flush_tlb_range_op(tlbi_op lop, tlbi_op rop,
+ 		num = __TLBI_RANGE_NUM(pages, scale);
+ 		if (num >= 0) {
+ 			__tlbi_range(rop, addr, asid, scale, num, level, lpa2);
+-			addr += __TLBI_RANGE_PAGES(num, scale) << PAGE_SHIFT;
++			addr += __TLBI_RANGE_PAGES(num, scale) << MMUPAGE_SHIFT;
+ 		}
+ 
+ 		scale--;
+@@ -570,7 +570,7 @@ static inline bool __flush_tlb_range_limit_excess(unsigned long pages,
+ 	if (system_supports_tlb_range())
+ 		return pages > MAX_TLBI_RANGE_PAGES;
+ 
+-	return pages >= (MAX_DVM_OPS * stride) >> PAGE_SHIFT;
++	return pages >= (MAX_DVM_OPS * stride) >> MMUPAGE_SHIFT;
+ }
+ 
+ typedef unsigned __bitwise tlbf_t;
+@@ -598,7 +598,7 @@ static __always_inline void __do_flush_tlb_range(struct vm_area_struct *vma,
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	unsigned long asid, pages;
+ 
+-	pages = (end - start) >> PAGE_SHIFT;
++	pages = (end - start) >> MMUPAGE_SHIFT;
+ 
+ 	if (__flush_tlb_range_limit_excess(pages, stride)) {
+ 		flush_tlb_mm(mm);
+@@ -661,16 +661,16 @@ static inline void flush_tlb_range(struct vm_area_struct *vma,
+ 	 * Set the tlb_level to TLBI_TTL_UNKNOWN because we can not get enough
+ 	 * information here.
+ 	 */
+-	__flush_tlb_range(vma, start, end, PAGE_SIZE, TLBI_TTL_UNKNOWN, TLBF_NONE);
++	__flush_tlb_range(vma, start, end, MMUPAGE_SIZE, TLBI_TTL_UNKNOWN, TLBF_NONE);
+ }
+ 
+ static inline void __flush_tlb_page(struct vm_area_struct *vma,
+ 				    unsigned long uaddr, tlbf_t flags)
+ {
+-	unsigned long start = round_down(uaddr, PAGE_SIZE);
+-	unsigned long end = start + PAGE_SIZE;
++	unsigned long start = round_down(uaddr, MMUPAGE_SIZE);
++	unsigned long end = start + MMUPAGE_SIZE;
+ 
+-	__do_flush_tlb_range(vma, start, end, PAGE_SIZE, 3,
++	__do_flush_tlb_range(vma, start, end, MMUPAGE_SIZE, 3,
+ 			     TLBF_NOWALKCACHE | flags);
+ }
+ 
+@@ -682,12 +682,12 @@ static inline void flush_tlb_page(struct vm_area_struct *vma,
+ 
+ static inline void flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ {
+-	const unsigned long stride = PAGE_SIZE;
++	const unsigned long stride = MMUPAGE_SIZE;
+ 	unsigned long pages;
+ 
+ 	start = round_down(start, stride);
+ 	end = round_up(end, stride);
+-	pages = (end - start) >> PAGE_SHIFT;
++	pages = (end - start) >> MMUPAGE_SHIFT;
+ 
+ 	if (__flush_tlb_range_limit_excess(pages, stride)) {
+ 		flush_tlb_all();
+@@ -720,7 +720,7 @@ static inline void arch_tlbbatch_add_pending(struct arch_tlbflush_unmap_batch *b
+ {
+ 	struct vm_area_struct vma = { .vm_mm = mm, .vm_flags = 0 };
+ 
+-	__flush_tlb_range(&vma, start, end, PAGE_SIZE, 3,
++	__flush_tlb_range(&vma, start, end, MMUPAGE_SIZE, 3,
+ 			  TLBF_NOWALKCACHE | TLBF_NOSYNC);
+ 	sme_dvmsync_add_pending(batch, mm);
+ }
+diff --git a/arch/arm64/include/asm/vmalloc.h b/arch/arm64/include/asm/vmalloc.h
+index 4ec1acd3c1b3..27a19e293de5 100644
+--- a/arch/arm64/include/asm/vmalloc.h
++++ b/arch/arm64/include/asm/vmalloc.h
+@@ -29,16 +29,16 @@ static inline unsigned long arch_vmap_pte_range_map_size(unsigned long addr,
+ 	 * block using the PTE_CONT bit for more efficient use of the TLB.
+ 	 */
+ 	if (max_page_shift < CONT_PTE_SHIFT)
+-		return PAGE_SIZE;
++		return MMUPAGE_SIZE;
+ 
+ 	if (end - addr < CONT_PTE_SIZE)
+-		return PAGE_SIZE;
++		return MMUPAGE_SIZE;
+ 
+ 	if (!IS_ALIGNED(addr, CONT_PTE_SIZE))
+-		return PAGE_SIZE;
++		return MMUPAGE_SIZE;
+ 
+ 	if (!IS_ALIGNED(PFN_PHYS(pfn), CONT_PTE_SIZE))
+-		return PAGE_SIZE;
++		return MMUPAGE_SIZE;
+ 
+ 	return CONT_PTE_SIZE;
+ }
+@@ -51,7 +51,7 @@ static inline unsigned long arch_vmap_pte_range_unmap_size(unsigned long addr,
+ 	 * The caller handles alignment so it's sufficient just to check
+ 	 * PTE_CONT.
+ 	 */
+-	return pte_valid_cont(__ptep_get(ptep)) ? CONT_PTE_SIZE : PAGE_SIZE;
++	return pte_valid_cont(__ptep_get(ptep)) ? CONT_PTE_SIZE : MMUPAGE_SIZE;
+ }
+ 
+ #define arch_vmap_pte_supported_shift arch_vmap_pte_supported_shift
+@@ -60,7 +60,7 @@ static inline int arch_vmap_pte_supported_shift(unsigned long size)
+ 	if (size >= CONT_PTE_SIZE)
+ 		return CONT_PTE_SHIFT;
+ 
+-	return PAGE_SHIFT;
++	return MMUPAGE_SHIFT;
+ }
+ 
+ #endif
+diff --git a/arch/arm64/kernel/pi/map_kernel.c b/arch/arm64/kernel/pi/map_kernel.c
+index a852264958c3..431591808fc8 100644
+--- a/arch/arm64/kernel/pi/map_kernel.c
++++ b/arch/arm64/kernel/pi/map_kernel.c
+@@ -40,7 +40,7 @@ static void __init map_kernel(u64 kaslr_offset, u64 va_offset, int root_level)
+ {
+ 	bool enable_scs = IS_ENABLED(CONFIG_UNWIND_PATCH_PAC_INTO_SCS);
+ 	bool twopass = IS_ENABLED(CONFIG_RELOCATABLE);
+-	phys_addr_t pgdp = (phys_addr_t)init_pg_dir + PAGE_SIZE;
++	phys_addr_t pgdp = (phys_addr_t)init_pg_dir + MMUPAGE_SIZE;
+ 	pgprot_t text_prot = PAGE_KERNEL_ROX;
+ 	pgprot_t data_prot = PAGE_KERNEL;
+ 	pgprot_t prot;
+@@ -133,7 +133,7 @@ static void __init map_kernel(u64 kaslr_offset, u64 va_offset, int root_level)
+ 	}
+ 
+ 	/* Copy the root page table to its final location */
+-	memcpy((void *)swapper_pg_dir + va_offset, init_pg_dir, PAGE_SIZE);
++	memcpy((void *)swapper_pg_dir + va_offset, init_pg_dir, MMUPAGE_SIZE);
+ 	dsb(ishst);
+ 	idmap_cpu_replace_ttbr1((phys_addr_t)swapper_pg_dir);
+ }
+@@ -199,7 +199,7 @@ static void __init remap_idmap_for_lpa2(void)
+ 
+ static void *__init map_fdt(phys_addr_t fdt)
+ {
+-	static u8 ptes[INIT_IDMAP_FDT_SIZE] __initdata __aligned(PAGE_SIZE);
++	static u8 ptes[INIT_IDMAP_FDT_SIZE] __initdata __aligned(MMUPAGE_SIZE);
+ 	phys_addr_t efdt = fdt + MAX_FDT_SIZE;
+ 	phys_addr_t ptep = (phys_addr_t)ptes; /* We're idmapped when called */
+ 
+diff --git a/arch/arm64/kernel/pi/map_range.c b/arch/arm64/kernel/pi/map_range.c
+index de52cd85c691..b3d13ba7f0a9 100644
+--- a/arch/arm64/kernel/pi/map_range.c
++++ b/arch/arm64/kernel/pi/map_range.c
+@@ -33,13 +33,13 @@ void __init map_range(phys_addr_t *pte, u64 start, u64 end, phys_addr_t pa,
+ 	u64 cmask = (level == 3) ? CONT_PTE_SIZE - 1 : U64_MAX;
+ 	ptdesc_t protval = pgprot_val(prot) & ~PTE_TYPE_MASK;
+ 	int lshift = (3 - level) * PTDESC_TABLE_SHIFT;
+-	u64 lmask = (PAGE_SIZE << lshift) - 1;
++	u64 lmask = (MMUPAGE_SIZE << lshift) - 1;
+ 
+-	start	&= PAGE_MASK;
+-	pa	&= PAGE_MASK;
++	start	&= MMUPAGE_MASK;
++	pa	&= MMUPAGE_MASK;
+ 
+ 	/* Advance tbl to the entry that covers start */
+-	tbl += (start >> (lshift + PAGE_SHIFT)) % PTRS_PER_PTE;
++	tbl += (start >> (lshift + MMUPAGE_SHIFT)) % PTRS_PER_PTE;
+ 
+ 	/*
+ 	 * Set the right block/page bits for this level unless we are
+@@ -49,7 +49,7 @@ void __init map_range(phys_addr_t *pte, u64 start, u64 end, phys_addr_t pa,
+ 		protval |= (level == 2) ? PMD_TYPE_SECT : PTE_TYPE_PAGE;
+ 
+ 	while (start < end) {
+-		u64 next = min((start | lmask) + 1, PAGE_ALIGN(end));
++		u64 next = min((start | lmask) + 1, ALIGN(end, MMUPAGE_SIZE));
+ 
+ 		if (level < 2 || (level == 2 && (start | next | pa) & lmask)) {
+ 			/*
+@@ -90,7 +90,7 @@ void __init map_range(phys_addr_t *pte, u64 start, u64 end, phys_addr_t pa,
+ 
+ asmlinkage phys_addr_t __init create_init_idmap(pgd_t *pg_dir, ptdesc_t clrmask)
+ {
+-	phys_addr_t ptep = (phys_addr_t)pg_dir + PAGE_SIZE; /* MMU is off */
++	phys_addr_t ptep = (phys_addr_t)pg_dir + MMUPAGE_SIZE; /* MMU is off */
+ 	pgprot_t text_prot = PAGE_KERNEL_ROX;
+ 	pgprot_t data_prot = PAGE_KERNEL;
+ 
+diff --git a/arch/arm64/kernel/sys.c b/arch/arm64/kernel/sys.c
+index f08408b6e826..bbff421d2c25 100644
+--- a/arch/arm64/kernel/sys.c
++++ b/arch/arm64/kernel/sys.c
+@@ -22,10 +22,10 @@ SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
+ 		unsigned long, prot, unsigned long, flags,
+ 		unsigned long, fd, unsigned long, off)
+ {
+-	if (offset_in_page(off) != 0)
++	if (off & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 
+-	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
++	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> MMUPAGE_SHIFT);
+ }
+ 
+ SYSCALL_DEFINE1(arm64_personality, unsigned int, personality)
+diff --git a/arch/arm64/kernel/sys32.c b/arch/arm64/kernel/sys32.c
+index 12a948f3a504..8fe06c3a16b5 100644
+--- a/arch/arm64/kernel/sys32.c
++++ b/arch/arm64/kernel/sys32.c
+@@ -51,10 +51,10 @@ COMPAT_SYSCALL_DEFINE6(aarch32_mmap2, unsigned long, addr, unsigned long, len,
+ 		       unsigned long, prot, unsigned long, flags,
+ 		       unsigned long, fd, unsigned long, off_4k)
+ {
+-	if (off_4k & (~PAGE_MASK >> 12))
++	if (off_4k & (~MMUPAGE_MASK >> 12))
+ 		return -EINVAL;
+ 
+-	off_4k >>= (PAGE_SHIFT - 12);
++	off_4k >>= (MMUPAGE_SHIFT - 12);
+ 
+ 	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off_4k);
+ }
+diff --git a/arch/arm64/kernel/vdso.c b/arch/arm64/kernel/vdso.c
+index 592dd8668de4..7389b7f9cd23 100644
+--- a/arch/arm64/kernel/vdso.c
++++ b/arch/arm64/kernel/vdso.c
+@@ -79,17 +79,19 @@ static int __init __vdso_init(enum vdso_abi abi)
+ 	vdso_info[abi].vdso_pages = (
+ 			vdso_info[abi].vdso_code_end -
+ 			vdso_info[abi].vdso_code_start) >>
+-			PAGE_SHIFT;
++			MMUPAGE_SHIFT;
+ 
+ 	vdso_pagelist = kzalloc_objs(struct page *, vdso_info[abi].vdso_pages);
+ 	if (vdso_pagelist == NULL)
+ 		return -ENOMEM;
+ 
+-	/* Grab the vDSO code pages. */
++	/* Grab the vDSO code pages (MMUPAGE granularity for PGCL). */
+ 	pfn = sym_to_pfn(vdso_info[abi].vdso_code_start);
+ 
+-	for (i = 0; i < vdso_info[abi].vdso_pages; i++)
+-		vdso_pagelist[i] = pfn_to_page(pfn + i);
++	for (i = 0; i < vdso_info[abi].vdso_pages; i++) {
++		unsigned long offset = i << MMUPAGE_SHIFT;
++		vdso_pagelist[i] = pfn_to_page(pfn + (offset >> PAGE_SHIFT));
++	}
+ 
+ 	vdso_info[abi].cm->pages = vdso_pagelist;
+ 
+@@ -107,9 +109,9 @@ static int __setup_additional_pages(enum vdso_abi abi,
+ 
+ 	BUILD_BUG_ON(VDSO_NR_PAGES != __VDSO_PAGES);
+ 
+-	vdso_text_len = vdso_info[abi].vdso_pages << PAGE_SHIFT;
++	vdso_text_len = vdso_info[abi].vdso_pages << MMUPAGE_SHIFT;
+ 	/* Be sure to map the data page */
+-	vdso_mapping_len = vdso_text_len + VDSO_NR_PAGES * PAGE_SIZE;
++	vdso_mapping_len = vdso_text_len + VDSO_NR_PAGES * MMUPAGE_SIZE;
+ 
+ 	vdso_base = get_unmapped_area(NULL, 0, vdso_mapping_len, 0, 0);
+ 	if (IS_ERR_VALUE(vdso_base)) {
+@@ -124,7 +126,7 @@ static int __setup_additional_pages(enum vdso_abi abi,
+ 	if (system_supports_bti_kernel())
+ 		gp_flags = VM_ARM64_BTI;
+ 
+-	vdso_base += VDSO_NR_PAGES * PAGE_SIZE;
++	vdso_base += VDSO_NR_PAGES * MMUPAGE_SIZE;
+ 	mm->context.vdso = (void *)vdso_base;
+ 	ret = _install_special_mapping(mm, vdso_base, vdso_text_len,
+ 				       VM_READ|VM_EXEC|gp_flags|
+@@ -253,7 +255,7 @@ static int aarch32_kuser_helpers_setup(struct mm_struct *mm)
+ 	 * Avoid VM_MAYWRITE for compatibility with arch/arm/, where it's
+ 	 * not safe to CoW the page containing the CPU exception vectors.
+ 	 */
+-	ret = _install_special_mapping(mm, AARCH32_VECTORS_BASE, PAGE_SIZE,
++	ret = _install_special_mapping(mm, AARCH32_VECTORS_BASE, MMUPAGE_SIZE,
+ 				       VM_READ | VM_EXEC |
+ 				       VM_MAYREAD | VM_MAYEXEC |
+ 				       VM_SEALED_SYSMAP,
+@@ -267,7 +269,7 @@ static int aarch32_sigreturn_setup(struct mm_struct *mm)
+ 	unsigned long addr;
+ 	void *ret;
+ 
+-	addr = get_unmapped_area(NULL, 0, PAGE_SIZE, 0, 0);
++	addr = get_unmapped_area(NULL, 0, MMUPAGE_SIZE, 0, 0);
+ 	if (IS_ERR_VALUE(addr)) {
+ 		ret = ERR_PTR(addr);
+ 		goto out;
+@@ -277,7 +279,7 @@ static int aarch32_sigreturn_setup(struct mm_struct *mm)
+ 	 * VM_MAYWRITE is required to allow gdb to Copy-on-Write and
+ 	 * set breakpoints.
+ 	 */
+-	ret = _install_special_mapping(mm, addr, PAGE_SIZE,
++	ret = _install_special_mapping(mm, addr, MMUPAGE_SIZE,
+ 				       VM_READ | VM_EXEC | VM_MAYREAD |
+ 				       VM_MAYWRITE | VM_MAYEXEC |
+ 				       VM_SEALED_SYSMAP,
+diff --git a/arch/arm64/kernel/vmlinux.lds.S b/arch/arm64/kernel/vmlinux.lds.S
+index e1ac876200a3..6f0502b2df28 100644
+--- a/arch/arm64/kernel/vmlinux.lds.S
++++ b/arch/arm64/kernel/vmlinux.lds.S
+@@ -233,18 +233,18 @@ SECTIONS
+ 	}
+ 
+ 	idmap_pg_dir = .;
+-	. += PAGE_SIZE;
++	. += MMUPAGE_SIZE;
+ 
+ #ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+ 	tramp_pg_dir = .;
+-	. += PAGE_SIZE;
++	. += MMUPAGE_SIZE;
+ #endif
+ 
+ 	reserved_pg_dir = .;
+-	. += PAGE_SIZE;
++	. += MMUPAGE_SIZE;
+ 
+ 	swapper_pg_dir = .;
+-	. += PAGE_SIZE;
++	. += MMUPAGE_SIZE;
+ 
+ 	. = ALIGN(SEGMENT_ALIGN);
+ 	__init_begin = .;
+diff --git a/arch/arm64/kvm/mmu.c b/arch/arm64/kvm/mmu.c
+index 4da9281312eb..cfd614d6b260 100644
+--- a/arch/arm64/kvm/mmu.c
++++ b/arch/arm64/kvm/mmu.c
+@@ -1444,7 +1444,7 @@ static int get_vma_page_shift(struct vm_area_struct *vma, unsigned long hva)
+ 
+ 	VM_BUG_ON(is_vm_hugetlb_page(vma));
+ 
+-	pa = (vma->vm_pgoff << PAGE_SHIFT) + (hva - vma->vm_start);
++	pa = (vma->vm_pgoff << MMUPAGE_SHIFT) + (hva - vma->vm_start);
+ 
+ #ifndef __PAGETABLE_PMD_FOLDED
+ 	if ((hva & (PUD_SIZE - 1)) == (pa & (PUD_SIZE - 1)) &&
+@@ -1724,7 +1724,7 @@ static int pkvm_mem_abort(const struct kvm_s2_fault_desc *s2fd)
+ 	}
+ 
+ 	write_lock(&kvm->mmu_lock);
+-	ret = pkvm_pgtable_stage2_map(pgt, s2fd->fault_ipa, PAGE_SIZE,
++	ret = pkvm_pgtable_stage2_map(pgt, s2fd->fault_ipa, MMUPAGE_SIZE,
+ 				      page_to_phys(page), KVM_PGTABLE_PROT_RWX,
+ 				      hyp_memcache, 0);
+ 	write_unlock(&kvm->mmu_lock);
+@@ -1749,8 +1749,8 @@ static short kvm_s2_resolve_vma_size(const struct kvm_s2_fault_desc *s2fd,
+ 	short vma_shift;
+ 
+ 	if (memslot_is_logging(s2fd->memslot)) {
+-		s2vi->max_map_size = PAGE_SIZE;
+-		vma_shift = PAGE_SHIFT;
++		s2vi->max_map_size = MMUPAGE_SIZE;
++		vma_shift = MMUPAGE_SHIFT;
+ 	} else {
+ 		s2vi->max_map_size = PUD_SIZE;
+ 		vma_shift = get_vma_page_shift(vma, s2fd->hva);
+@@ -1770,11 +1770,13 @@ static short kvm_s2_resolve_vma_size(const struct kvm_s2_fault_desc *s2fd,
+ 		if (fault_supports_stage2_huge_mapping(s2fd->memslot, s2fd->hva, PMD_SIZE))
+ 			break;
+ 		fallthrough;
++#if CONT_PTE_SHIFT != MMUPAGE_SHIFT
+ 	case CONT_PTE_SHIFT:
+-		vma_shift = PAGE_SHIFT;
+-		s2vi->max_map_size = PAGE_SIZE;
++		vma_shift = MMUPAGE_SHIFT;
++		s2vi->max_map_size = MMUPAGE_SIZE;
+ 		fallthrough;
+-	case PAGE_SHIFT:
++#endif
++	case MMUPAGE_SHIFT:
+ 		break;
+ 	default:
+ 		WARN_ONCE(1, "Unknown vma_shift %d", vma_shift);
+@@ -1798,8 +1800,8 @@ static short kvm_s2_resolve_vma_size(const struct kvm_s2_fault_desc *s2fd,
+ 		 */
+ 		if (max_map_size >= PMD_SIZE && max_map_size < PUD_SIZE)
+ 			max_map_size = PMD_SIZE;
+-		else if (max_map_size >= PAGE_SIZE && max_map_size < PMD_SIZE)
+-			max_map_size = PAGE_SIZE;
++		else if (max_map_size >= MMUPAGE_SIZE && max_map_size < PMD_SIZE)
++			max_map_size = MMUPAGE_SIZE;
+ 
+ 		s2vi->max_map_size = max_map_size;
+ 		vma_shift = min_t(short, vma_shift, __ffs(max_map_size));
+diff --git a/arch/arm64/mm/contpte.c b/arch/arm64/mm/contpte.c
+index 2de12656b4d8..94ce5e14e695 100644
+--- a/arch/arm64/mm/contpte.c
++++ b/arch/arm64/mm/contpte.c
+@@ -58,7 +58,7 @@ static void contpte_try_unfold_partial(struct mm_struct *mm, unsigned long addr,
+ 		contpte_try_unfold(mm, addr, ptep, __ptep_get(ptep));
+ 
+ 	if (ptep + nr != contpte_align_down(ptep + nr)) {
+-		unsigned long last_addr = addr + PAGE_SIZE * (nr - 1);
++		unsigned long last_addr = addr + MMUPAGE_SIZE * (nr - 1);
+ 		pte_t *last_ptep = ptep + nr - 1;
+ 
+ 		contpte_try_unfold(mm, last_addr, last_ptep,
+@@ -76,9 +76,18 @@ static void contpte_convert(struct mm_struct *mm, unsigned long addr,
+ 
+ 	start_ptep = ptep = contpte_align_down(ptep);
+ 	start_addr = addr = ALIGN_DOWN(addr, CONT_PTE_SIZE);
+-	pte = pfn_pte(ALIGN_DOWN(pte_pfn(pte), CONT_PTES), pte_pgprot(pte));
++	/*
++	 * Reset the PTE to point at the FIRST sub-page of this CONT range
++	 * (which may not be sub-page 0 of the enclosing kernel page).  With
++	 * PGCL, a kernel page contains PAGE_MMUCOUNT sub-pages and several
++	 * CONT_PTE-sized cont ranges; using pfn_pte(pte_pfn(pte), ...) would
++	 * always reset to sub-page 0 of the kernel page, miscoloring the
++	 * second/third/fourth cont range to point back at sub-page 0.
++	 */
++	pte = __pte(__phys_to_pte_val(ALIGN_DOWN(__pte_to_phys(pte),
++				CONT_PTE_SIZE)) | pgprot_val(pte_pgprot(pte)));
+ 
+-	for (i = 0; i < CONT_PTES; i++, ptep++, addr += PAGE_SIZE) {
++	for (i = 0; i < CONT_PTES; i++, ptep++, addr += MMUPAGE_SIZE) {
+ 		pte_t ptent = __ptep_get_and_clear(mm, addr, ptep);
+ 
+ 		if (pte_dirty(ptent))
+@@ -225,7 +234,7 @@ static void contpte_convert(struct mm_struct *mm, unsigned long addr,
+ 	 */
+ 
+ 	if (!system_supports_bbml2_noabort())
+-		__flush_tlb_range(&vma, start_addr, addr, PAGE_SIZE, 3,
++		__flush_tlb_range(&vma, start_addr, addr, MMUPAGE_SIZE, 3,
+ 				  TLBF_NOWALKCACHE);
+ 
+ 	__set_ptes(mm, start_addr, start_ptep, pte, CONT_PTES);
+@@ -257,7 +266,6 @@ void __contpte_try_fold(struct mm_struct *mm, unsigned long addr,
+ 	pte_t expected_pte, subpte;
+ 	struct folio *folio;
+ 	struct page *page;
+-	unsigned long pfn;
+ 	pte_t *orig_ptep;
+ 	pgprot_t prot;
+ 
+@@ -268,7 +276,8 @@ void __contpte_try_fold(struct mm_struct *mm, unsigned long addr,
+ 
+ 	page = pte_page(pte);
+ 	folio = page_folio(page);
+-	folio_start = addr - (page - &folio->page) * PAGE_SIZE;
++	folio_start = addr - (page - &folio->page) * PAGE_SIZE
++			  - ((__pte_to_phys(pte) & ~PAGE_MASK) >> MMUPAGE_SHIFT) * MMUPAGE_SIZE;
+ 	folio_end = folio_start + folio_nr_pages(folio) * PAGE_SIZE;
+ 	cont_start = ALIGN_DOWN(addr, CONT_PTE_SIZE);
+ 	cont_end = cont_start + CONT_PTE_SIZE;
+@@ -276,9 +285,9 @@ void __contpte_try_fold(struct mm_struct *mm, unsigned long addr,
+ 	if (folio_start > cont_start || folio_end < cont_end)
+ 		return;
+ 
+-	pfn = ALIGN_DOWN(pte_pfn(pte), CONT_PTES);
+ 	prot = pte_pgprot(pte_mkold(pte_mkclean(pte)));
+-	expected_pte = pfn_pte(pfn, prot);
++	expected_pte = __pte(__phys_to_pte_val(ALIGN_DOWN(__pte_to_phys(pte),
++				CONT_PTE_SIZE)) | pgprot_val(prot));
+ 	orig_ptep = ptep;
+ 	ptep = contpte_align_down(ptep);
+ 
+@@ -358,12 +367,12 @@ pte_t contpte_ptep_get(pte_t *ptep, pte_t orig_pte)
+ }
+ EXPORT_SYMBOL_GPL(contpte_ptep_get);
+ 
+-static inline bool contpte_is_consistent(pte_t pte, unsigned long pfn,
++static inline bool contpte_is_consistent(pte_t pte, phys_addr_t phys,
+ 					pgprot_t orig_prot)
+ {
+ 	pgprot_t prot = pte_pgprot(pte_mkold(pte_mkclean(pte)));
+ 
+-	return pte_valid_cont(pte) && pte_pfn(pte) == pfn &&
++	return pte_valid_cont(pte) && __pte_to_phys(pte) == phys &&
+ 			pgprot_val(prot) == pgprot_val(orig_prot);
+ }
+ 
+@@ -387,7 +396,7 @@ pte_t contpte_ptep_get_lockless(pte_t *orig_ptep)
+ 	 */
+ 
+ 	pgprot_t orig_prot;
+-	unsigned long pfn;
++	phys_addr_t phys;
+ 	pte_t orig_pte;
+ 	pte_t *ptep;
+ 	pte_t pte;
+@@ -401,20 +410,20 @@ pte_t contpte_ptep_get_lockless(pte_t *orig_ptep)
+ 
+ 	orig_prot = pte_pgprot(pte_mkold(pte_mkclean(orig_pte)));
+ 	ptep = contpte_align_down(orig_ptep);
+-	pfn = pte_pfn(orig_pte) - (orig_ptep - ptep);
++	phys = __pte_to_phys(orig_pte) - (orig_ptep - ptep) * MMUPAGE_SIZE;
+ 
+-	for (i = 0; i < CONT_PTES; i++, ptep++, pfn++) {
++	for (i = 0; i < CONT_PTES; i++, ptep++, phys += MMUPAGE_SIZE) {
+ 		pte = __ptep_get(ptep);
+ 
+-		if (!contpte_is_consistent(pte, pfn, orig_prot))
++		if (!contpte_is_consistent(pte, phys, orig_prot))
+ 			goto retry;
+ 
+ 		if (pte_dirty(pte)) {
+ 			orig_pte = pte_mkdirty(orig_pte);
+-			for (; i < CONT_PTES; i++, ptep++, pfn++) {
++			for (; i < CONT_PTES; i++, ptep++, phys += MMUPAGE_SIZE) {
+ 				pte = __ptep_get(ptep);
+ 
+-				if (!contpte_is_consistent(pte, pfn, orig_prot))
++				if (!contpte_is_consistent(pte, phys, orig_prot))
+ 					goto retry;
+ 
+ 				if (pte_young(pte)) {
+@@ -429,11 +438,11 @@ pte_t contpte_ptep_get_lockless(pte_t *orig_ptep)
+ 			orig_pte = pte_mkyoung(orig_pte);
+ 			i++;
+ 			ptep++;
+-			pfn++;
+-			for (; i < CONT_PTES; i++, ptep++, pfn++) {
++			phys += MMUPAGE_SIZE;
++			for (; i < CONT_PTES; i++, ptep++, phys += MMUPAGE_SIZE) {
+ 				pte = __ptep_get(ptep);
+ 
+-				if (!contpte_is_consistent(pte, pfn, orig_prot))
++				if (!contpte_is_consistent(pte, phys, orig_prot))
+ 					goto retry;
+ 
+ 				if (pte_dirty(pte)) {
+@@ -454,7 +463,7 @@ void contpte_set_ptes(struct mm_struct *mm, unsigned long addr,
+ {
+ 	unsigned long next;
+ 	unsigned long end;
+-	unsigned long pfn;
++	phys_addr_t phys;
+ 	pgprot_t prot;
+ 
+ 	/*
+@@ -468,16 +477,16 @@ void contpte_set_ptes(struct mm_struct *mm, unsigned long addr,
+ 	if (!mm_is_user(mm))
+ 		return __set_ptes(mm, addr, ptep, pte, nr);
+ 
+-	end = addr + (nr << PAGE_SHIFT);
+-	pfn = pte_pfn(pte);
++	end = addr + ((unsigned long)nr << MMUPAGE_SHIFT);
++	phys = __pte_to_phys(pte);
+ 	prot = pte_pgprot(pte);
+ 
+ 	do {
+ 		next = pte_cont_addr_end(addr, end);
+-		nr = (next - addr) >> PAGE_SHIFT;
+-		pte = pfn_pte(pfn, prot);
++		nr = (next - addr) >> MMUPAGE_SHIFT;
++		pte = __pte(__phys_to_pte_val(phys) | pgprot_val(prot));
+ 
+-		if (((addr | next | (pfn << PAGE_SHIFT)) & ~CONT_PTE_MASK) == 0)
++		if (((addr | next | phys) & ~CONT_PTE_MASK) == 0)
+ 			pte = pte_mkcont(pte);
+ 		else
+ 			pte = pte_mknoncont(pte);
+@@ -486,7 +495,7 @@ void contpte_set_ptes(struct mm_struct *mm, unsigned long addr,
+ 
+ 		addr = next;
+ 		ptep += nr;
+-		pfn += nr;
++		phys += (unsigned long)nr << MMUPAGE_SHIFT;
+ 
+ 	} while (addr != end);
+ }
+@@ -524,11 +533,11 @@ bool contpte_test_and_clear_young_ptes(struct vm_area_struct *vma,
+ 	 * of the same large folio in a single VMA and a single page table.
+ 	 */
+ 
+-	unsigned long end = addr + nr * PAGE_SIZE;
++	unsigned long end = addr + nr * MMUPAGE_SIZE;
+ 	bool young = false;
+ 
+ 	ptep = contpte_align_addr_ptep(&addr, &end, ptep, nr);
+-	for (; addr != end; ptep++, addr += PAGE_SIZE)
++	for (; addr != end; ptep++, addr += MMUPAGE_SIZE)
+ 		young |= __ptep_test_and_clear_young(vma, addr, ptep);
+ 
+ 	return young;
+@@ -543,14 +552,14 @@ bool contpte_clear_flush_young_ptes(struct vm_area_struct *vma,
+ 	young = contpte_test_and_clear_young_ptes(vma, addr, ptep, nr);
+ 
+ 	if (young) {
+-		unsigned long end = addr + nr * PAGE_SIZE;
++		unsigned long end = addr + nr * MMUPAGE_SIZE;
+ 
+ 		contpte_align_addr_ptep(&addr, &end, ptep, nr);
+ 		/*
+ 		 * See comment in __ptep_clear_flush_young(); same rationale for
+ 		 * eliding the trailing DSB applies here.
+ 		 */
+-		__flush_tlb_range(vma, addr, end, PAGE_SIZE, 3,
++		__flush_tlb_range(vma, addr, end, MMUPAGE_SIZE, 3,
+ 				  TLBF_NOWALKCACHE | TLBF_NOSYNC);
+ 	}
+ 
+@@ -591,10 +600,10 @@ void contpte_clear_young_dirty_ptes(struct vm_area_struct *vma,
+ 	 * clearing access/dirty for the whole block.
+ 	 */
+ 	unsigned long start = addr;
+-	unsigned long end = start + nr * PAGE_SIZE;
++	unsigned long end = start + nr * MMUPAGE_SIZE;
+ 
+ 	ptep = contpte_align_addr_ptep(&start, &end, ptep, nr);
+-	__clear_young_dirty_ptes(vma, start, ptep, (end - start) / PAGE_SIZE, flags);
++	__clear_young_dirty_ptes(vma, start, ptep, (end - start) / MMUPAGE_SIZE, flags);
+ }
+ EXPORT_SYMBOL_GPL(contpte_clear_young_dirty_ptes);
+ 
+@@ -680,7 +689,7 @@ int contpte_ptep_set_access_flags(struct vm_area_struct *vma,
+ 		 * for the whole contpte block and returned early, pte_same()
+ 		 * within __ptep_set_access_flags() is likely false.
+ 		 */
+-		for (i = 0; i < CONT_PTES; i++, ptep++, addr += PAGE_SIZE)
++		for (i = 0; i < CONT_PTES; i++, ptep++, addr += MMUPAGE_SIZE)
+ 			__ptep_set_access_flags(vma, addr, ptep, entry, 0);
+ 
+ 		if (dirty)
+diff --git a/arch/arm64/mm/fixmap.c b/arch/arm64/mm/fixmap.c
+index c5c5425791da..cb4bf833b7ac 100644
+--- a/arch/arm64/mm/fixmap.c
++++ b/arch/arm64/mm/fixmap.c
+@@ -127,10 +127,10 @@ void __set_fixmap(enum fixed_addresses idx,
+ 	ptep = fixmap_pte(addr);
+ 
+ 	if (pgprot_val(flags)) {
+-		__set_pte(ptep, pfn_pte(phys >> PAGE_SHIFT, flags));
++		__set_pte(ptep, __pte(__phys_to_pte_val(phys) | pgprot_val(flags)));
+ 	} else {
+ 		__pte_clear(&init_mm, addr, ptep);
+-		flush_tlb_kernel_range(addr, addr+PAGE_SIZE);
++		flush_tlb_kernel_range(addr, addr+MMUPAGE_SIZE);
+ 	}
+ }
+ 
+@@ -152,12 +152,12 @@ void *__init fixmap_remap_fdt(phys_addr_t dt_phys, int *size, pgprot_t prot)
+ 	if (!dt_phys || dt_phys % MIN_FDT_ALIGN)
+ 		return NULL;
+ 
+-	dt_phys_base = round_down(dt_phys, PAGE_SIZE);
+-	offset = dt_phys % PAGE_SIZE;
++	dt_phys_base = round_down(dt_phys, MMUPAGE_SIZE);
++	offset = dt_phys % MMUPAGE_SIZE;
+ 	dt_virt = (void *)dt_virt_base + offset;
+ 
+ 	/* map the first chunk so we can read the size from the header */
+-	create_mapping_noalloc(dt_phys_base, dt_virt_base, PAGE_SIZE, prot);
++	create_mapping_noalloc(dt_phys_base, dt_virt_base, MMUPAGE_SIZE, prot);
+ 
+ 	if (fdt_magic(dt_virt) != FDT_MAGIC)
+ 		return NULL;
+@@ -166,7 +166,7 @@ void *__init fixmap_remap_fdt(phys_addr_t dt_phys, int *size, pgprot_t prot)
+ 	if (*size > MAX_FDT_SIZE)
+ 		return NULL;
+ 
+-	if (offset + *size > PAGE_SIZE) {
++	if (offset + *size > MMUPAGE_SIZE) {
+ 		create_mapping_noalloc(dt_phys_base, dt_virt_base,
+ 				       offset + *size, prot);
+ 	}
+diff --git a/arch/arm64/mm/hugetlbpage.c b/arch/arm64/mm/hugetlbpage.c
+index 30772a909aea..5197c1a50ba4 100644
+--- a/arch/arm64/mm/hugetlbpage.c
++++ b/arch/arm64/mm/hugetlbpage.c
+@@ -83,7 +83,7 @@ static int find_num_contig(struct mm_struct *mm, unsigned long addr,
+ 	pud_t *pudp;
+ 	pmd_t *pmdp;
+ 
+-	*pgsize = PAGE_SIZE;
++	*pgsize = MMUPAGE_SIZE;
+ 	p4dp = p4d_offset(pgdp, addr);
+ 	pudp = pud_offset(p4dp, addr);
+ 	pmdp = pmd_offset(pudp, addr);
+@@ -106,7 +106,7 @@ static inline int num_contig_ptes(unsigned long size, size_t *pgsize)
+ 		contig_ptes = CONT_PMDS;
+ 		break;
+ 	case CONT_PTE_SIZE:
+-		*pgsize = PAGE_SIZE;
++		*pgsize = MMUPAGE_SIZE;
+ 		contig_ptes = CONT_PTES;
+ 		break;
+ 	default:
+@@ -503,7 +503,8 @@ static int __init hugetlbpage_init(void)
+ 
+ 	hugetlb_add_hstate(CONT_PMD_SHIFT - PAGE_SHIFT);
+ 	hugetlb_add_hstate(PMD_SHIFT - PAGE_SHIFT);
+-	hugetlb_add_hstate(CONT_PTE_SHIFT - PAGE_SHIFT);
++	if (CONT_PTE_SHIFT > PAGE_SHIFT)
++		hugetlb_add_hstate(CONT_PTE_SHIFT - PAGE_SHIFT);
+ 
+ 	return 0;
+ }
+diff --git a/arch/arm64/mm/init.c b/arch/arm64/mm/init.c
+index 97987f850a33..4d3cf9b54461 100644
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -330,7 +330,24 @@ void __init bootmem_init(void)
+ 
+ void __init arch_setup_zero_pages(void)
+ {
++#if PAGE_MMUSHIFT > 0
++	/*
++	 * PGCL: the static empty_zero_page buffer is only MMUPAGE_SIZE
++	 * aligned (assembler limit on some arches forced relaxation in
++	 * mm_init.c).  phys_to_page() on a symbol that is not PAGE_SIZE
++	 * aligned returns a struct page covering a kernel page that also
++	 * contains adjacent BSS data, leaking it through the zero-page
++	 * mapping.  Allocate a fresh PAGE_SIZE-aligned zero page from
++	 * memblock instead.
++	 */
++	void *z = memblock_alloc(PAGE_SIZE, PAGE_SIZE);
++
++	if (!z)
++		panic("Failed to allocate zero page");
++	__zero_page = virt_to_page(z);
++#else
+ 	__zero_page = phys_to_page(__pa_symbol(empty_zero_page));
++#endif
+ }
+ 
+ void __init arch_mm_preinit(void)
+@@ -394,8 +411,12 @@ void free_initmem(void)
+ 	void *lm_init_begin = lm_alias(__init_begin);
+ 	void *lm_init_end = lm_alias(__init_end);
+ 
+-	WARN_ON(!IS_ALIGNED((unsigned long)lm_init_begin, PAGE_SIZE));
+-	WARN_ON(!IS_ALIGNED((unsigned long)lm_init_end, PAGE_SIZE));
++	/* Kernel sections are SEGMENT_ALIGN-aligned (64K) per linker script;
++	 * vmap/page-tables walk at MMUPAGE granularity.  PAGE_SIZE alignment
++	 * is over-strict under page-clustering (PAGE_SIZE up to 1MB).
++	 */
++	WARN_ON(!IS_ALIGNED((unsigned long)lm_init_begin, MMUPAGE_SIZE));
++	WARN_ON(!IS_ALIGNED((unsigned long)lm_init_end, MMUPAGE_SIZE));
+ 
+ 	free_reserved_area(lm_init_begin, lm_init_end,
+ 			   POISON_FREE_INITMEM, "unused kernel");
+diff --git a/arch/arm64/mm/mmu.c b/arch/arm64/mm/mmu.c
+index 8242f93f05e4..501fc14a6a0c 100644
+--- a/arch/arm64/mm/mmu.c
++++ b/arch/arm64/mm/mmu.c
+@@ -109,7 +109,7 @@ static phys_addr_t __init early_pgtable_alloc(enum pgtable_level pgtable_level)
+ {
+ 	phys_addr_t phys;
+ 
+-	phys = memblock_phys_alloc_range(PAGE_SIZE, PAGE_SIZE, 0,
++	phys = memblock_phys_alloc_range(MMUPAGE_SIZE, MMUPAGE_SIZE, 0,
+ 					 MEMBLOCK_ALLOC_NOLEAKTRACE);
+ 	if (!phys)
+ 		panic("Failed to allocate page table page\n");
+@@ -158,7 +158,7 @@ bool pgattr_change_is_safe(pteval_t old, pteval_t new)
+ 
+ static void init_clear_pgtable(void *table)
+ {
+-	clear_page(table);
++	memset(table, 0, MMUPAGE_SIZE);
+ 
+ 	/* Ensure the zeroing is observed by page table walks. */
+ 	dsb(ishst);
+@@ -174,7 +174,7 @@ static void init_pte(pte_t *ptep, unsigned long addr, unsigned long end,
+ 		 * Required barriers to make this visible to the table walker
+ 		 * are deferred to the end of alloc_init_cont_pte().
+ 		 */
+-		__set_pte_nosync(ptep, pfn_pte(__phys_to_pfn(phys), prot));
++		__set_pte_nosync(ptep, __pte(__phys_to_pte_val(phys) | pgprot_val(prot)));
+ 
+ 		/*
+ 		 * After the PTE entry has been populated once, we
+@@ -183,8 +183,8 @@ static void init_pte(pte_t *ptep, unsigned long addr, unsigned long end,
+ 		BUG_ON(!pgattr_change_is_safe(pte_val(old_pte),
+ 					      pte_val(__ptep_get(ptep))));
+ 
+-		phys += PAGE_SIZE;
+-	} while (ptep++, addr += PAGE_SIZE, addr != end);
++		phys += MMUPAGE_SIZE;
++	} while (ptep++, addr += MMUPAGE_SIZE, addr != end);
+ }
+ 
+ static int alloc_init_cont_pte(pmd_t *pmdp, unsigned long addr,
+@@ -471,12 +471,12 @@ static int __create_pgd_mapping_locked(pgd_t *pgdir, phys_addr_t phys,
+ 	 * If the virtual and physical address don't have the same offset
+ 	 * within a page, we cannot map the region as the caller expects.
+ 	 */
+-	if (WARN_ON((phys ^ virt) & ~PAGE_MASK))
++	if (WARN_ON((phys ^ virt) & ~MMUPAGE_MASK))
+ 		return -EINVAL;
+ 
+-	phys &= PAGE_MASK;
+-	addr = virt & PAGE_MASK;
+-	end = PAGE_ALIGN(virt + size);
++	phys &= MMUPAGE_MASK;
++	addr = virt & MMUPAGE_MASK;
++	end = ALIGN(virt + size, MMUPAGE_SIZE);
+ 
+ 	do {
+ 		next = pgd_addr_end(addr, end);
+@@ -629,7 +629,7 @@ static void split_contpmd(pmd_t *pmdp)
+ static int split_pud(pud_t *pudp, pud_t pud, gfp_t gfp, bool to_cont)
+ {
+ 	pudval_t tableprot = PUD_TYPE_TABLE | PUD_TABLE_UXN | PUD_TABLE_AF;
+-	unsigned int step = PMD_SIZE >> PAGE_SHIFT;
++	unsigned int step = PMD_SIZE >> MMUPAGE_SHIFT;
+ 	unsigned long pfn = pud_pfn(pud);
+ 	pgprot_t prot = pud_pgprot(pud);
+ 	phys_addr_t pmd_phys;
+@@ -817,7 +817,7 @@ int split_kernel_leaf_mapping(unsigned long start, unsigned long end)
+ 	 * Ensure start and end are at least page-aligned since this is the
+ 	 * finest granularity we can split to.
+ 	 */
+-	if (start != PAGE_ALIGN(start) || end != PAGE_ALIGN(end))
++	if (!IS_ALIGNED(start, MMUPAGE_SIZE) || !IS_ALIGNED(end, MMUPAGE_SIZE))
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&pgtable_split_lock);
+@@ -834,7 +834,7 @@ int split_kernel_leaf_mapping(unsigned long start, unsigned long end)
+ 	 * on the more aligned address since the both addresses must be in the
+ 	 * same contpte block and it must have been split to ptes.
+ 	 */
+-	if (end - start == PAGE_SIZE) {
++	if (end - start == MMUPAGE_SIZE) {
+ 		start = __ffs(start) < __ffs(end) ? start : end;
+ 		ret = split_kernel_leaf_mapping_locked(start);
+ 	} else {
+@@ -1225,11 +1225,18 @@ static void __init declare_vma(struct vm_struct *vma,
+ 	phys_addr_t pa_start = __pa_symbol(va_start);
+ 	unsigned long size = va_end - va_start;
+ 
+-	BUG_ON(!PAGE_ALIGNED(pa_start));
+-	BUG_ON(!PAGE_ALIGNED(size));
++	/*
++	 * Kernel segments are SEGMENT_ALIGN-aligned (64K), which equals
++	 * PAGE_SIZE when MMUPAGE_SHIFT == PAGE_SHIFT but is smaller under
++	 * page-clustering (PAGE_SIZE up to 1MB on PGCL=6 with 16K MMU).
++	 * vmap area is MMUPAGE-granular regardless, so MMUPAGE alignment
++	 * is sufficient here.
++	 */
++	BUG_ON(!IS_ALIGNED(pa_start, MMUPAGE_SIZE));
++	BUG_ON(!IS_ALIGNED(size, MMUPAGE_SIZE));
+ 
+ 	if (!(vm_flags & VM_NO_GUARD))
+-		size += PAGE_SIZE;
++		size += MMUPAGE_SIZE;
+ 
+ 	vma->addr	= va_start;
+ 	vma->phys_addr	= pa_start;
+@@ -1247,7 +1254,7 @@ static phys_addr_t kpti_ng_temp_alloc __initdata;
+ 
+ static phys_addr_t __init kpti_ng_pgd_alloc(enum pgtable_level pgtable_level)
+ {
+-	kpti_ng_temp_alloc -= PAGE_SIZE;
++	kpti_ng_temp_alloc -= MMUPAGE_SIZE;
+ 	return kpti_ng_temp_alloc;
+ }
+ 
+@@ -1275,7 +1282,7 @@ static int __init __kpti_install_ng_mappings(void *__unused)
+ 		int ret;
+ 
+ 		alloc = __get_free_pages(GFP_ATOMIC | __GFP_ZERO, order);
+-		kpti_ng_temp_pgd = (pgd_t *)(alloc + (levels - 1) * PAGE_SIZE);
++		kpti_ng_temp_pgd = (pgd_t *)(alloc + (levels - 1) * MMUPAGE_SIZE);
+ 		kpti_ng_temp_alloc = kpti_ng_temp_pgd_pa = __pa(kpti_ng_temp_pgd);
+ 
+ 		//
+@@ -1295,7 +1302,7 @@ static int __init __kpti_install_ng_mappings(void *__unused)
+ 		// to be used as a ad-hoc fixmap.
+ 		//
+ 		ret = __create_pgd_mapping_locked(kpti_ng_temp_pgd, __pa(alloc),
+-						  KPTI_NG_TEMP_VA, PAGE_SIZE, PAGE_KERNEL,
++						  KPTI_NG_TEMP_VA, MMUPAGE_SIZE, PAGE_KERNEL,
+ 						  kpti_ng_pgd_alloc, 0);
+ 		if (ret)
+ 			panic("Failed to create page tables\n");
+@@ -1356,13 +1363,13 @@ static int __init map_entry_trampoline(void)
+ 				 pgd_pgtable_alloc_init_mm, NO_BLOCK_MAPPINGS);
+ 
+ 	/* Map both the text and data into the kernel page table */
+-	for (i = 0; i < DIV_ROUND_UP(entry_tramp_text_size(), PAGE_SIZE); i++)
++	for (i = 0; i < DIV_ROUND_UP(entry_tramp_text_size(), MMUPAGE_SIZE); i++)
+ 		__set_fixmap(FIX_ENTRY_TRAMP_TEXT1 - i,
+-			     pa_start + i * PAGE_SIZE, prot);
++			     pa_start + i * MMUPAGE_SIZE, prot);
+ 
+ 	if (IS_ENABLED(CONFIG_RELOCATABLE))
+ 		__set_fixmap(FIX_ENTRY_TRAMP_TEXT1 - i,
+-			     pa_start + i * PAGE_SIZE, PAGE_KERNEL_RO);
++			     pa_start + i * MMUPAGE_SIZE, PAGE_KERNEL_RO);
+ 
+ 	return 0;
+ }
+@@ -1387,8 +1394,8 @@ void __pi_map_range(phys_addr_t *pte, u64 start, u64 end, phys_addr_t pa,
+ 		    pgprot_t prot, int level, pte_t *tbl, bool may_use_cont,
+ 		    u64 va_offset);
+ 
+-static u8 idmap_ptes[IDMAP_LEVELS - 1][PAGE_SIZE] __aligned(PAGE_SIZE) __ro_after_init,
+-	  kpti_bbml2_ptes[IDMAP_LEVELS - 1][PAGE_SIZE] __aligned(PAGE_SIZE) __ro_after_init;
++static u8 idmap_ptes[IDMAP_LEVELS - 1][MMUPAGE_SIZE] __aligned(MMUPAGE_SIZE) __ro_after_init,
++	  kpti_bbml2_ptes[IDMAP_LEVELS - 1][MMUPAGE_SIZE] __aligned(MMUPAGE_SIZE) __ro_after_init;
+ 
+ static void __init create_idmap(void)
+ {
+@@ -1442,7 +1449,7 @@ static void free_hotplug_page_range(struct page *page, size_t size,
+ static void free_hotplug_pgtable_page(struct page *page)
+ {
+ 	pagetable_dtor(page_ptdesc(page));
+-	free_hotplug_page_range(page, PAGE_SIZE, NULL);
++	free_hotplug_page_range(page, MMUPAGE_SIZE, NULL);
+ }
+ 
+ static bool pgtable_range_aligned(unsigned long start, unsigned long end,
+@@ -1481,12 +1488,12 @@ static void unmap_hotplug_pte_range(pmd_t *pmdp, unsigned long addr,
+ 		if (free_mapped) {
+ 			/* CONT blocks are not supported in the vmemmap */
+ 			WARN_ON(pte_cont(pte));
+-			flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
++			flush_tlb_kernel_range(addr, addr + MMUPAGE_SIZE);
+ 			free_hotplug_page_range(pte_page(pte),
+-						PAGE_SIZE, altmap);
++						MMUPAGE_SIZE, altmap);
+ 		}
+ 		/* unmap_hotplug_range() flushes TLB for !free_mapped */
+-	} while (addr += PAGE_SIZE, addr < end);
++	} while (addr += MMUPAGE_SIZE, addr < end);
+ }
+ 
+ static void unmap_hotplug_pmd_range(pud_t *pudp, unsigned long addr,
+@@ -1509,7 +1516,7 @@ static void unmap_hotplug_pmd_range(pud_t *pudp, unsigned long addr,
+ 			if (free_mapped) {
+ 				/* CONT blocks are not supported in the vmemmap */
+ 				WARN_ON(pmd_cont(pmd));
+-				flush_tlb_kernel_range(addr, addr + PMD_SIZE);
++				flush_tlb_kernel_range(addr, addr + MMUPAGE_SIZE);
+ 				free_hotplug_page_range(pmd_page(pmd),
+ 							PMD_SIZE, altmap);
+ 			}
+@@ -1539,7 +1546,7 @@ static void unmap_hotplug_pud_range(p4d_t *p4dp, unsigned long addr,
+ 		if (pud_leaf(pud)) {
+ 			pud_clear(pudp);
+ 			if (free_mapped) {
+-				flush_tlb_kernel_range(addr, addr + PUD_SIZE);
++				flush_tlb_kernel_range(addr, addr + MMUPAGE_SIZE);
+ 				free_hotplug_page_range(pud_page(pud),
+ 							PUD_SIZE, altmap);
+ 			}
+@@ -1616,7 +1623,7 @@ static void free_empty_pte_table(pmd_t *pmdp, unsigned long addr,
+ 		 * pte clearing has been done by earlier unmap loops.
+ 		 */
+ 		WARN_ON(!pte_none(pte));
+-	} while (addr += PAGE_SIZE, addr < end);
++	} while (addr += MMUPAGE_SIZE, addr < end);
+ 
+ 	if (!pgtable_range_aligned(start, end, floor, ceiling, PMD_MASK))
+ 		return;
+@@ -2280,8 +2287,8 @@ pte_t modify_prot_start_ptes(struct vm_area_struct *vma, unsigned long addr,
+ 		 * in cases where cpu is affected with errata #2645198.
+ 		 */
+ 		if (pte_accessible(vma->vm_mm, pte) && pte_user_exec(pte))
+-			__flush_tlb_range(vma, addr, nr * PAGE_SIZE,
+-					  PAGE_SIZE, 3, TLBF_NOWALKCACHE);
++			__flush_tlb_range(vma, addr, nr * MMUPAGE_SIZE,
++					  MMUPAGE_SIZE, 3, TLBF_NOWALKCACHE);
+ 	}
+ 
+ 	return pte;
+diff --git a/arch/arm64/mm/proc.S b/arch/arm64/mm/proc.S
+index 22866b49be37..763c68fbf120 100644
+--- a/arch/arm64/mm/proc.S
++++ b/arch/arm64/mm/proc.S
+@@ -244,14 +244,14 @@ SYM_FUNC_ALIAS(__pi_idmap_cpu_replace_ttbr1, idmap_cpu_replace_ttbr1)
+ 	.macro	kpti_map_pgtbl, type, level
+ 	str	xzr, [temp_pte, #8 * (\level + 2)]	// break before make
+ 	dsb	nshst
+-	add	pte, temp_pte, #PAGE_SIZE * (\level + 2)
++	add	pte, temp_pte, #MMUPAGE_SIZE * (\level + 2)
+ 	lsr	pte, pte, #12
+ 	tlbi	vaae1, pte
+ 	dsb	nsh
+ 	isb
+ 
+ 	phys_to_pte pte, cur_\type\()p
+-	add	cur_\type\()p, temp_pte, #PAGE_SIZE * (\level + 2)
++	add	cur_\type\()p, temp_pte, #MMUPAGE_SIZE * (\level + 2)
+ 	orr	pte, pte, pte_flags
+ 	str	pte, [temp_pte, #8 * (\level + 2)]
+ 	dsb	nshst
+diff --git a/arch/arm64/mm/ptdump.c b/arch/arm64/mm/ptdump.c
+index ab9899ca1e5f..f446f43e88db 100644
+--- a/arch/arm64/mm/ptdump.c
++++ b/arch/arm64/mm/ptdump.c
+@@ -170,7 +170,7 @@ static void note_prot_uxn(struct ptdump_pg_state *st, unsigned long addr)
+ 	WARN_ONCE(1, "arm64/mm: Found non-UXN mapping at address %p/%pS\n",
+ 		  (void *)st->start_address, (void *)st->start_address);
+ 
+-	st->uxn_pages += (addr - st->start_address) / PAGE_SIZE;
++	st->uxn_pages += (addr - st->start_address) / MMUPAGE_SIZE;
+ }
+ 
+ static void note_prot_wx(struct ptdump_pg_state *st, unsigned long addr)
+@@ -185,7 +185,7 @@ static void note_prot_wx(struct ptdump_pg_state *st, unsigned long addr)
+ 	WARN_ONCE(1, "arm64/mm: Found insecure W+X mapping at address %p/%pS\n",
+ 		  (void *)st->start_address, (void *)st->start_address);
+ 
+-	st->wx_pages += (addr - st->start_address) / PAGE_SIZE;
++	st->wx_pages += (addr - st->start_address) / MMUPAGE_SIZE;
+ }
+ 
+ void note_page(struct ptdump_state *pt_st, unsigned long addr, int level,
+-- 
+2.54.0
+

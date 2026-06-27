@@ -1,0 +1,2194 @@
+From b22fa517679568bfcc7717b6b7b0ec4fe7edc203 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:30 +0200
+Subject: [RFC PATCH 10/28] x86: support page clustering (PAGE_MMUSHIFT)
+
+---
+ arch/x86/Kconfig                             |  14 ++
+ arch/x86/boot/compressed/head_64.S           |   2 +-
+ arch/x86/boot/compressed/ident_map_64.c      |  10 +-
+ arch/x86/boot/compressed/pgtable_64.c        |   6 +-
+ arch/x86/boot/startup/sev-shared.c           |   2 +-
+ arch/x86/entry/vdso/common/vdso-layout.lds.S |   4 +-
+ arch/x86/entry/vdso/vma.c                    |  19 +--
+ arch/x86/include/asm/boot.h                  |   6 +-
+ arch/x86/include/asm/elf.h                   |   2 +-
+ arch/x86/include/asm/fixmap.h                |  10 +-
+ arch/x86/include/asm/intel_ds.h              |  26 +++-
+ arch/x86/include/asm/page_32_types.h         |   2 +-
+ arch/x86/include/asm/page_64_types.h         |   8 +-
+ arch/x86/include/asm/page_types.h            |   2 +-
+ arch/x86/include/asm/pgtable.h               |  15 +-
+ arch/x86/include/asm/pgtable_64.h            |   2 +-
+ arch/x86/include/asm/pgtable_64_types.h      |   2 +-
+ arch/x86/include/asm/processor.h             |   6 +-
+ arch/x86/include/asm/realmode.h              |  10 +-
+ arch/x86/include/asm/shmparam.h              |   2 +-
+ arch/x86/include/asm/svm.h                   |   2 +-
+ arch/x86/include/asm/tlbflush.h              |   4 +-
+ arch/x86/include/asm/vdso/vsyscall.h         |   2 +-
+ arch/x86/kernel/alternative.c                |  40 ++++--
+ arch/x86/kernel/apic/vector.c                |   3 +
+ arch/x86/kernel/cpu/sgx/encl.c               |   8 +-
+ arch/x86/kernel/cpu/sgx/virt.c               |   3 +-
+ arch/x86/kernel/dumpstack_64.c               |   2 +-
+ arch/x86/kernel/e820.c                       |  27 ++++
+ arch/x86/kernel/espfix_64.c                  |  10 +-
+ arch/x86/kernel/head64.c                     |   7 +-
+ arch/x86/kernel/head_64.S                    |   4 +-
+ arch/x86/kernel/irq_64.c                     |   7 +-
+ arch/x86/kernel/irqinit.c                    |   7 +-
+ arch/x86/kernel/ldt.c                        |  20 ++-
+ arch/x86/kernel/mpparse.c                    |  10 +-
+ arch/x86/kernel/sys_x86_64.c                 |  23 ++-
+ arch/x86/lib/clear_page_64.S                 |   1 +
+ arch/x86/lib/copy_page_64.S                  |   5 +-
+ arch/x86/mm/cpu_entry_area.c                 |  32 +++--
+ arch/x86/mm/dump_pagetables.c                |  33 ++++-
+ arch/x86/mm/init.c                           |  55 +++++---
+ arch/x86/mm/init_64.c                        |  47 +++++--
+ arch/x86/mm/ioremap.c                        |  37 +++--
+ arch/x86/mm/pat/set_memory.c                 | 140 +++++++++++++------
+ arch/x86/mm/pgtable.c                        |   2 +-
+ arch/x86/mm/pti.c                            |   2 +-
+ arch/x86/mm/tlb.c                            |   2 +-
+ arch/x86/platform/efi/efi_32.c               |   5 +-
+ arch/x86/platform/efi/efi_64.c               |  43 ++++--
+ arch/x86/platform/efi/quirks.c               |  15 +-
+ arch/x86/realmode/init.c                     |  62 ++++++--
+ arch/x86/realmode/rm/realmode.lds.S          |   4 +-
+ arch/x86/realmode/rm/trampoline_32.S         |   2 +-
+ arch/x86/realmode/rm/trampoline_64.S         |   6 +-
+ arch/x86/xen/mmu_pv.c                        |   2 +-
+ 56 files changed, 589 insertions(+), 235 deletions(-)
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index f3f7cb01d69d..7a0990879309 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1575,6 +1575,20 @@ config ARCH_SPARSEMEM_ENABLE
+ config ARCH_SPARSEMEM_DEFAULT
+ 	def_bool X86_64 || (NUMA && X86_32)
+ 
++# x86 has no notion of multiple base page sizes, but PGCL widens
++# PAGE_SIZE by 2**PAGE_MMUSHIFT.  The mmzone.h invariant
++# MAX_PAGE_ORDER + PAGE_SHIFT <= SECTION_SIZE_BITS (=27 on x86_64,
++# =29/26 on x86_32) breaks at the upstream default of 10 once
++# PAGE_MMUSHIFT reaches 4 on x86_32-PAE / 6 on x86_64.  Provide a
++# default that scales down so the buddy allocator fits within the
++# section.
++config ARCH_FORCE_MAX_ORDER
++	int
++	default 5 if PAGE_MMUSHIFT >= 6
++	default 8 if PAGE_MMUSHIFT >= 4
++	default 10 if PAGE_MMUSHIFT >= 2
++	default 10
++
+ config ARCH_SELECT_MEMORY_MODEL
+ 	def_bool y
+ 	depends on ARCH_SPARSEMEM_ENABLE && ARCH_FLATMEM_ENABLE
+diff --git a/arch/x86/boot/compressed/head_64.S b/arch/x86/boot/compressed/head_64.S
+index d9dab940ff62..b42a7e42b716 100644
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@ -536,4 +536,4 @@ SYM_DATA_LOCAL(pgtable,		.fill BOOT_PGT_SIZE, 1, 0)
+  * The page table is going to be used instead of page table in the trampoline
+  * memory.
+  */
+-SYM_DATA_LOCAL(top_pgtable,	.fill PAGE_SIZE, 1, 0)
++SYM_DATA_LOCAL(top_pgtable,	.fill MMUPAGE_SIZE, 1, 0)
+diff --git a/arch/x86/boot/compressed/ident_map_64.c b/arch/x86/boot/compressed/ident_map_64.c
+index dfb9c2deb77c..82824727f7e5 100644
+--- a/arch/x86/boot/compressed/ident_map_64.c
++++ b/arch/x86/boot/compressed/ident_map_64.c
+@@ -68,7 +68,7 @@ static void *alloc_pgt_page(void *context)
+ 	}
+ 
+ 	entry = pages->pgt_buf + pages->pgt_buf_offset;
+-	pages->pgt_buf_offset += PAGE_SIZE;
++	pages->pgt_buf_offset += MMUPAGE_SIZE;	/* HW page table = one MMU page */
+ 
+ 	return entry;
+ }
+@@ -206,10 +206,10 @@ static pte_t *split_large_pmd(struct x86_mapping_info *info,
+ 	/* No large page - clear PSE flag */
+ 	page_flags  = info->page_flag & ~_PAGE_PSE;
+ 
+-	/* Populate the PTEs */
++	/* Populate the PTEs — step by MMUPAGE_SIZE (hardware page size) */
+ 	for (i = 0; i < PTRS_PER_PMD; i++) {
+ 		set_pte(&pte[i], __pte(address | page_flags));
+-		address += PAGE_SIZE;
++		address += MMUPAGE_SIZE;
+ 	}
+ 
+ 	/*
+@@ -239,8 +239,8 @@ static void clflush_page(unsigned long address)
+ 	 * cause another #VC exception and the GHCB is not ready to use yet.
+ 	 */
+ 	flush_size = 64;
+-	start      = (char *)(address & PAGE_MASK);
+-	end        = start + PAGE_SIZE;
++	start      = (char *)(address & MMUPAGE_MASK);
++	end        = start + MMUPAGE_SIZE;
+ 
+ 	/*
+ 	 * First make sure there are no pending writes on the cache-lines to
+diff --git a/arch/x86/boot/compressed/pgtable_64.c b/arch/x86/boot/compressed/pgtable_64.c
+index 0e89e197e112..4447dd83f882 100644
+--- a/arch/x86/boot/compressed/pgtable_64.c
++++ b/arch/x86/boot/compressed/pgtable_64.c
+@@ -61,7 +61,7 @@ static unsigned long find_trampoline_placement(void)
+ 	if (ebda_start > BIOS_START_MIN && ebda_start < bios_start)
+ 		bios_start = ebda_start;
+ 
+-	bios_start = round_down(bios_start, PAGE_SIZE);
++	bios_start = round_down(bios_start, MMUPAGE_SIZE);
+ 
+ 	/* Find the first usable memory region under bios_start. */
+ 	for (i = boot_params_ptr->e820_entries - 1; i >= 0; i--) {
+@@ -82,7 +82,7 @@ static unsigned long find_trampoline_placement(void)
+ 			new = entry->addr + entry->size;
+ 
+ 		/* Keep bios_start page-aligned. */
+-		new = round_down(new, PAGE_SIZE);
++		new = round_down(new, MMUPAGE_SIZE);
+ 
+ 		/* Skip the entry if it's too small. */
+ 		if (new - TRAMPOLINE_32BIT_SIZE < entry->addr)
+@@ -184,7 +184,7 @@ asmlinkage void configure_5level_paging(struct boot_params *bp, void *pgtable)
+ 		 */
+ 		pgdp = (pgd_t *)native_read_cr3_pa();
+ 		new_cr3 = (u64 *)(native_pgd_val(pgdp[0]) & PTE_PFN_MASK);
+-		memcpy(trampoline_32bit, new_cr3, PAGE_SIZE);
++		memcpy(trampoline_32bit, new_cr3, MMUPAGE_SIZE);
+ 	}
+ 
+ 	toggle_la57(trampoline_32bit);
+diff --git a/arch/x86/boot/startup/sev-shared.c b/arch/x86/boot/startup/sev-shared.c
+index d9ac3a929d33..844b66acafb8 100644
+--- a/arch/x86/boot/startup/sev-shared.c
++++ b/arch/x86/boot/startup/sev-shared.c
+@@ -703,7 +703,7 @@ static bool __init svsm_setup_ca(const struct cc_blob_sev_info *cc_info,
+ 	unsigned int i;
+ 	u64 caa;
+ 
+-	BUILD_BUG_ON(sizeof(*secrets_page) != PAGE_SIZE);
++	BUILD_BUG_ON(sizeof(*secrets_page) != MMUPAGE_SIZE);
+ 
+ 	/*
+ 	 * Check if running at VMPL0.
+diff --git a/arch/x86/entry/vdso/common/vdso-layout.lds.S b/arch/x86/entry/vdso/common/vdso-layout.lds.S
+index a1e30be3e83d..0b965065411d 100644
+--- a/arch/x86/entry/vdso/common/vdso-layout.lds.S
++++ b/arch/x86/entry/vdso/common/vdso-layout.lds.S
+@@ -21,8 +21,8 @@ SECTIONS
+ 	VDSO_VVAR_SYMS
+ 
+ 	vclock_pages = VDSO_VCLOCK_PAGES_START(vdso_u_data);
+-	pvclock_page = vclock_pages + VDSO_PAGE_PVCLOCK_OFFSET * PAGE_SIZE;
+-	hvclock_page = vclock_pages + VDSO_PAGE_HVCLOCK_OFFSET * PAGE_SIZE;
++	pvclock_page = vclock_pages + VDSO_PAGE_PVCLOCK_OFFSET * MMUPAGE_SIZE;
++	hvclock_page = vclock_pages + VDSO_PAGE_HVCLOCK_OFFSET * MMUPAGE_SIZE;
+ 
+ 	. = SIZEOF_HEADERS;
+ 
+diff --git a/arch/x86/entry/vdso/vma.c b/arch/x86/entry/vdso/vma.c
+index d903bce24f15..c9905407b115 100644
+--- a/arch/x86/entry/vdso/vma.c
++++ b/arch/x86/entry/vdso/vma.c
+@@ -38,7 +38,7 @@ unsigned int __read_mostly vdso64_enabled = 1;
+ int __init init_vdso_image(const struct vdso_image *image)
+ {
+ 	BUILD_BUG_ON(VDSO_CLOCKMODE_MAX >= 32);
+-	BUG_ON(image->size % PAGE_SIZE != 0);
++	BUG_ON(image->size % MMUPAGE_SIZE != 0);
+ 
+ 	apply_alternatives((struct alt_instr *)(image->data + image->alt),
+ 			   (struct alt_instr *)(image->data + image->alt +
+@@ -54,10 +54,10 @@ static vm_fault_t vdso_fault(const struct vm_special_mapping *sm,
+ {
+ 	const struct vdso_image *image = vma->vm_mm->context.vdso_image;
+ 
+-	if (!image || (vmf->pgoff << PAGE_SHIFT) >= image->size)
++	if (!image || (vmf->pgoff << MMUPAGE_SHIFT) >= image->size)
+ 		return VM_FAULT_SIGBUS;
+ 
+-	vmf->page = virt_to_page(image->data + (vmf->pgoff << PAGE_SHIFT));
++	vmf->page = virt_to_page(image->data + (vmf->pgoff << MMUPAGE_SHIFT));
+ 	get_page(vmf->page);
+ 	return 0;
+ }
+@@ -94,8 +94,9 @@ static vm_fault_t vvar_vclock_fault(const struct vm_special_mapping *sm,
+ 			pvclock_get_pvti_cpu0_va();
+ 
+ 		if (pvti && vclock_was_used(VDSO_CLOCKMODE_PVCLOCK))
++			/* vmf_insert_pfn_prot() takes an MMUPAGE-granular PFN. */
+ 			return vmf_insert_pfn_prot(vma, vmf->address,
+-					__pa(pvti) >> PAGE_SHIFT,
++					__pa(pvti) >> MMUPAGE_SHIFT,
+ 					pgprot_decrypted(vma->vm_page_prot));
+ 		break;
+ 	}
+@@ -103,7 +104,9 @@ static vm_fault_t vvar_vclock_fault(const struct vm_special_mapping *sm,
+ 	{
+ 		unsigned long pfn = hv_get_tsc_pfn();
+ 		if (pfn && vclock_was_used(VDSO_CLOCKMODE_HVCLOCK))
+-			return vmf_insert_pfn(vma, vmf->address, pfn);
++			/* hv_get_tsc_pfn() is PAGE-granular; vmf_insert_pfn() takes MMUPAGE. */
++			return vmf_insert_pfn(vma, vmf->address,
++					      pfn << PAGE_MMUSHIFT);
+ 		break;
+ 	}
+ 	}
+@@ -137,13 +140,13 @@ static int map_vdso(const struct vdso_image *image, unsigned long addr)
+ 		return -EINTR;
+ 
+ 	addr = get_unmapped_area(NULL, addr,
+-				 image->size + __VDSO_PAGES * PAGE_SIZE, 0, 0);
++				 image->size + __VDSO_PAGES * MMUPAGE_SIZE, 0, 0);
+ 	if (IS_ERR_VALUE(addr)) {
+ 		ret = addr;
+ 		goto up_fail;
+ 	}
+ 
+-	text_start = addr + __VDSO_PAGES * PAGE_SIZE;
++	text_start = addr + __VDSO_PAGES * MMUPAGE_SIZE;
+ 
+ 	/*
+ 	 * MAYWRITE to allow gdb to COW and set breakpoints
+@@ -170,7 +173,7 @@ static int map_vdso(const struct vdso_image *image, unsigned long addr)
+ 
+ 	vma = _install_special_mapping(mm,
+ 				       VDSO_VCLOCK_PAGES_START(addr),
+-				       VDSO_NR_VCLOCK_PAGES * PAGE_SIZE,
++				       VDSO_NR_VCLOCK_PAGES * MMUPAGE_SIZE,
+ 				       VM_READ|VM_MAYREAD|VM_IO|VM_DONTDUMP|
+ 				       VM_PFNMAP|VM_SEALED_SYSMAP,
+ 				       &vvar_vclock_mapping);
+diff --git a/arch/x86/include/asm/boot.h b/arch/x86/include/asm/boot.h
+index f7b67cb73915..ecbea84bf18c 100644
+--- a/arch/x86/include/asm/boot.h
++++ b/arch/x86/include/asm/boot.h
+@@ -10,7 +10,7 @@
+ #ifdef CONFIG_X86_64
+ # define MIN_KERNEL_ALIGN_LG2	PMD_SHIFT
+ #else
+-# define MIN_KERNEL_ALIGN_LG2	(PAGE_SHIFT + THREAD_SIZE_ORDER)
++# define MIN_KERNEL_ALIGN_LG2	(MMUPAGE_SHIFT + THREAD_SIZE_ORDER)
+ #endif
+ #define MIN_KERNEL_ALIGN	(_AC(1, UL) << MIN_KERNEL_ALIGN_LG2)
+ 
+@@ -74,9 +74,9 @@
+ # define BOOT_STACK_SIZE	0x1000
+ #endif
+ 
+-#define TRAMPOLINE_32BIT_SIZE		(2 * PAGE_SIZE)
++#define TRAMPOLINE_32BIT_SIZE		(2 * MMUPAGE_SIZE)
+ 
+-#define TRAMPOLINE_32BIT_CODE_OFFSET	PAGE_SIZE
++#define TRAMPOLINE_32BIT_CODE_OFFSET	MMUPAGE_SIZE
+ #define TRAMPOLINE_32BIT_CODE_SIZE	0xA0
+ 
+ #ifndef __ASSEMBLER__
+diff --git a/arch/x86/include/asm/elf.h b/arch/x86/include/asm/elf.h
+index c7f98977663c..bccc41639081 100644
+--- a/arch/x86/include/asm/elf.h
++++ b/arch/x86/include/asm/elf.h
+@@ -224,7 +224,7 @@ extern int force_personality32;
+ #endif /* !CONFIG_X86_32 */
+ 
+ #define CORE_DUMP_USE_REGSET
+-#define ELF_EXEC_PAGESIZE	4096
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ 
+ /*
+  * This is the base location for PIE (ET_DYN with INTERP) loads. On
+diff --git a/arch/x86/include/asm/fixmap.h b/arch/x86/include/asm/fixmap.h
+index 4519c9f35ba0..64ff2d21b7f2 100644
+--- a/arch/x86/include/asm/fixmap.h
++++ b/arch/x86/include/asm/fixmap.h
+@@ -55,8 +55,8 @@
+ extern unsigned long __FIXADDR_TOP;
+ #define FIXADDR_TOP	((unsigned long)__FIXADDR_TOP)
+ #else
+-#define FIXADDR_TOP	(round_up(VSYSCALL_ADDR + PAGE_SIZE, 1<<PMD_SHIFT) - \
+-			 PAGE_SIZE)
++#define FIXADDR_TOP	(round_up(VSYSCALL_ADDR + MMUPAGE_SIZE, 1<<PMD_SHIFT) - \
++			 MMUPAGE_SIZE)
+ #endif
+ 
+ /*
+@@ -83,7 +83,7 @@ enum fixed_addresses {
+ 	FIX_HOLE,
+ #else
+ #ifdef CONFIG_X86_VSYSCALL_EMULATION
+-	VSYSCALL_PAGE = (FIXADDR_TOP - VSYSCALL_ADDR) >> PAGE_SHIFT,
++	VSYSCALL_PAGE = (FIXADDR_TOP - VSYSCALL_ADDR) >> MMUPAGE_SHIFT,
+ #endif
+ #endif
+ 	FIX_DBGP_BASE,
+@@ -147,9 +147,9 @@ enum fixed_addresses {
+ 
+ extern void reserve_top_address(unsigned long reserve);
+ 
+-#define FIXADDR_SIZE		(__end_of_permanent_fixed_addresses << PAGE_SHIFT)
++#define FIXADDR_SIZE		(__end_of_permanent_fixed_addresses << MMUPAGE_SHIFT)
+ #define FIXADDR_START		(FIXADDR_TOP - FIXADDR_SIZE)
+-#define FIXADDR_TOT_SIZE	(__end_of_fixed_addresses << PAGE_SHIFT)
++#define FIXADDR_TOT_SIZE	(__end_of_fixed_addresses << MMUPAGE_SHIFT)
+ #define FIXADDR_TOT_START	(FIXADDR_TOP - FIXADDR_TOT_SIZE)
+ 
+ extern int fixmaps_set;
+diff --git a/arch/x86/include/asm/intel_ds.h b/arch/x86/include/asm/intel_ds.h
+index 695f87efbeb8..39c2aaf1447a 100644
+--- a/arch/x86/include/asm/intel_ds.h
++++ b/arch/x86/include/asm/intel_ds.h
+@@ -3,15 +3,22 @@
+ 
+ #include <linux/percpu-defs.h>
+ 
+-#define BTS_BUFFER_SIZE		(PAGE_SIZE << 4)
++/*
++ * The BTS and PEBS trace buffers are hardware-written byte buffers sized in
++ * hardware pages.  Under page clustering use MMUPAGE_SIZE, not the (large)
++ * kernel PAGE_SIZE, so the buffers -- and the cpu_entry_area that maps them --
++ * stay the intended ~64K rather than ballooning (e.g. to 4M at PAGE_MMUSHIFT=6).
++ * Identity at PAGE_MMUSHIFT == 0 (MMUPAGE_SIZE == PAGE_SIZE).
++ */
++#define BTS_BUFFER_SIZE		(MMUPAGE_SIZE << 4)
+ #define PEBS_BUFFER_SHIFT	4
+-#define PEBS_BUFFER_SIZE	(PAGE_SIZE << PEBS_BUFFER_SHIFT)
++#define PEBS_BUFFER_SIZE	(MMUPAGE_SIZE << PEBS_BUFFER_SHIFT)
+ 
+ /*
+- * The largest PEBS record could consume a page, ensure
++ * The largest PEBS record could consume a hardware page, ensure
+  * a record at least can be written after triggering PMI.
+  */
+-#define ARCH_PEBS_THRESH_MULTI	((PEBS_BUFFER_SIZE - PAGE_SIZE) >> PEBS_BUFFER_SHIFT)
++#define ARCH_PEBS_THRESH_MULTI	((PEBS_BUFFER_SIZE - MMUPAGE_SIZE) >> PEBS_BUFFER_SHIFT)
+ #define ARCH_PEBS_THRESH_SINGLE	1
+ 
+ /* The maximal number of PEBS events: */
+@@ -35,7 +42,16 @@ struct debug_store {
+ 	u64	pebs_absolute_maximum;
+ 	u64	pebs_interrupt_threshold;
+ 	u64	pebs_event_reset[MAX_PEBS_EVENTS + MAX_FIXED_PEBS_EVENTS];
+-} __aligned(PAGE_SIZE);
++	/*
++	 * The DS area is a hardware structure mapped into the cpu_entry_area at
++	 * hardware-page granularity; align to MMUPAGE_SIZE, not the kernel
++	 * PAGE_SIZE.  Otherwise under page clustering each embedded/percpu copy
++	 * balloons to a full (e.g. 256K) PAGE -- inflating the cpu_entry_area and
++	 * pushing alloc_percpu(struct bts_ctx) past PCPU_MIN_UNIT_SIZE in
++	 * bts_init() (the "illegal size for percpu allocation" WARN).  Identity at
++	 * PAGE_MMUSHIFT == 0 (MMUPAGE_SIZE == PAGE_SIZE).
++	 */
++} __aligned(MMUPAGE_SIZE);
+ 
+ DECLARE_PER_CPU_PAGE_ALIGNED(struct debug_store, cpu_debug_store);
+ 
+diff --git a/arch/x86/include/asm/page_32_types.h b/arch/x86/include/asm/page_32_types.h
+index 623f1e9f493e..b592144e0e72 100644
+--- a/arch/x86/include/asm/page_32_types.h
++++ b/arch/x86/include/asm/page_32_types.h
+@@ -20,7 +20,7 @@
+ #define __START_KERNEL_map	__PAGE_OFFSET
+ 
+ #define THREAD_SIZE_ORDER	1
+-#define THREAD_SIZE		(PAGE_SIZE << THREAD_SIZE_ORDER)
++#define THREAD_SIZE		(MMUPAGE_SIZE << THREAD_SIZE_ORDER)
+ 
+ #define IRQ_STACK_SIZE		THREAD_SIZE
+ 
+diff --git a/arch/x86/include/asm/page_64_types.h b/arch/x86/include/asm/page_64_types.h
+index 7400dab373fe..b850575cd575 100644
+--- a/arch/x86/include/asm/page_64_types.h
++++ b/arch/x86/include/asm/page_64_types.h
+@@ -13,13 +13,13 @@
+ #endif
+ 
+ #define THREAD_SIZE_ORDER	(2 + KASAN_STACK_ORDER)
+-#define THREAD_SIZE  (PAGE_SIZE << THREAD_SIZE_ORDER)
++#define THREAD_SIZE  (MMUPAGE_SIZE << THREAD_SIZE_ORDER)
+ 
+ #define EXCEPTION_STACK_ORDER (1 + KASAN_STACK_ORDER)
+-#define EXCEPTION_STKSZ (PAGE_SIZE << EXCEPTION_STACK_ORDER)
++#define EXCEPTION_STKSZ (MMUPAGE_SIZE << EXCEPTION_STACK_ORDER)
+ 
+ #define IRQ_STACK_ORDER (2 + KASAN_STACK_ORDER)
+-#define IRQ_STACK_SIZE (PAGE_SIZE << IRQ_STACK_ORDER)
++#define IRQ_STACK_SIZE (MMUPAGE_SIZE << IRQ_STACK_ORDER)
+ 
+ /*
+  * The index for the tss.ist[] array. The hardware limit is 7 entries.
+@@ -51,7 +51,7 @@
+ #define __VIRTUAL_MASK_SHIFT	(pgtable_l5_enabled() ? 56 : 47)
+ 
+ #define TASK_SIZE_MAX		task_size_max()
+-#define DEFAULT_MAP_WINDOW	((1UL << 47) - PAGE_SIZE)
++#define DEFAULT_MAP_WINDOW	((1UL << 47) - MMUPAGE_SIZE)
+ 
+ /* This decides where the kernel will search for a free chunk of vm
+  * space during mmap's.
+diff --git a/arch/x86/include/asm/page_types.h b/arch/x86/include/asm/page_types.h
+index 3e0801a0f782..83c34af483e8 100644
+--- a/arch/x86/include/asm/page_types.h
++++ b/arch/x86/include/asm/page_types.h
+@@ -13,7 +13,7 @@
+ /* Cast P*D_MASK to a signed type so that it is sign-extended if
+    virtual addresses are 32-bits but physical addresses are larger
+    (ie, 32-bit PAE). */
+-#define PHYSICAL_PAGE_MASK	(((signed long)PAGE_MASK) & __PHYSICAL_MASK)
++#define PHYSICAL_PAGE_MASK	(((signed long)MMUPAGE_MASK) & __PHYSICAL_MASK)
+ #define PHYSICAL_PMD_PAGE_MASK	(((signed long)PMD_MASK) & __PHYSICAL_MASK)
+ #define PHYSICAL_PUD_PAGE_MASK	(((signed long)PUD_MASK) & __PHYSICAL_MASK)
+ 
+diff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+index 2187e9cfcefa..9e62c866ac16 100644
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -251,7 +251,18 @@ static inline int pte_special(pte_t pte)
+ 
+ static inline u64 protnone_mask(u64 val);
+ 
+-#define PFN_PTE_SHIFT	PAGE_SHIFT
++/*
++ * Stride between consecutive hardware PTEs.  The x86 PTE physical-address
++ * field is fixed at bit MMUPAGE_SHIFT (4 KiB), independent of the kernel's
++ * PAGE_SIZE.  Under page clustering (PAGE_MMUSHIFT > 0) PAGE_SHIFT exceeds
++ * MMUPAGE_SHIFT, so using PAGE_SHIFT here makes pte_advance_pfn() add
++ * nr << PAGE_SHIFT to the PTE value (unmasked) -- striding the physical
++ * field 16x too far at PAGE_MMUSHIFT=4 and walking into reserved bits, which
++ * faults (error 0x0b) once it overflows the platform's physical-address
++ * width on large-memory systems.  Must be MMUPAGE_SHIFT; identity when
++ * PAGE_MMUSHIFT == 0.
++ */
++#define PFN_PTE_SHIFT	MMUPAGE_SHIFT
+ 
+ static inline unsigned long pte_pfn(pte_t pte)
+ {
+@@ -1470,7 +1481,7 @@ static inline void clone_pgd_range(pgd_t *dst, pgd_t *src, int count)
+ #define PTE_SHIFT ilog2(PTRS_PER_PTE)
+ static inline int page_level_shift(enum pg_level level)
+ {
+-	return (PAGE_SHIFT - PTE_SHIFT) + level * PTE_SHIFT;
++	return (MMUPAGE_SHIFT - PTE_SHIFT) + level * PTE_SHIFT;
+ }
+ static inline unsigned long page_level_size(enum pg_level level)
+ {
+diff --git a/arch/x86/include/asm/pgtable_64.h b/arch/x86/include/asm/pgtable_64.h
+index ce45882ccd07..8df5f6ffb338 100644
+--- a/arch/x86/include/asm/pgtable_64.h
++++ b/arch/x86/include/asm/pgtable_64.h
+@@ -277,7 +277,7 @@ L4_START_KERNEL = l4_index(__START_KERNEL_map)
+ L3_START_KERNEL = pud_index(__START_KERNEL_map)
+ 
+ #define SYM_DATA_START_PAGE_ALIGNED(name)			\
+-	SYM_START(name, SYM_L_GLOBAL, .balign PAGE_SIZE)
++	SYM_START(name, SYM_L_GLOBAL, .balign MMUPAGE_SIZE)
+ 
+ /* Automate the creation of 1 to 1 mapping pmd entries */
+ #define PMDS(START, PERM, COUNT)			\
+diff --git a/arch/x86/include/asm/pgtable_64_types.h b/arch/x86/include/asm/pgtable_64_types.h
+index 7eb61ef6a185..fda1d393050d 100644
+--- a/arch/x86/include/asm/pgtable_64_types.h
++++ b/arch/x86/include/asm/pgtable_64_types.h
+@@ -188,7 +188,7 @@ extern unsigned int ptrs_per_p4d;
+ 
+ #define EARLY_DYNAMIC_PAGE_TABLES	64
+ 
+-#define PGD_KERNEL_START	((PAGE_SIZE / 2) / sizeof(pgd_t))
++#define PGD_KERNEL_START	((MMUPAGE_SIZE / 2) / sizeof(pgd_t))
+ 
+ /*
+  * We borrow bit 3 to remember PG_anon_exclusive.
+diff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h
+index 67dd932305db..3ba40fc8fa32 100644
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -364,12 +364,12 @@ struct x86_hw_tss {
+ #define IO_BITMAP_OFFSET_INVALID	(__KERNEL_TSS_LIMIT + 1)
+ 
+ struct entry_stack {
+-	char	stack[PAGE_SIZE];
++	char	stack[MMUPAGE_SIZE];
+ };
+ 
+ struct entry_stack_page {
+ 	struct entry_stack stack;
+-} __aligned(PAGE_SIZE);
++} __aligned(MMUPAGE_SIZE);
+ 
+ /*
+  * All IO bitmap related data stored in the TSS:
+@@ -411,7 +411,7 @@ struct tss_struct {
+ 	struct x86_hw_tss	x86_tss;
+ 
+ 	struct x86_io_bitmap	io_bitmap;
+-} __aligned(PAGE_SIZE);
++} __aligned(MMUPAGE_SIZE);
+ 
+ DECLARE_PER_CPU_PAGE_ALIGNED(struct tss_struct, cpu_tss_rw);
+ 
+diff --git a/arch/x86/include/asm/realmode.h b/arch/x86/include/asm/realmode.h
+index e406a1e92c63..36ae704cb179 100644
+--- a/arch/x86/include/asm/realmode.h
++++ b/arch/x86/include/asm/realmode.h
+@@ -83,7 +83,15 @@ static __always_inline size_t real_mode_size_needed(void)
+ 	if (real_mode_header)
+ 		return 0;	/* already allocated. */
+ 
+-	return ALIGN(real_mode_blob_end - real_mode_blob, PAGE_SIZE);
++	/*
++	 * Align to MMUPAGE_SIZE, not PAGE_SIZE.  The real-mode trampoline only
++	 * needs hardware-page (MMUPAGE) granularity; under page clustering
++	 * (PAGE_MMUSHIFT > 0) a PAGE_SIZE alignment+size (e.g. 256K) often
++	 * cannot be satisfied in a fragmented sub-1M e820, panicking the boot in
++	 * init_real_mode().  Identity at PAGE_MMUSHIFT == 0 (MMUPAGE_SIZE ==
++	 * PAGE_SIZE).
++	 */
++	return ALIGN(real_mode_blob_end - real_mode_blob, MMUPAGE_SIZE);
+ }
+ 
+ static inline void set_real_mode_mem(phys_addr_t mem)
+diff --git a/arch/x86/include/asm/shmparam.h b/arch/x86/include/asm/shmparam.h
+index c4041819c3e5..6574f168d504 100644
+--- a/arch/x86/include/asm/shmparam.h
++++ b/arch/x86/include/asm/shmparam.h
+@@ -2,6 +2,6 @@
+ #ifndef _ASM_X86_SHMPARAM_H
+ #define _ASM_X86_SHMPARAM_H
+ 
+-#define SHMLBA PAGE_SIZE	 /* attach addr a multiple of this */
++#define SHMLBA MMUPAGE_SIZE	 /* attach addr a multiple of this */
+ 
+ #endif /* _ASM_X86_SHMPARAM_H */
+diff --git a/arch/x86/include/asm/svm.h b/arch/x86/include/asm/svm.h
+index bcfeb5e7c0ed..be483e46d9e3 100644
+--- a/arch/x86/include/asm/svm.h
++++ b/arch/x86/include/asm/svm.h
+@@ -555,7 +555,7 @@ struct vmcb {
+ #define EXPECTED_GHCB_SAVE_AREA_SIZE		1032
+ #define EXPECTED_SEV_ES_SAVE_AREA_SIZE		1648
+ #define EXPECTED_VMCB_CONTROL_AREA_SIZE		1024
+-#define EXPECTED_GHCB_SIZE			PAGE_SIZE
++#define EXPECTED_GHCB_SIZE			MMUPAGE_SIZE
+ 
+ #define BUILD_BUG_RESERVED_OFFSET(x, y) \
+ 	ASSERT_STRUCT_OFFSET(struct x, reserved ## _ ## y, y)
+diff --git a/arch/x86/include/asm/tlbflush.h b/arch/x86/include/asm/tlbflush.h
+index 0545fe75c3fa..5e550c9a077f 100644
+--- a/arch/x86/include/asm/tlbflush.h
++++ b/arch/x86/include/asm/tlbflush.h
+@@ -332,7 +332,7 @@ static inline bool mm_in_asid_transition(struct mm_struct *mm) { return false; }
+ 	flush_tlb_mm_range((vma)->vm_mm, start, end,			\
+ 			   ((vma)->vm_flags & VM_HUGETLB)		\
+ 				? huge_page_shift(hstate_vma(vma))	\
+-				: PAGE_SHIFT, true)
++				: MMUPAGE_SHIFT, true)
+ 
+ extern void flush_tlb_all(void);
+ extern void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+@@ -342,7 +342,7 @@ extern void flush_tlb_kernel_range(unsigned long start, unsigned long end);
+ 
+ static inline void flush_tlb_page(struct vm_area_struct *vma, unsigned long a)
+ {
+-	flush_tlb_mm_range(vma->vm_mm, a, a + PAGE_SIZE, PAGE_SHIFT, false);
++	flush_tlb_mm_range(vma->vm_mm, a, a + MMUPAGE_SIZE, MMUPAGE_SHIFT, false);
+ }
+ 
+ static inline bool arch_tlbbatch_should_defer(struct mm_struct *mm)
+diff --git a/arch/x86/include/asm/vdso/vsyscall.h b/arch/x86/include/asm/vdso/vsyscall.h
+index 4aa311a923f2..3c7f9064f5f8 100644
+--- a/arch/x86/include/asm/vdso/vsyscall.h
++++ b/arch/x86/include/asm/vdso/vsyscall.h
+@@ -5,7 +5,7 @@
+ #define __VDSO_PAGES	6
+ 
+ #define VDSO_NR_VCLOCK_PAGES	2
+-#define VDSO_VCLOCK_PAGES_START(_b)	((_b) + (__VDSO_PAGES - VDSO_NR_VCLOCK_PAGES) * PAGE_SIZE)
++#define VDSO_VCLOCK_PAGES_START(_b)	((_b) + (__VDSO_PAGES - VDSO_NR_VCLOCK_PAGES) * MMUPAGE_SIZE)
+ #define VDSO_PAGE_PVCLOCK_OFFSET	0
+ #define VDSO_PAGE_HVCLOCK_OFFSET	1
+ 
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index 62936a3bde19..7e9dd7faf8c2 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -2545,13 +2545,19 @@ typedef void text_poke_f(void *dst, const void *src, size_t len);
+ 
+ static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t len)
+ {
+-	bool cross_page_boundary = offset_in_page(addr) + len > PAGE_SIZE;
++	/*
++	 * Use MMUPAGE (hardware page) granularity for offset and boundary
++	 * calculations, since each PTE maps one MMUPAGE, not one PAGE.
++	 */
++	unsigned long mmu_offset = (unsigned long)addr & ~MMUPAGE_MASK;
++	bool cross_page_boundary = mmu_offset + len > MMUPAGE_SIZE;
+ 	struct page *pages[2] = {NULL};
+ 	struct mm_struct *prev_mm;
+ 	unsigned long flags;
+ 	pte_t pte, *ptep;
+ 	spinlock_t *ptl;
+ 	pgprot_t pgprot;
++	phys_addr_t phys;
+ 
+ 	/*
+ 	 * While boot memory allocator is running we cannot use struct pages as
+@@ -2562,12 +2568,12 @@ static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t l
+ 	if (!core_kernel_text((unsigned long)addr)) {
+ 		pages[0] = vmalloc_to_page(addr);
+ 		if (cross_page_boundary)
+-			pages[1] = vmalloc_to_page(addr + PAGE_SIZE);
++			pages[1] = vmalloc_to_page(addr + MMUPAGE_SIZE);
+ 	} else {
+ 		pages[0] = virt_to_page(addr);
+ 		WARN_ON(!PageReserved(pages[0]));
+ 		if (cross_page_boundary)
+-			pages[1] = virt_to_page(addr + PAGE_SIZE);
++			pages[1] = virt_to_page(addr + MMUPAGE_SIZE);
+ 	}
+ 	/*
+ 	 * If something went wrong, crash and burn since recovery paths are not
+@@ -2593,12 +2599,22 @@ static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t l
+ 
+ 	local_irq_save(flags);
+ 
+-	pte = mk_pte(pages[0], pgprot);
++	/*
++	 * Map the MMUPAGE containing addr. With page clustering, a struct page
++	 * covers PAGE_SIZE (>MMUPAGE_SIZE), so add the sub-page MMUPAGE offset
++	 * to get the correct physical address for the PTE.
++	 */
++	phys = page_to_phys(pages[0]) + (offset_in_page(addr) & MMUPAGE_MASK);
++	pte = __pte((phys & PTE_PFN_MASK) | pgprot_val(pgprot));
+ 	set_pte_at(text_poke_mm, text_poke_mm_addr, ptep, pte);
+ 
+ 	if (cross_page_boundary) {
+-		pte = mk_pte(pages[1], pgprot);
+-		set_pte_at(text_poke_mm, text_poke_mm_addr + PAGE_SIZE, ptep + 1, pte);
++		unsigned long addr2 = (unsigned long)addr + MMUPAGE_SIZE;
++
++		phys = page_to_phys(pages[1]) + (offset_in_page(addr2) & MMUPAGE_MASK);
++		pte = __pte((phys & PTE_PFN_MASK) | pgprot_val(pgprot));
++		set_pte_at(text_poke_mm, text_poke_mm_addr + MMUPAGE_SIZE,
++			   ptep + 1, pte);
+ 	}
+ 
+ 	/*
+@@ -2608,7 +2624,7 @@ static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t l
+ 	prev_mm = use_temporary_mm(text_poke_mm);
+ 
+ 	kasan_disable_current();
+-	func((u8 *)text_poke_mm_addr + offset_in_page(addr), src, len);
++	func((u8 *)text_poke_mm_addr + mmu_offset, src, len);
+ 	kasan_enable_current();
+ 
+ 	/*
+@@ -2619,7 +2635,7 @@ static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t l
+ 
+ 	pte_clear(text_poke_mm, text_poke_mm_addr, ptep);
+ 	if (cross_page_boundary)
+-		pte_clear(text_poke_mm, text_poke_mm_addr + PAGE_SIZE, ptep + 1);
++		pte_clear(text_poke_mm, text_poke_mm_addr + MMUPAGE_SIZE, ptep + 1);
+ 
+ 	/*
+ 	 * Loading the previous page-table hierarchy requires a serializing
+@@ -2633,8 +2649,8 @@ static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t l
+ 	 * IRQs, but not if the mm is not used, as it is in this point.
+ 	 */
+ 	flush_tlb_mm_range(text_poke_mm, text_poke_mm_addr, text_poke_mm_addr +
+-			   (cross_page_boundary ? 2 : 1) * PAGE_SIZE,
+-			   PAGE_SHIFT, false);
++			   (cross_page_boundary ? 2 : 1) * MMUPAGE_SIZE,
++			   MMUPAGE_SHIFT, false);
+ 
+ 	if (func == text_poke_memcpy) {
+ 		/*
+@@ -2704,7 +2720,7 @@ void *text_poke_copy_locked(void *addr, const void *opcode, size_t len,
+ 		unsigned long ptr = start + patched;
+ 		size_t s;
+ 
+-		s = min_t(size_t, PAGE_SIZE * 2 - offset_in_page(ptr), len - patched);
++		s = min_t(size_t, MMUPAGE_SIZE * 2 - (ptr & ~MMUPAGE_MASK), len - patched);
+ 
+ 		__text_poke(text_poke_memcpy, (void *)ptr, opcode + patched, s);
+ 		patched += s;
+@@ -2754,7 +2770,7 @@ void *text_poke_set(void *addr, int c, size_t len)
+ 		unsigned long ptr = start + patched;
+ 		size_t s;
+ 
+-		s = min_t(size_t, PAGE_SIZE * 2 - offset_in_page(ptr), len - patched);
++		s = min_t(size_t, MMUPAGE_SIZE * 2 - (ptr & ~MMUPAGE_MASK), len - patched);
+ 
+ 		__text_poke(text_poke_memset, (void *)ptr, (void *)&c, s);
+ 		patched += s;
+diff --git a/arch/x86/kernel/apic/vector.c b/arch/x86/kernel/apic/vector.c
+index bddc54465399..b85690fd56e0 100644
+--- a/arch/x86/kernel/apic/vector.c
++++ b/arch/x86/kernel/apic/vector.c
+@@ -775,6 +775,7 @@ void __init lapic_assign_system_vectors(void)
+ {
+ 	unsigned int i, vector;
+ 
++	pr_info("lapic_assign_system_vectors: vector_matrix=%px\n", vector_matrix);
+ 	for_each_set_bit(vector, system_vectors, NR_VECTORS)
+ 		irq_matrix_assign_system(vector_matrix, vector, false);
+ 
+@@ -815,8 +816,10 @@ int __init arch_early_irq_init(void)
+ 	 */
+ 	vector_matrix = irq_alloc_matrix(NR_VECTORS, FIRST_EXTERNAL_VECTOR,
+ 					 FIRST_SYSTEM_VECTOR);
++	pr_info("arch_early_irq_init: vector_matrix=%px at &=%px\n", vector_matrix, &vector_matrix);
+ 	BUG_ON(!vector_matrix);
+ 
++	pr_info("arch_early_irq_init: calling arch_early_ioapic_init\n");
+ 	return arch_early_ioapic_init();
+ }
+ 
+diff --git a/arch/x86/kernel/cpu/sgx/encl.c b/arch/x86/kernel/cpu/sgx/encl.c
+index 3f0222d10f6e..ff21e8a293dd 100644
+--- a/arch/x86/kernel/cpu/sgx/encl.c
++++ b/arch/x86/kernel/cpu/sgx/encl.c
+@@ -15,7 +15,7 @@
+ static int sgx_encl_lookup_backing(struct sgx_encl *encl, unsigned long page_index,
+ 			    struct sgx_backing *backing);
+ 
+-#define PCMDS_PER_PAGE (PAGE_SIZE / sizeof(struct sgx_pcmd))
++#define PCMDS_PER_PAGE (MMUPAGE_SIZE / sizeof(struct sgx_pcmd))
+ /*
+  * 32 PCMD entries share a PCMD page. PCMD_FIRST_MASK is used to
+  * determine the page index associated with the first PCMD entry
+@@ -405,7 +405,8 @@ static vm_fault_t sgx_encl_eaug_page(struct vm_area_struct *vma,
+ 	 * Do not undo everything when creating PTE entry fails - next #PF
+ 	 * would find page ready for a PTE.
+ 	 */
+-	vmret = vmf_insert_pfn(vma, addr, PFN_DOWN(phys_addr));
++	/* vmf_insert_pfn() takes an MMUPAGE-granular PFN. */
++	vmret = vmf_insert_pfn(vma, addr, phys_addr >> MMUPAGE_SHIFT);
+ 	if (vmret != VM_FAULT_NOPAGE) {
+ 		mutex_unlock(&encl->lock);
+ 		return VM_FAULT_SIGBUS;
+@@ -471,7 +472,8 @@ static vm_fault_t sgx_vma_fault(struct vm_fault *vmf)
+ 
+ 	phys_addr = sgx_get_epc_phys_addr(entry->epc_page);
+ 
+-	ret = vmf_insert_pfn(vma, addr, PFN_DOWN(phys_addr));
++	/* vmf_insert_pfn() takes an MMUPAGE-granular PFN. */
++	ret = vmf_insert_pfn(vma, addr, phys_addr >> MMUPAGE_SHIFT);
+ 	if (ret != VM_FAULT_NOPAGE) {
+ 		mutex_unlock(&encl->lock);
+ 
+diff --git a/arch/x86/kernel/cpu/sgx/virt.c b/arch/x86/kernel/cpu/sgx/virt.c
+index db6806c40483..ebe5f13463f7 100644
+--- a/arch/x86/kernel/cpu/sgx/virt.c
++++ b/arch/x86/kernel/cpu/sgx/virt.c
+@@ -55,7 +55,8 @@ static int __sgx_vepc_fault(struct sgx_vepc *vepc,
+ 	if (ret)
+ 		goto err_free;
+ 
+-	pfn = PFN_DOWN(sgx_get_epc_phys_addr(epc_page));
++	/* vmf_insert_pfn() takes an MMUPAGE-granular PFN. */
++	pfn = sgx_get_epc_phys_addr(epc_page) >> MMUPAGE_SHIFT;
+ 
+ 	ret = vmf_insert_pfn(vma, addr, pfn);
+ 	if (ret != VM_FAULT_NOPAGE) {
+diff --git a/arch/x86/kernel/dumpstack_64.c b/arch/x86/kernel/dumpstack_64.c
+index 6c5defd6569a..08c51d4f0d1c 100644
+--- a/arch/x86/kernel/dumpstack_64.c
++++ b/arch/x86/kernel/dumpstack_64.c
+@@ -64,7 +64,7 @@ const char *stack_type_name(enum stack_type type)
+  */
+ struct estack_pages {
+ 	u32	offs;
+-	u16	size;
++	u32	size;
+ 	u16	type;
+ };
+ 
+diff --git a/arch/x86/kernel/e820.c b/arch/x86/kernel/e820.c
+index eb72537bc0b1..1fd66827ae4f 100644
+--- a/arch/x86/kernel/e820.c
++++ b/arch/x86/kernel/e820.c
+@@ -1376,5 +1376,32 @@ __init void e820__memblock_setup(void)
+ 	/* Throw away partial pages: */
+ 	memblock_trim_memory(PAGE_SIZE);
+ 
++#if PAGE_MMUSHIFT
++	/*
++	 * Under page clustering PAGE_SIZE is large (e.g. 256K), so the trim
++	 * above discards sub-PAGE low (<1M) RAM -- including the memory
++	 * reserve_real_mode() needs for the real-mode trampoline (see the KHO
++	 * scratch marking above).  The low 1M is reserved wholesale before the
++	 * buddy handover and never becomes buddy pages, so re-add the <1M e820
++	 * RAM at MMUPAGE granularity to keep it available to the early sub-1M
++	 * trampoline allocation.  Identity at PAGE_MMUSHIFT == 0 (the trim is
++	 * already PAGE==MMUPAGE granular, so nothing was thrown away to re-add).
++	 */
++	for (idx = 0; idx < e820_table->nr_entries; idx++) {
++		struct e820_entry *entry = &e820_table->entries[idx];
++		u64 start = entry->addr;
++
++		end = entry->addr + entry->size;
++		if (entry->type != E820_TYPE_RAM || start >= SZ_1M)
++			continue;
++		if (end > SZ_1M)
++			end = SZ_1M;
++		start = round_up(start, MMUPAGE_SIZE);
++		end = round_down(end, MMUPAGE_SIZE);
++		if (start < end)
++			memblock_add(start, end - start);
++	}
++#endif
++
+ 	memblock_dump_all();
+ }
+diff --git a/arch/x86/kernel/espfix_64.c b/arch/x86/kernel/espfix_64.c
+index 6726e0473d0b..09cc9f78198f 100644
+--- a/arch/x86/kernel/espfix_64.c
++++ b/arch/x86/kernel/espfix_64.c
+@@ -39,10 +39,10 @@
+  * it up to a cache line to avoid unnecessary sharing.
+  */
+ #define ESPFIX_STACK_SIZE	(8*8UL)
+-#define ESPFIX_STACKS_PER_PAGE	(PAGE_SIZE/ESPFIX_STACK_SIZE)
++#define ESPFIX_STACKS_PER_PAGE	(MMUPAGE_SIZE/ESPFIX_STACK_SIZE)
+ 
+ /* There is address space for how many espfix pages? */
+-#define ESPFIX_PAGE_SPACE	(1UL << (P4D_SHIFT-PAGE_SHIFT-16))
++#define ESPFIX_PAGE_SPACE	(1UL << (P4D_SHIFT-MMUPAGE_SHIFT-16))
+ 
+ #define ESPFIX_MAX_CPUS		(ESPFIX_STACKS_PER_PAGE * ESPFIX_PAGE_SPACE)
+ #if CONFIG_NR_CPUS > ESPFIX_MAX_CPUS
+@@ -79,13 +79,13 @@ static inline unsigned long espfix_base_addr(unsigned int cpu)
+ 
+ 	page = (cpu / ESPFIX_STACKS_PER_PAGE) ^ page_random;
+ 	slot = (cpu + slot_random) % ESPFIX_STACKS_PER_PAGE;
+-	addr = (page << PAGE_SHIFT) + (slot * ESPFIX_STACK_SIZE);
++	addr = (page << MMUPAGE_SHIFT) + (slot * ESPFIX_STACK_SIZE);
+ 	addr = (addr & 0xffffUL) | ((addr & ~0xffffUL) << 16);
+ 	addr += ESPFIX_BASE_ADDR;
+ 	return addr;
+ }
+ 
+-#define PTE_STRIDE        (65536/PAGE_SIZE)
++#define PTE_STRIDE        (65536/MMUPAGE_SIZE)
+ #define ESPFIX_PTE_CLONES (PTRS_PER_PTE/PTE_STRIDE)
+ #define ESPFIX_PMD_CLONES PTRS_PER_PMD
+ #define ESPFIX_PUD_CLONES (65536/(ESPFIX_PTE_CLONES*ESPFIX_PMD_CLONES))
+@@ -201,5 +201,5 @@ void init_espfix_ap(int cpu)
+ done:
+ 	per_cpu(espfix_stack, cpu) = addr;
+ 	per_cpu(espfix_waddr, cpu) = (unsigned long)stack_page
+-				      + (addr & ~PAGE_MASK);
++				      + (addr & ~MMUPAGE_MASK);
+ }
+diff --git a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
+index fd28b53dbac5..bc3a31a385fa 100644
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@ -252,7 +252,12 @@ asmlinkage __visible void __init __noreturn x86_64_start_kernel(char * real_mode
+ 	 * This needs to happen *before* kasan_early_init() because latter maps stuff
+ 	 * into that page.
+ 	 */
+-	clear_page(init_top_pgt);
++	/*
++	 * init_top_pgt is a PGD (MMUPAGE_SIZE, not PAGE_SIZE).
++	 * Use memset to avoid overwriting adjacent data when
++	 * PAGE_MMUSHIFT > 0.
++	 */
++	memset(init_top_pgt, 0, PTRS_PER_PGD * sizeof(pgd_t));
+ 
+ 	/*
+ 	 * SME support may update early_pmd_flags to include the memory
+diff --git a/arch/x86/kernel/head_64.S b/arch/x86/kernel/head_64.S
+index 7ed5520dd52e..5b7893fb50a6 100644
+--- a/arch/x86/kernel/head_64.S
++++ b/arch/x86/kernel/head_64.S
+@@ -590,7 +590,7 @@ SYM_PIC_ALIAS(vc_no_ghcb);
+ #define PTI_USER_PGD_FILL	512
+ /* This ensures they are 8k-aligned: */
+ #define SYM_DATA_START_PTI_ALIGNED(name) \
+-	SYM_START(name, SYM_L_GLOBAL, .balign 2 * PAGE_SIZE)
++	SYM_START(name, SYM_L_GLOBAL, .balign 2 * MMUPAGE_SIZE)
+ #else
+ #define SYM_DATA_START_PTI_ALIGNED(name) \
+ 	SYM_DATA_START_PAGE_ALIGNED(name)
+@@ -657,7 +657,7 @@ SYM_DATA_START_PAGE_ALIGNED(level2_fixmap_pgt)
+ 	.fill	(512 - 4 - FIXMAP_PMD_NUM),8,0
+ 	pgtno = 0
+ 	.rept (FIXMAP_PMD_NUM)
+-	.quad level1_fixmap_pgt + (pgtno << PAGE_SHIFT) - __START_KERNEL_map \
++	.quad level1_fixmap_pgt + (pgtno << MMUPAGE_SHIFT) - __START_KERNEL_map \
+ 		+ _PAGE_TABLE_NOENC;
+ 	pgtno = pgtno + 1
+ 	.endr
+diff --git a/arch/x86/kernel/irq_64.c b/arch/x86/kernel/irq_64.c
+index ca78dce39361..e5e7a0499a3d 100644
+--- a/arch/x86/kernel/irq_64.c
++++ b/arch/x86/kernel/irq_64.c
+@@ -36,17 +36,18 @@ DEFINE_PER_CPU_PAGE_ALIGNED(struct irq_stack, irq_stack_backing_store) __visible
+ static int map_irq_stack(unsigned int cpu)
+ {
+ 	char *stack = (char *)per_cpu_ptr(&irq_stack_backing_store, cpu);
+-	struct page *pages[IRQ_STACK_SIZE / PAGE_SIZE];
++	const int nr_pages = DIV_ROUND_UP(IRQ_STACK_SIZE, PAGE_SIZE);
++	struct page *pages[DIV_ROUND_UP(IRQ_STACK_SIZE, PAGE_SIZE)];
+ 	void *va;
+ 	int i;
+ 
+-	for (i = 0; i < IRQ_STACK_SIZE / PAGE_SIZE; i++) {
++	for (i = 0; i < nr_pages; i++) {
+ 		phys_addr_t pa = per_cpu_ptr_to_phys(stack + (i << PAGE_SHIFT));
+ 
+ 		pages[i] = pfn_to_page(pa >> PAGE_SHIFT);
+ 	}
+ 
+-	va = vmap(pages, IRQ_STACK_SIZE / PAGE_SIZE, VM_MAP, PAGE_KERNEL);
++	va = vmap(pages, nr_pages, VM_MAP, PAGE_KERNEL);
+ 	if (!va)
+ 		return -ENOMEM;
+ 
+diff --git a/arch/x86/kernel/irqinit.c b/arch/x86/kernel/irqinit.c
+index 6ab9eac64670..cd3e878468a1 100644
+--- a/arch/x86/kernel/irqinit.c
++++ b/arch/x86/kernel/irqinit.c
+@@ -94,16 +94,21 @@ void __init init_IRQ(void)
+ 
+ void __init native_init_IRQ(void)
+ {
++	pr_info("native_init_IRQ: entry\n");
+ 	/* Execute any quirks before the call gates are initialised: */
+ 	x86_init.irqs.pre_vector_init();
++	pr_info("native_init_IRQ: after pre_vector_init\n");
+ 
+ 	/* FRED's IRQ path may be used even if FRED isn't fully enabled. */
+ 	if (IS_ENABLED(CONFIG_X86_FRED))
+ 		fred_complete_exception_setup();
+ 
+-	if (!cpu_feature_enabled(X86_FEATURE_FRED))
++	if (!cpu_feature_enabled(X86_FEATURE_FRED)) {
++		pr_info("native_init_IRQ: about to call idt_setup_apic_and_irq_gates\n");
+ 		idt_setup_apic_and_irq_gates();
++	}
+ 
++	pr_info("native_init_IRQ: about to call lapic_assign_system_vectors\n");
+ 	lapic_assign_system_vectors();
+ 
+ 	if (!acpi_ioapic && !of_ioapic && nr_legacy_irqs()) {
+diff --git a/arch/x86/kernel/ldt.c b/arch/x86/kernel/ldt.c
+index 40c5bf97dd5c..38efec6d3adb 100644
+--- a/arch/x86/kernel/ldt.c
++++ b/arch/x86/kernel/ldt.c
+@@ -306,18 +306,24 @@ map_ldt_struct(struct mm_struct *mm, struct ldt_struct *ldt, int slot)
+ 
+ 	is_vmalloc = is_vmalloc_addr(ldt->entries);
+ 
+-	nr_pages = DIV_ROUND_UP(ldt->nr_entries * LDT_ENTRY_SIZE, PAGE_SIZE);
++	nr_pages = DIV_ROUND_UP(ldt->nr_entries * LDT_ENTRY_SIZE, MMUPAGE_SIZE);
+ 
+ 	for (i = 0; i < nr_pages; i++) {
+-		unsigned long offset = i << PAGE_SHIFT;
++		unsigned long offset = i << MMUPAGE_SHIFT;
+ 		const void *src = (char *)ldt->entries + offset;
+ 		unsigned long pfn;
+ 		pgprot_t pte_prot;
+ 		pte_t pte, *ptep;
+ 
+ 		va = (unsigned long)ldt_slot_va(slot) + offset;
+-		pfn = is_vmalloc ? vmalloc_to_pfn(src) :
+-			page_to_pfn(virt_to_page(src));
++		if (is_vmalloc) {
++			struct page *page = vmalloc_to_page(src);
++			pfn = page_to_pfn(page) * PAGE_MMUCOUNT +
++				(((unsigned long)src >> MMUPAGE_SHIFT) &
++				 (PAGE_MMUCOUNT - 1));
++		} else {
++			pfn = __pa(src) >> MMUPAGE_SHIFT;
++		}
+ 		/*
+ 		 * Treat the PTI LDT range as a *userspace* range.
+ 		 * get_locked_pte() will allocate all needed pagetables
+@@ -358,10 +364,10 @@ static void unmap_ldt_struct(struct mm_struct *mm, struct ldt_struct *ldt)
+ 	if (!boot_cpu_has(X86_FEATURE_PTI))
+ 		return;
+ 
+-	nr_pages = DIV_ROUND_UP(ldt->nr_entries * LDT_ENTRY_SIZE, PAGE_SIZE);
++	nr_pages = DIV_ROUND_UP(ldt->nr_entries * LDT_ENTRY_SIZE, MMUPAGE_SIZE);
+ 
+ 	for (i = 0; i < nr_pages; i++) {
+-		unsigned long offset = i << PAGE_SHIFT;
++		unsigned long offset = i << MMUPAGE_SHIFT;
+ 		spinlock_t *ptl;
+ 		pte_t *ptep;
+ 
+@@ -374,7 +380,7 @@ static void unmap_ldt_struct(struct mm_struct *mm, struct ldt_struct *ldt)
+ 	}
+ 
+ 	va = (unsigned long)ldt_slot_va(ldt->slot);
+-	flush_tlb_mm_range(mm, va, va + nr_pages * PAGE_SIZE, PAGE_SHIFT, false);
++	flush_tlb_mm_range(mm, va, va + nr_pages * MMUPAGE_SIZE, MMUPAGE_SHIFT, false);
+ }
+ 
+ #else /* !CONFIG_MITIGATION_PAGE_TABLE_ISOLATION */
+diff --git a/arch/x86/kernel/mpparse.c b/arch/x86/kernel/mpparse.c
+index 4a1b1b28abf9..b6547d3f6255 100644
+--- a/arch/x86/kernel/mpparse.c
++++ b/arch/x86/kernel/mpparse.c
+@@ -414,9 +414,15 @@ static unsigned long __init get_mpc_size(unsigned long physptr)
+ 	struct mpc_table *mpc;
+ 	unsigned long size;
+ 
+-	mpc = early_memremap(physptr, PAGE_SIZE);
++	/*
++	 * Map only one MMUPAGE: we read mpc->length (offset 4) which fits
++	 * in a single hardware page.  Using PAGE_SIZE under page-clustering
++	 * (PAGE_SIZE up to 1MB on PGCL=6) overflows NR_FIX_BTMAPS in the
++	 * early_ioremap fixmap pool.
++	 */
++	mpc = early_memremap(physptr, MMUPAGE_SIZE);
+ 	size = mpc->length;
+-	early_memunmap(mpc, PAGE_SIZE);
++	early_memunmap(mpc, MMUPAGE_SIZE);
+ 	apic_pr_verbose("  mpc: %lx-%lx\n", physptr, physptr + size);
+ 
+ 	return size;
+diff --git a/arch/x86/kernel/sys_x86_64.c b/arch/x86/kernel/sys_x86_64.c
+index 776ae6fa7f2d..07f77c7a660c 100644
+--- a/arch/x86/kernel/sys_x86_64.c
++++ b/arch/x86/kernel/sys_x86_64.c
+@@ -83,10 +83,10 @@ SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
+ 		unsigned long, prot, unsigned long, flags,
+ 		unsigned long, fd, unsigned long, off)
+ {
+-	if (off & ~PAGE_MASK)
++	if (off & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 
+-	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
++	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> MMUPAGE_SHIFT);
+ }
+ 
+ static void find_start_end(unsigned long addr, unsigned long flags,
+@@ -141,7 +141,8 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr, unsigned long len,
+ 		return -ENOMEM;
+ 
+ 	if (addr) {
+-		addr = PAGE_ALIGN(addr);
++		/* PGCL: hint addresses are MMUPAGE-granular (identity at shift 0) */
++		addr = MMUPAGE_ALIGN(addr);
+ 		vma = find_vma(mm, addr);
+ 		if (end - len >= addr &&
+ 		    (!vma || addr + len <= vm_start_gap(vma)))
+@@ -152,7 +153,7 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr, unsigned long len,
+ 	info.low_limit = begin;
+ 	info.high_limit = end;
+ 	if (!(filp && is_file_hugepages(filp))) {
+-		info.align_offset = pgoff << PAGE_SHIFT;
++		info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 		info.start_gap = stack_guard_placement(vm_flags);
+ 	}
+ 	if (filp) {
+@@ -187,7 +188,8 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr0,
+ 
+ 	/* requesting a specific address */
+ 	if (addr) {
+-		addr &= PAGE_MASK;
++		/* PGCL: hint addresses are MMUPAGE-granular (identity at shift 0) */
++		addr &= MMUPAGE_MASK;
+ 		if (!mmap_address_hint_valid(addr, len))
+ 			goto get_unmapped_area;
+ 
+@@ -207,7 +209,7 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr0,
+ 	info.high_limit = get_mmap_base(0);
+ 	if (!(filp && is_file_hugepages(filp))) {
+ 		info.start_gap = stack_guard_placement(vm_flags);
+-		info.align_offset = pgoff << PAGE_SHIFT;
++		info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	}
+ 
+ 	/*
+@@ -225,7 +227,14 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr0,
+ 		info.align_offset += get_align_bits();
+ 	}
+ 	addr = vm_unmapped_area(&info);
+-	if (!(addr & ~PAGE_MASK))
++	/*
++	 * PGCL: vm_unmapped_area() returns an MMUPAGE-granular address; a valid
++	 * result need not be PAGE_SIZE-aligned, so test alignment with
++	 * MMUPAGE_MASK (identity at PAGE_MMUSHIFT==0).  Using PAGE_MASK here made
++	 * valid MMUPAGE-aligned results look like errors -> silent bottom-up
++	 * fallback (and VM_BUG_ON under DEBUG_VM).
++	 */
++	if (!(addr & ~MMUPAGE_MASK))
+ 		return addr;
+ 	VM_BUG_ON(addr != -ENOMEM);
+ 
+diff --git a/arch/x86/lib/clear_page_64.S b/arch/x86/lib/clear_page_64.S
+index f7f356e7218b..407007a871cf 100644
+--- a/arch/x86/lib/clear_page_64.S
++++ b/arch/x86/lib/clear_page_64.S
+@@ -4,6 +4,7 @@
+ #include <linux/cfi_types.h>
+ #include <linux/objtool.h>
+ #include <asm/asm.h>
++#include <asm/page_types.h>
+ 
+ /*
+  * Zero page aligned region.
+diff --git a/arch/x86/lib/copy_page_64.S b/arch/x86/lib/copy_page_64.S
+index d8e87fedc20d..d12078e9aa4d 100644
+--- a/arch/x86/lib/copy_page_64.S
++++ b/arch/x86/lib/copy_page_64.S
+@@ -6,6 +6,7 @@
+ #include <linux/cfi_types.h>
+ #include <asm/cpufeatures.h>
+ #include <asm/alternative.h>
++#include <asm/page_types.h>
+ 
+ /*
+  * Some CPUs run faster using the string copy instructions (sane microcode).
+@@ -16,7 +17,7 @@
+ 	ALIGN
+ SYM_TYPED_FUNC_START(copy_page)
+ 	ALTERNATIVE "jmp copy_page_regs", "", X86_FEATURE_REP_GOOD
+-	movl	$4096/8, %ecx
++	movl	$PAGE_SIZE/8, %ecx
+ 	rep	movsq
+ 	RET
+ SYM_FUNC_END(copy_page)
+@@ -27,7 +28,7 @@ SYM_FUNC_START_LOCAL(copy_page_regs)
+ 	movq	%rbx,	(%rsp)
+ 	movq	%r12,	1*8(%rsp)
+ 
+-	movl	$(4096/64)-5,	%ecx
++	movl	$(PAGE_SIZE/64)-5,	%ecx
+ 	.p2align 4
+ .Loop64:
+ 	dec	%rcx
+diff --git a/arch/x86/mm/cpu_entry_area.c b/arch/x86/mm/cpu_entry_area.c
+index 575f863f3c75..5eac08174dd2 100644
+--- a/arch/x86/mm/cpu_entry_area.c
++++ b/arch/x86/mm/cpu_entry_area.c
+@@ -70,7 +70,15 @@ static inline void init_cea_offsets(void) { }
+ noinstr struct cpu_entry_area *get_cpu_entry_area(int cpu)
+ {
+ 	unsigned long va = CPU_ENTRY_AREA_PER_CPU + cea_offset(cpu) * CPU_ENTRY_AREA_SIZE;
+-	BUILD_BUG_ON(sizeof(struct cpu_entry_area) % PAGE_SIZE != 0);
++	/*
++	 * The cpu_entry_area is built and mapped at hardware-page (MMUPAGE)
++	 * granularity (see cea_set_pte()/cea_map_percpu_pages()), so each CPU's
++	 * area need only be an MMUPAGE multiple, not a full kernel PAGE multiple.
++	 * Asserting PAGE_SIZE here would force every sub-structure (e.g. the DS
++	 * area and its buffers) up to a full PAGE under page clustering.  Identity
++	 * at PAGE_MMUSHIFT == 0 (MMUPAGE_SIZE == PAGE_SIZE).
++	 */
++	BUILD_BUG_ON(sizeof(struct cpu_entry_area) % MMUPAGE_SIZE != 0);
+ 
+ 	return (struct cpu_entry_area *) va;
+ }
+@@ -79,7 +87,7 @@ EXPORT_SYMBOL(get_cpu_entry_area);
+ void cea_set_pte(void *cea_vaddr, phys_addr_t pa, pgprot_t flags)
+ {
+ 	unsigned long va = (unsigned long) cea_vaddr;
+-	pte_t pte = pfn_pte(pa >> PAGE_SHIFT, flags);
++	pte_t pte = __pte((pa & PHYSICAL_PAGE_MASK) | pgprot_val(flags));
+ 
+ 	/*
+ 	 * The cpu_entry_area is shared between the user and kernel
+@@ -98,7 +106,7 @@ void cea_set_pte(void *cea_vaddr, phys_addr_t pa, pgprot_t flags)
+ static void __init
+ cea_map_percpu_pages(void *cea_vaddr, void *ptr, int pages, pgprot_t prot)
+ {
+-	for ( ; pages; pages--, cea_vaddr+= PAGE_SIZE, ptr += PAGE_SIZE)
++	for ( ; pages; pages--, cea_vaddr += MMUPAGE_SIZE, ptr += MMUPAGE_SIZE)
+ 		cea_set_pte(cea_vaddr, per_cpu_ptr_to_phys(ptr), prot);
+ }
+ 
+@@ -112,8 +120,8 @@ static void __init percpu_setup_debug_store(unsigned int cpu)
+ 		return;
+ 
+ 	cea = &get_cpu_entry_area(cpu)->cpu_debug_store;
+-	npages = sizeof(struct debug_store) / PAGE_SIZE;
+-	BUILD_BUG_ON(sizeof(struct debug_store) % PAGE_SIZE != 0);
++	npages = sizeof(struct debug_store) / MMUPAGE_SIZE;
++	BUILD_BUG_ON(sizeof(struct debug_store) % MMUPAGE_SIZE != 0);
+ 	cea_map_percpu_pages(cea, &per_cpu(cpu_debug_store, cpu), npages,
+ 			     PAGE_KERNEL);
+ 
+@@ -122,8 +130,8 @@ static void __init percpu_setup_debug_store(unsigned int cpu)
+ 	 * Force the population of PMDs for not yet allocated per cpu
+ 	 * memory like debug store buffers.
+ 	 */
+-	npages = sizeof(struct debug_store_buffers) / PAGE_SIZE;
+-	for (; npages; npages--, cea += PAGE_SIZE)
++	npages = sizeof(struct debug_store_buffers) / MMUPAGE_SIZE;
++	for (; npages; npages--, cea += MMUPAGE_SIZE)
+ 		cea_set_pte(cea, 0, PAGE_NONE);
+ #endif
+ }
+@@ -131,7 +139,7 @@ static void __init percpu_setup_debug_store(unsigned int cpu)
+ #ifdef CONFIG_X86_64
+ 
+ #define cea_map_stack(name) do {					\
+-	npages = sizeof(estacks->name## _stack) / PAGE_SIZE;		\
++	npages = sizeof(estacks->name## _stack) / MMUPAGE_SIZE;		\
+ 	cea_map_percpu_pages(cea->estacks.name## _stack,		\
+ 			estacks->name## _stack, npages, PAGE_KERNEL);	\
+ 	} while (0)
+@@ -142,7 +150,7 @@ static void __init percpu_setup_exception_stacks(unsigned int cpu)
+ 	struct cpu_entry_area *cea = get_cpu_entry_area(cpu);
+ 	unsigned int npages;
+ 
+-	BUILD_BUG_ON(sizeof(exception_stacks) % PAGE_SIZE != 0);
++	BUILD_BUG_ON(sizeof(exception_stacks) % MMUPAGE_SIZE != 0);
+ 
+ 	per_cpu(cea_exception_stacks, cpu) = &cea->estacks;
+ 
+@@ -220,8 +228,8 @@ static void __init setup_cpu_entry_area(unsigned int cpu)
+ 	 * boundary.  Assert that we're not doing that.
+ 	 */
+ 	BUILD_BUG_ON((offsetof(struct tss_struct, x86_tss) ^
+-		      offsetofend(struct tss_struct, x86_tss)) & PAGE_MASK);
+-	BUILD_BUG_ON(sizeof(struct tss_struct) % PAGE_SIZE != 0);
++		      offsetofend(struct tss_struct, x86_tss)) & MMUPAGE_MASK);
++	BUILD_BUG_ON(sizeof(struct tss_struct) % MMUPAGE_SIZE != 0);
+ 	/*
+ 	 * VMX changes the host TR limit to 0x67 after a VM exit. This is
+ 	 * okay, since 0x67 covers the size of struct x86_hw_tss. Make sure
+@@ -231,7 +239,7 @@ static void __init setup_cpu_entry_area(unsigned int cpu)
+ 	BUILD_BUG_ON(sizeof(struct x86_hw_tss) != 0x68);
+ 
+ 	cea_map_percpu_pages(&cea->tss, &per_cpu(cpu_tss_rw, cpu),
+-			     sizeof(struct tss_struct) / PAGE_SIZE, tss_prot);
++			     sizeof(struct tss_struct) / MMUPAGE_SIZE, tss_prot);
+ 
+ #ifdef CONFIG_X86_32
+ 	per_cpu(cpu_entry_area, cpu) = cea;
+diff --git a/arch/x86/mm/dump_pagetables.c b/arch/x86/mm/dump_pagetables.c
+index 2afa7a23340e..5924e816b6b2 100644
+--- a/arch/x86/mm/dump_pagetables.c
++++ b/arch/x86/mm/dump_pagetables.c
+@@ -17,6 +17,7 @@
+ #include <linux/highmem.h>
+ #include <linux/pci.h>
+ #include <linux/ptdump.h>
++#include <asm/realmode.h>
+ 
+ #include <asm/e820/types.h>
+ 
+@@ -149,7 +150,7 @@ static struct addr_marker address_markers[] = {
+ #endif /* !CONFIG_X86_64 */
+ 
+ /* Multipliers for offsets within the PTEs */
+-#define PTE_LEVEL_MULT (PAGE_SIZE)
++#define PTE_LEVEL_MULT (MMUPAGE_SIZE)
+ #define PMD_LEVEL_MULT (PTRS_PER_PTE * PTE_LEVEL_MULT)
+ #define PUD_LEVEL_MULT (PTRS_PER_PMD * PMD_LEVEL_MULT)
+ #define P4D_LEVEL_MULT (PTRS_PER_PUD * PUD_LEVEL_MULT)
+@@ -228,7 +229,7 @@ static void note_wx(struct pg_state *st, unsigned long addr)
+ {
+ 	unsigned long npages;
+ 
+-	npages = (addr - st->start_address) / PAGE_SIZE;
++	npages = (addr - st->start_address) / MMUPAGE_SIZE;
+ 
+ #ifdef CONFIG_PCI_BIOS
+ 	/*
+@@ -241,6 +242,34 @@ static void note_wx(struct pg_state *st, unsigned long addr)
+ 		return;
+ 	}
+ #endif
++	/*
++	 * With PAGE_MMUSHIFT > 0, the realmode trampoline text and
++	 * writable data share the same PAGE_SIZE page(s).  CPA cannot
++	 * set MMUPAGE-granularity permissions, so the trampoline area
++	 * is intentionally W+X.  Suppress the warning.
++	 */
++	if (PAGE_MMUSHIFT > 0 && real_mode_header) {
++		/*
++		 * The trampoline is only MMUPAGE-aligned (a PAGE_SIZE alignment
++		 * is unsatisfiable in a fragmented sub-1M e820), but
++		 * set_real_mode_permissions() clears NX on the whole PAGE_SIZE
++		 * page(s) containing it via set_memory_x(PAGE_ALIGN_DOWN(...)).
++		 * The resulting W+X run therefore begins at the PAGE boundary
++		 * *below* real_mode_header, so the suppression range must be
++		 * PAGE-aligned to actually cover it.
++		 */
++		unsigned long rm_base =
++			PAGE_ALIGN_DOWN((unsigned long)real_mode_header);
++		unsigned long rm_end =
++			PAGE_ALIGN((unsigned long)real_mode_header +
++				   (real_mode_blob_end - real_mode_blob));
++
++		if (st->start_address >= rm_base &&
++		    addr <= rm_end) {
++			st->wx_pages += npages;
++			return;
++		}
++	}
+ 	/* Account the WX pages */
+ 	st->wx_pages += npages;
+ 	WARN_ONCE(__supported_pte_mask & _PAGE_NX,
+diff --git a/arch/x86/mm/init.c b/arch/x86/mm/init.c
+index fb67217fddcd..304be16e1f56 100644
+--- a/arch/x86/mm/init.c
++++ b/arch/x86/mm/init.c
+@@ -135,22 +135,29 @@ __ref void *alloc_low_pages(unsigned int num)
+ 		return (void *)__get_free_pages(GFP_ATOMIC | __GFP_ZERO, order);
+ 	}
+ 
++	/*
++	 * num is the number of hardware (MMUPAGE-sized) page-table pages to
++	 * allocate.  Under page-clustering, kernel-page granularity (PAGE_SIZE)
++	 * is PAGE_MMUCOUNT× larger and would waste pool space; use MMUPAGE_SIZE
++	 * consistently with the brk pool sized by INIT_PGD_PAGE_COUNT *
++	 * MMUPAGE_SIZE.  pgt_buf_end/top are in MMUPAGE PFN units.
++	 */
+ 	if ((pgt_buf_end + num) > pgt_buf_top || !can_use_brk_pgt) {
+ 		unsigned long ret = 0;
+ 
+ 		if (min_pfn_mapped < max_pfn_mapped) {
+ 			ret = memblock_phys_alloc_range(
+-					PAGE_SIZE * num, PAGE_SIZE,
++					MMUPAGE_SIZE * num, MMUPAGE_SIZE,
+ 					min_pfn_mapped << PAGE_SHIFT,
+ 					max_pfn_mapped << PAGE_SHIFT);
+ 		}
+ 		if (!ret && can_use_brk_pgt)
+-			ret = __pa(extend_brk(PAGE_SIZE * num, PAGE_SIZE));
++			ret = __pa(extend_brk(MMUPAGE_SIZE * num, MMUPAGE_SIZE));
+ 
+ 		if (!ret)
+ 			panic("alloc_low_pages: can not alloc memory");
+ 
+-		pfn = ret >> PAGE_SHIFT;
++		pfn = ret >> MMUPAGE_SHIFT;
+ 	} else {
+ 		pfn = pgt_buf_end;
+ 		pgt_buf_end += num;
+@@ -159,11 +166,11 @@ __ref void *alloc_low_pages(unsigned int num)
+ 	for (i = 0; i < num; i++) {
+ 		void *adr;
+ 
+-		adr = __va((pfn + i) << PAGE_SHIFT);
+-		clear_page(adr);
++		adr = __va((unsigned long)(pfn + i) << MMUPAGE_SHIFT);
++		memset(adr, 0, MMUPAGE_SIZE);
+ 	}
+ 
+-	return __va(pfn << PAGE_SHIFT);
++	return __va((unsigned long)pfn << MMUPAGE_SHIFT);
+ }
+ 
+ /*
+@@ -182,18 +189,26 @@ __ref void *alloc_low_pages(unsigned int num)
+ #define INIT_PGD_PAGE_COUNT      (4 * INIT_PGD_PAGE_TABLES)
+ #endif
+ 
+-#define INIT_PGT_BUF_SIZE	(INIT_PGD_PAGE_COUNT * PAGE_SIZE)
++/*
++ * Page tables are MMUPAGE-sized (hardware page size); under page-clustering
++ * PAGE_SIZE may exceed MMUPAGE_SIZE by PAGE_MMUCOUNT.  Sizing the early
++ * page-table pool by PAGE_SIZE wastes brk space (each 4KB page table would
++ * consume a 256KB kernel page at PGCL=6) and overflows the linker-reserved
++ * .bss..brk allocation once dmi_alloc has pre-claimed its 64KB.  Use
++ * MMUPAGE_SIZE consistently — alloc_low_pages also speaks MMUPAGE PFNs.
++ */
++#define INIT_PGT_BUF_SIZE	(INIT_PGD_PAGE_COUNT * MMUPAGE_SIZE)
+ RESERVE_BRK(early_pgt_alloc, INIT_PGT_BUF_SIZE);
+ void  __init early_alloc_pgt_buf(void)
+ {
+ 	unsigned long tables = INIT_PGT_BUF_SIZE;
+ 	phys_addr_t base;
+ 
+-	base = __pa(extend_brk(tables, PAGE_SIZE));
++	base = __pa(extend_brk(tables, MMUPAGE_SIZE));
+ 
+-	pgt_buf_start = base >> PAGE_SHIFT;
++	pgt_buf_start = base >> MMUPAGE_SHIFT;
+ 	pgt_buf_end = pgt_buf_start;
+-	pgt_buf_top = pgt_buf_start + (tables >> PAGE_SHIFT);
++	pgt_buf_top = pgt_buf_start + (tables >> MMUPAGE_SHIFT);
+ }
+ 
+ int after_bootmem;
+@@ -836,11 +851,11 @@ void __init poking_init(void)
+ 	 */
+ 	text_poke_mm_addr = TASK_UNMAPPED_BASE;
+ 	if (IS_ENABLED(CONFIG_RANDOMIZE_BASE))
+-		text_poke_mm_addr += (kaslr_get_random_long("Poking") & PAGE_MASK) %
+-			(TASK_SIZE - TASK_UNMAPPED_BASE - 3 * PAGE_SIZE);
++		text_poke_mm_addr += (kaslr_get_random_long("Poking") & MMUPAGE_MASK) %
++			(TASK_SIZE - TASK_UNMAPPED_BASE - 3 * MMUPAGE_SIZE);
+ 
+-	if (((text_poke_mm_addr + PAGE_SIZE) & ~PMD_MASK) == 0)
+-		text_poke_mm_addr += PAGE_SIZE;
++	if (((text_poke_mm_addr + MMUPAGE_SIZE) & ~PMD_MASK) == 0)
++		text_poke_mm_addr += MMUPAGE_SIZE;
+ 
+ 	/*
+ 	 * We need to trigger the allocation of the page-tables that will be
+@@ -898,11 +913,19 @@ void free_init_pages(const char *what, unsigned long begin, unsigned long end)
+ {
+ 	unsigned long begin_aligned, end_aligned;
+ 
+-	/* Make sure boundaries are page aligned */
++	/*
++	 * Make sure boundaries are page aligned.  With PAGE_MMUSHIFT > 0,
++	 * init sections may only be MMUPAGE-aligned, so silently round
++	 * to PAGE boundaries — CPA requires PAGE-aligned addresses.
++	 */
+ 	begin_aligned = PAGE_ALIGN(begin);
+ 	end_aligned   = end & PAGE_MASK;
+ 
+-	if (WARN_ON(begin_aligned != begin || end_aligned != end)) {
++	if (PAGE_MMUSHIFT == 0 &&
++	    WARN_ON(begin_aligned != begin || end_aligned != end)) {
++		begin = begin_aligned;
++		end   = end_aligned;
++	} else {
+ 		begin = begin_aligned;
+ 		end   = end_aligned;
+ 	}
+diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
+index df2261fa4f98..c815fe5adb4d 100644
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@ -481,12 +481,12 @@ phys_pte_init(pte_t *pte_page, unsigned long paddr, unsigned long paddr_end,
+ 	i = pte_index(paddr);
+ 
+ 	for (; i < PTRS_PER_PTE; i++, paddr = paddr_next, pte++) {
+-		paddr_next = (paddr & PAGE_MASK) + PAGE_SIZE;
++		paddr_next = (paddr & MMUPAGE_MASK) + MMUPAGE_SIZE;
+ 		if (paddr >= paddr_end) {
+ 			if (!after_bootmem &&
+-			    !e820__mapped_any(paddr & PAGE_MASK, paddr_next,
++			    !e820__mapped_any(paddr & MMUPAGE_MASK, paddr_next,
+ 					     E820_TYPE_RAM) &&
+-			    !e820__mapped_any(paddr & PAGE_MASK, paddr_next,
++			    !e820__mapped_any(paddr & MMUPAGE_MASK, paddr_next,
+ 					     E820_TYPE_ACPI))
+ 				set_pte_init(pte, __pte(0), init);
+ 			continue;
+@@ -505,8 +505,21 @@ phys_pte_init(pte_t *pte_page, unsigned long paddr, unsigned long paddr_end,
+ 		}
+ 
+ 		pages++;
+-		set_pte_init(pte, pfn_pte(paddr >> PAGE_SHIFT, prot), init);
+-		paddr_last = (paddr & PAGE_MASK) + PAGE_SIZE;
++		/*
++		 * #106 diagnostic + Newton fix: the 4K leaf is reached only for
++		 * sub-2MB RAM fragments (laptop's fragmented UEFI map; never on
++		 * QEMU's contiguous map).  PHYSICAL_PAGE_MASK (== MMUPAGE_MASK &
++		 * __PHYSICAL_MASK) restores the MAXPHYADDR clamp that pfn_pte()
++		 * applies in mainline and that the hand-rolled PGCL PTE dropped;
++		 * identity at PAGE_MMUSHIFT==0.  The WARN_ONCE fires iff paddr
++		 * carries bits above MAXPHYADDR before we build the PTE — i.e. the
++		 * suspected #106 trigger actually reaches this leaf.
++		 */
++		WARN_ONCE(paddr & ~PHYSICAL_PAGE_MASK & ~(MMUPAGE_SIZE - 1),
++			  "PGCL #106: phys_pte_init paddr %lx above MAXPHYADDR (prot %lx)\n",
++			  paddr, (unsigned long)pgprot_val(prot));
++		set_pte_init(pte, __pte((paddr & PHYSICAL_PAGE_MASK) | pgprot_val(prot)), init);
++		paddr_last = (paddr & MMUPAGE_MASK) + MMUPAGE_SIZE;
+ 	}
+ 
+ 	update_page_count(PG_LEVEL_4K, pages);
+@@ -1273,8 +1286,16 @@ remove_pagetable(unsigned long start, unsigned long end, bool direct,
+ void __ref vmemmap_free(unsigned long start, unsigned long end,
+ 		struct vmem_altmap *altmap)
+ {
+-	VM_BUG_ON(!PAGE_ALIGNED(start));
+-	VM_BUG_ON(!PAGE_ALIGNED(end));
++	/*
++	 * PGCL: the vmemmap range is MMUPAGE-granular — basepages map it at
++	 * PTE/MMUPAGE granularity, and at PAGE_MMUSHIFT>0 the per-section
++	 * vmemmap chunk (PAGES_PER_SECTION * sizeof(struct page)) is MMUPAGE-
++	 * but not PAGE-aligned.  PAGE_ALIGNED is over-strict here; require only
++	 * MMUPAGE alignment (identity at shift 0).  Mirrors the s390x vmem
++	 * assertion relaxation.
++	 */
++	VM_BUG_ON(!IS_ALIGNED(start, MMUPAGE_SIZE));
++	VM_BUG_ON(!IS_ALIGNED(end, MMUPAGE_SIZE));
+ 
+ 	remove_pagetable(start, end, false, altmap);
+ }
+@@ -1560,8 +1581,16 @@ int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node,
+ {
+ 	int err;
+ 
+-	VM_BUG_ON(!PAGE_ALIGNED(start));
+-	VM_BUG_ON(!PAGE_ALIGNED(end));
++	/*
++	 * PGCL: the vmemmap range is MMUPAGE-granular — basepages map it at
++	 * PTE/MMUPAGE granularity, and at PAGE_MMUSHIFT>0 the per-section
++	 * vmemmap chunk (PAGES_PER_SECTION * sizeof(struct page)) is MMUPAGE-
++	 * but not PAGE-aligned.  PAGE_ALIGNED is over-strict here; require only
++	 * MMUPAGE alignment (identity at shift 0).  Mirrors the s390x vmem
++	 * assertion relaxation.
++	 */
++	VM_BUG_ON(!IS_ALIGNED(start, MMUPAGE_SIZE));
++	VM_BUG_ON(!IS_ALIGNED(end, MMUPAGE_SIZE));
+ 
+ 	if (end - start < PAGES_PER_SECTION * sizeof(struct page))
+ 		err = vmemmap_populate_basepages(start, end, node, NULL);
+diff --git a/arch/x86/mm/ioremap.c b/arch/x86/mm/ioremap.c
+index 12c8180ca1ba..4196604ed21f 100644
+--- a/arch/x86/mm/ioremap.c
++++ b/arch/x86/mm/ioremap.c
+@@ -219,11 +219,15 @@ __ioremap_caller(resource_size_t phys_addr, unsigned long size,
+ 	}
+ 
+ 	/*
+-	 * Mappings have to be page-aligned
++	 * Mappings have to be MMU-page-aligned (hardware page size).
++	 * The vm_area allocated by get_vm_area_caller rounds up to
++	 * PAGE_SIZE, but we only map the MMUPAGE-aligned range to
++	 * avoid extending into adjacent memory regions (which could
++	 * cross RAM/reserved boundaries and fail memtype_reserve).
+ 	 */
+-	offset = phys_addr & ~PAGE_MASK;
+-	phys_addr &= PAGE_MASK;
+-	size = PAGE_ALIGN(last_addr+1) - phys_addr;
++	offset = phys_addr & ~MMUPAGE_MASK;
++	phys_addr &= MMUPAGE_MASK;
++	size = ALIGN(last_addr + 1, MMUPAGE_SIZE) - phys_addr;
+ 
+ 	/*
+ 	 * Mask out any bits not part of the actual physical
+@@ -493,7 +497,18 @@ void iounmap(volatile void __iomem *addr)
+ 
+ 	kmsan_iounmap_page_range((unsigned long)addr,
+ 		(unsigned long)addr + get_vm_area_size(p));
+-	memtype_free(p->phys_addr, p->phys_addr + get_vm_area_size(p));
++	/*
++	 * Free the exact memtype range that __ioremap_caller() reserved, which
++	 * is MMUPAGE-granular (area->requested_size, the unrounded size passed
++	 * to get_vm_area_caller()).  Do NOT use get_vm_area_size(): under PGCL
++	 * (PAGE_SIZE > MMUPAGE_SIZE) it rounds the span up to the cluster
++	 * PAGE_SIZE, so it would hand memtype_free() a larger end than was
++	 * reserved.  memtype_erase() requires an exact [start,end] match, so the
++	 * oversized free fails ("freeing invalid memtype") and leaks the memtype
++	 * rbtree node.  Identity at PAGE_MMUSHIFT==0, where requested_size and
++	 * get_vm_area_size() coincide (size is already PAGE/MMUPAGE-aligned).
++	 */
++	memtype_free(p->phys_addr, p->phys_addr + p->requested_size);
+ 
+ 	/* Finally remove it */
+ 	o = remove_vm_area((void __force *)addr);
+@@ -821,7 +836,7 @@ void __init *early_memremap_decrypted_wp(resource_size_t phys_addr,
+ }
+ #endif	/* CONFIG_AMD_MEM_ENCRYPT */
+ 
+-static pte_t bm_pte[PAGE_SIZE/sizeof(pte_t)] __page_aligned_bss;
++static pte_t bm_pte[MMUPAGE_SIZE/sizeof(pte_t)] __page_aligned_bss;
+ 
+ static inline pmd_t * __init early_ioremap_pmd(unsigned long addr)
+ {
+@@ -842,7 +857,7 @@ static inline pte_t * __init early_ioremap_pte(unsigned long addr)
+ 
+ bool __init is_early_ioremap_ptep(pte_t *ptep)
+ {
+-	return ptep >= &bm_pte[0] && ptep < &bm_pte[PAGE_SIZE/sizeof(pte_t)];
++	return ptep >= &bm_pte[0] && ptep < &bm_pte[MMUPAGE_SIZE/sizeof(pte_t)];
+ }
+ 
+ void __init early_ioremap_init(void)
+@@ -850,9 +865,9 @@ void __init early_ioremap_init(void)
+ 	pmd_t *pmd;
+ 
+ #ifdef CONFIG_X86_64
+-	BUILD_BUG_ON((fix_to_virt(0) + PAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
++	BUILD_BUG_ON((fix_to_virt(0) + MMUPAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
+ #else
+-	WARN_ON((fix_to_virt(0) + PAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
++	WARN_ON((fix_to_virt(0) + MMUPAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
+ #endif
+ 
+ 	early_ioremap_setup();
+@@ -865,7 +880,7 @@ void __init early_ioremap_init(void)
+ 	 * The boot-ioremap range spans multiple pmds, for which
+ 	 * we are not prepared:
+ 	 */
+-#define __FIXADDR_TOP (-PAGE_SIZE)
++#define __FIXADDR_TOP (-MMUPAGE_SIZE)
+ 	BUILD_BUG_ON((__fix_to_virt(FIX_BTMAP_BEGIN) >> PMD_SHIFT)
+ 		     != (__fix_to_virt(FIX_BTMAP_END) >> PMD_SHIFT));
+ #undef __FIXADDR_TOP
+@@ -900,7 +915,7 @@ void __init __early_set_fixmap(enum fixed_addresses idx,
+ 	pgprot_val(flags) &= __supported_pte_mask;
+ 
+ 	if (pgprot_val(flags))
+-		set_pte(pte, pfn_pte(phys >> PAGE_SHIFT, flags));
++		set_pte(pte, __pte((phys & PHYSICAL_PAGE_MASK) | pgprot_val(flags)));
+ 	else
+ 		pte_clear(&init_mm, addr, pte);
+ 	flush_tlb_one_kernel(addr);
+diff --git a/arch/x86/mm/pat/set_memory.c b/arch/x86/mm/pat/set_memory.c
+index d023a40a1e03..252542ff7bc6 100644
+--- a/arch/x86/mm/pat/set_memory.c
++++ b/arch/x86/mm/pat/set_memory.c
+@@ -873,8 +873,13 @@ phys_addr_t slow_virt_to_phys(void *__virt_addr)
+ 		offset = virt_addr & ~PMD_MASK;
+ 		break;
+ 	default:
+-		phys_addr = (phys_addr_t)pte_pfn(*pte) << PAGE_SHIFT;
+-		offset = virt_addr & ~PAGE_MASK;
++	{
++		phys_addr_t raw = pte_val(*pte);
++
++		raw ^= protnone_mask(raw);
++		phys_addr = raw & PTE_PFN_MASK;
++		offset = virt_addr & ~MMUPAGE_MASK;
++	}
+ 	}
+ 
+ 	return (phys_addr_t)(phys_addr | offset);
+@@ -1087,13 +1092,18 @@ static int should_split_large_page(pte_t *kpte, unsigned long address,
+ 	return do_split;
+ }
+ 
+-static void split_set_pte(struct cpa_data *cpa, pte_t *pte, unsigned long pfn,
++static void split_set_pte(struct cpa_data *cpa, pte_t *pte, phys_addr_t paddr,
+ 			  pgprot_t ref_prot, unsigned long address,
+ 			  unsigned long size)
+ {
+ 	unsigned int npg = PFN_DOWN(size);
++	unsigned long pfn = PFN_DOWN(paddr);
+ 	pgprot_t prot;
+ 
++	/* Ensure at least 1 page for static_protections range check */
++	if (npg < 1)
++		npg = 1;
++
+ 	/*
+ 	 * If should_split_large_page() discovered an inconsistent mapping,
+ 	 * remove the invalid protection in the split mapping.
+@@ -1115,19 +1125,28 @@ static void split_set_pte(struct cpa_data *cpa, pte_t *pte, unsigned long pfn,
+ 	 * pages. Warn for now and revisit it in case this actually
+ 	 * happens.
+ 	 */
+-	if (size == PAGE_SIZE)
++	if (size <= MMUPAGE_SIZE)
+ 		ref_prot = prot;
+ 	else
+ 		pr_warn_once("CPA: Cannot fixup static protections for PUD split\n");
+ set:
+-	set_pte(pte, pfn_pte(pfn, ref_prot));
++	if (size <= MMUPAGE_SIZE) {
++		/*
++		 * PTE level: use MMUPAGE-granularity physical address directly
++		 * to avoid losing sub-PAGE_SIZE address bits through pfn_pte().
++		 */
++		set_pte(pte, __pte((paddr & PTE_PFN_MASK) |
++				   pgprot_val(ref_prot)));
++	} else {
++		set_pte(pte, pfn_pte(pfn, ref_prot));
++	}
+ }
+ 
+ static int
+ __split_large_page(struct cpa_data *cpa, pte_t *kpte, unsigned long address,
+ 		   struct ptdesc *ptdesc)
+ {
+-	unsigned long lpaddr, lpinc, ref_pfn, pfn, pfninc = 1;
++	unsigned long lpaddr, lpinc, ref_pfn;
+ 	struct page *base = ptdesc_page(ptdesc);
+ 	pte_t *pbase = (pte_t *)page_address(base);
+ 	unsigned int i, level;
+@@ -1158,13 +1177,12 @@ __split_large_page(struct cpa_data *cpa, pte_t *kpte, unsigned long address,
+ 		ref_prot = pgprot_large_2_4k(ref_prot);
+ 		ref_pfn = pmd_pfn(*(pmd_t *)kpte);
+ 		lpaddr = address & PMD_MASK;
+-		lpinc = PAGE_SIZE;
++		lpinc = MMUPAGE_SIZE;
+ 		break;
+ 
+ 	case PG_LEVEL_1G:
+ 		ref_prot = pud_pgprot(*(pud_t *)kpte);
+ 		ref_pfn = pud_pfn(*(pud_t *)kpte);
+-		pfninc = PMD_SIZE >> PAGE_SHIFT;
+ 		lpaddr = address & PUD_MASK;
+ 		lpinc = PMD_SIZE;
+ 		/*
+@@ -1184,11 +1202,16 @@ __split_large_page(struct cpa_data *cpa, pte_t *kpte, unsigned long address,
+ 	ref_prot = pgprot_clear_protnone_bits(ref_prot);
+ 
+ 	/*
+-	 * Get the target pfn from the original entry:
++	 * Get the target physical address from the original entry.
++	 * Use physical address arithmetic to avoid losing sub-PAGE_SIZE
++	 * address bits when PAGE_MMUSHIFT > 0.
+ 	 */
+-	pfn = ref_pfn;
+-	for (i = 0; i < PTRS_PER_PTE; i++, pfn += pfninc, lpaddr += lpinc)
+-		split_set_pte(cpa, pbase + i, pfn, ref_prot, lpaddr, lpinc);
++	{
++		phys_addr_t paddr = (phys_addr_t)ref_pfn << PAGE_SHIFT;
++
++		for (i = 0; i < PTRS_PER_PTE; i++, paddr += lpinc, lpaddr += lpinc)
++			split_set_pte(cpa, pbase + i, paddr, ref_prot, lpaddr, lpinc);
++	}
+ 
+ 	if (virt_addr_valid(address)) {
+ 		unsigned long pfn = PFN_DOWN(__pa(address));
+@@ -1438,7 +1461,7 @@ static bool unmap_pte_range(pmd_t *pmd, unsigned long start, unsigned long end)
+ 	while (start < end) {
+ 		set_pte(pte, __pte(0));
+ 
+-		start += PAGE_SIZE;
++		start += MMUPAGE_SIZE;
+ 		pte++;
+ 	}
+ 
+@@ -1573,18 +1596,23 @@ static void populate_pte(struct cpa_data *cpa,
+ 			 unsigned num_pages, pmd_t *pmd, pgprot_t pgprot)
+ {
+ 	pte_t *pte;
++	phys_addr_t paddr;
++	unsigned int num_mmu_pages = num_pages << PAGE_MMUSHIFT;
+ 
+ 	pte = pte_offset_kernel(pmd, start);
+ 
+ 	pgprot = pgprot_clear_protnone_bits(pgprot);
++	paddr = (phys_addr_t)cpa->pfn << PAGE_SHIFT;
+ 
+-	while (num_pages-- && start < end) {
+-		set_pte(pte, pfn_pte(cpa->pfn, pgprot));
++	while (num_mmu_pages-- && start < end) {
++		set_pte(pte, __pte((paddr & PTE_PFN_MASK) |
++				   pgprot_val(pgprot)));
+ 
+-		start	 += PAGE_SIZE;
+-		cpa->pfn++;
++		start += MMUPAGE_SIZE;
++		paddr += MMUPAGE_SIZE;
+ 		pte++;
+ 	}
++	cpa->pfn = PFN_DOWN(paddr);
+ }
+ 
+ static long populate_pmd(struct cpa_data *cpa,
+@@ -1864,38 +1892,62 @@ static int __change_page_attr(struct cpa_data *cpa, int primary)
+ 		return __cpa_process_fault(cpa, address, primary);
+ 
+ 	if (level == PG_LEVEL_4K) {
+-		pte_t new_pte;
+-		pgprot_t old_prot = pte_pgprot(old_pte);
+-		pgprot_t new_prot = pte_pgprot(old_pte);
+-		unsigned long pfn = pte_pfn(old_pte);
+-
+-		pgprot_val(new_prot) &= ~pgprot_val(cpa->mask_clr);
+-		pgprot_val(new_prot) |= pgprot_val(cpa->mask_set);
++		/*
++		 * When PAGE_MMUSHIFT > 0, one logical page spans multiple
++		 * MMUPAGE-sized PTEs.  Process all PAGE_MMUCOUNT PTEs for
++		 * this logical page so the outer loop can advance by
++		 * PAGE_SIZE correctly.
++		 */
++		int sub;
+ 
+-		cpa_inc_4k_install();
+-		/* Hand in lpsize = 0 to enforce the protection mechanism */
+-		new_prot = static_protections(new_prot, address, pfn, 1, 0,
+-					      CPA_PROTECT);
++		for (sub = 0; sub < PAGE_MMUCOUNT; sub++) {
++			pte_t sub_old = *(kpte + sub);
++			unsigned long sub_addr = address + sub * MMUPAGE_SIZE;
++			pte_t new_pte;
++			pgprot_t old_prot, new_prot;
+ 
+-		new_prot = verify_rwx(old_prot, new_prot, address, pfn, 1,
+-				      nx, rw);
++			if (pte_none(sub_old))
++				continue;
+ 
+-		new_prot = pgprot_clear_protnone_bits(new_prot);
++			old_prot = pte_pgprot(sub_old);
++			new_prot = pte_pgprot(sub_old);
++
++			pgprot_val(new_prot) &= ~pgprot_val(cpa->mask_clr);
++			pgprot_val(new_prot) |= pgprot_val(cpa->mask_set);
++
++			cpa_inc_4k_install();
++			new_prot = static_protections(new_prot, sub_addr,
++						      pte_pfn(sub_old), 1, 0,
++						      CPA_PROTECT);
++			new_prot = verify_rwx(old_prot, new_prot, sub_addr,
++					      pte_pfn(sub_old), 1, nx, rw);
++			new_prot = pgprot_clear_protnone_bits(new_prot);
++
++			{
++				phys_addr_t phys = pte_val(sub_old);
++
++				/*
++				 * #106: mirror pte_pfn()+pfn_pte() L1TF handling.
++				 * Un-invert the old (maybe not-present) encoding,
++				 * then RE-invert for the new prot, masking only
++				 * after both XORs.  Missing the re-invert made
++				 * set_direct_map_invalid write a non-inverted
++				 * not-present PTE, which set_direct_map_default then
++				 * doubly-inverted into a present PTE with pfn==~pfn
++				 * (reserved-bit fault).  Non-identity at MMUSHIFT==0.
++				 */
++				phys ^= protnone_mask(phys);
++				phys ^= protnone_mask(pgprot_val(new_prot));
++				phys &= PTE_PFN_MASK;
++				new_pte = __pte(phys | pgprot_val(new_prot));
++			}
+ 
+-		/*
+-		 * We need to keep the pfn from the existing PTE,
+-		 * after all we're only going to change its attributes
+-		 * not the memory it points to
+-		 */
+-		new_pte = pfn_pte(pfn, new_prot);
+-		cpa->pfn = pfn;
+-		/*
+-		 * Do we really change anything ?
+-		 */
+-		if (pte_val(old_pte) != pte_val(new_pte)) {
+-			set_pte_atomic(kpte, new_pte);
+-			cpa->flags |= CPA_FLUSHTLB;
++			if (pte_val(sub_old) != pte_val(new_pte)) {
++				set_pte_atomic(kpte + sub, new_pte);
++				cpa->flags |= CPA_FLUSHTLB;
++			}
+ 		}
++		cpa->pfn = pte_pfn(old_pte);
+ 		cpa->numpages = 1;
+ 		return 0;
+ 	}
+diff --git a/arch/x86/mm/pgtable.c b/arch/x86/mm/pgtable.c
+index da7f0a03cf90..ca5473b96e39 100644
+--- a/arch/x86/mm/pgtable.c
++++ b/arch/x86/mm/pgtable.c
+@@ -588,7 +588,7 @@ void native_set_fixmap(unsigned /* enum fixed_addresses */ idx,
+ 	/* Sanitize 'prot' against any unsupported bits: */
+ 	pgprot_val(flags) &= __default_kernel_pte_mask;
+ 
+-	__native_set_fixmap(idx, pfn_pte(phys >> PAGE_SHIFT, flags));
++	__native_set_fixmap(idx, __pte((phys & PHYSICAL_PAGE_MASK) | pgprot_val(flags)));
+ }
+ 
+ #ifdef CONFIG_HAVE_ARCH_HUGE_VMAP
+diff --git a/arch/x86/mm/pti.c b/arch/x86/mm/pti.c
+index 631f0375bd42..080c8f08d938 100644
+--- a/arch/x86/mm/pti.c
++++ b/arch/x86/mm/pti.c
+@@ -473,7 +473,7 @@ static void __init pti_clone_user_shared(void)
+ 		if (WARN_ON(!target_pte))
+ 			return;
+ 
+-		*target_pte = pfn_pte(pa >> PAGE_SHIFT, PAGE_KERNEL);
++		*target_pte = __pte((pa & PHYSICAL_PAGE_MASK) | pgprot_val(PAGE_KERNEL));
+ 	}
+ }
+ 
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index af43d177087e..01520b9dc8cc 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -1531,7 +1531,7 @@ void flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ 
+ 	guard(preempt)();
+ 
+-	info = get_flush_tlb_info(NULL, start, end, PAGE_SHIFT, false,
++	info = get_flush_tlb_info(NULL, start, end, MMUPAGE_SHIFT, false,
+ 				  TLB_GENERATION_INVALID);
+ 
+ 	if (info->end == TLB_FLUSH_ALL)
+diff --git a/arch/x86/platform/efi/efi_32.c b/arch/x86/platform/efi/efi_32.c
+index b2cc7b4552a1..b30a16f07a34 100644
+--- a/arch/x86/platform/efi/efi_32.c
++++ b/arch/x86/platform/efi/efi_32.c
+@@ -40,7 +40,7 @@ void __init efi_map_region(efi_memory_desc_t *md)
+ 	void *va;
+ 
+ 	start_pfn	= PFN_DOWN(md->phys_addr);
+-	size		= md->num_pages << PAGE_SHIFT;
++	size		= md->num_pages << EFI_PAGE_SHIFT;
+ 	end		= md->phys_addr + size;
+ 	end_pfn 	= PFN_UP(end);
+ 
+@@ -48,7 +48,8 @@ void __init efi_map_region(efi_memory_desc_t *md)
+ 		va = __va(md->phys_addr);
+ 
+ 		if (!(md->attribute & EFI_MEMORY_WB))
+-			set_memory_uc((unsigned long)va, md->num_pages);
++			set_memory_uc((unsigned long)va,
++			      DIV_ROUND_UP(md->num_pages, PAGE_MMUCOUNT));
+ 	} else {
+ 		va = ioremap_cache(md->phys_addr, size);
+ 	}
+diff --git a/arch/x86/platform/efi/efi_64.c b/arch/x86/platform/efi/efi_64.c
+index 5861008eab22..dbef3af8f8b6 100644
+--- a/arch/x86/platform/efi/efi_64.c
++++ b/arch/x86/platform/efi/efi_64.c
+@@ -298,15 +298,23 @@ static void __init __map_region(efi_memory_desc_t *md, u64 va)
+ 	    md->type != EFI_MEMORY_MAPPED_IO)
+ 		flags |= _PAGE_ENC;
+ 
+-	pfn = md->phys_addr >> PAGE_SHIFT;
+-	if (kernel_map_pages_in_pgd(pgd, pfn, va, md->num_pages, flags))
+-		pr_warn("Error mapping PA 0x%llx -> VA 0x%llx!\n",
+-			   md->phys_addr, va);
++	{
++		unsigned long phys_offset = md->phys_addr & ~PAGE_MASK;
++		unsigned long total_size = phys_offset +
++					  (md->num_pages << EFI_PAGE_SHIFT);
++
++		pfn = md->phys_addr >> PAGE_SHIFT;
++		if (kernel_map_pages_in_pgd(pgd, pfn, va - phys_offset,
++					    DIV_ROUND_UP(total_size, PAGE_SIZE),
++					    flags))
++			pr_warn("Error mapping PA 0x%llx -> VA 0x%llx!\n",
++				   md->phys_addr, va);
++	}
+ }
+ 
+ void __init efi_map_region(efi_memory_desc_t *md)
+ {
+-	unsigned long size = md->num_pages << PAGE_SHIFT;
++	unsigned long size = md->num_pages << EFI_PAGE_SHIFT;
+ 	u64 pa = md->phys_addr;
+ 
+ 	/*
+@@ -375,14 +383,25 @@ static int __init efi_update_mappings(efi_memory_desc_t *md, unsigned long pf)
+ 	int err1, err2;
+ 
+ 	/* Update the 1:1 mapping */
+-	pfn = md->phys_addr >> PAGE_SHIFT;
+-	err1 = kernel_map_pages_in_pgd(pgd, pfn, md->phys_addr, md->num_pages, pf);
+-	if (err1) {
+-		pr_err("Error while updating 1:1 mapping PA 0x%llx -> VA 0x%llx!\n",
+-			   md->phys_addr, md->virt_addr);
++	{
++		unsigned long phys_offset = md->phys_addr & ~PAGE_MASK;
++		unsigned long total_size = phys_offset +
++					  (md->num_pages << EFI_PAGE_SHIFT);
++		unsigned long nkpages = DIV_ROUND_UP(total_size, PAGE_SIZE);
++
++		pfn = md->phys_addr >> PAGE_SHIFT;
++		err1 = kernel_map_pages_in_pgd(pgd, pfn,
++					       md->phys_addr - phys_offset,
++					       nkpages, pf);
++		if (err1) {
++			pr_err("Error while updating 1:1 mapping PA 0x%llx -> VA 0x%llx!\n",
++				   md->phys_addr, md->virt_addr);
++		}
++
++		err2 = kernel_map_pages_in_pgd(pgd, pfn,
++					       md->virt_addr - phys_offset,
++					       nkpages, pf);
+ 	}
+-
+-	err2 = kernel_map_pages_in_pgd(pgd, pfn, md->virt_addr, md->num_pages, pf);
+ 	if (err2) {
+ 		pr_err("Error while updating VA mapping PA 0x%llx -> VA 0x%llx!\n",
+ 			   md->phys_addr, md->virt_addr);
+diff --git a/arch/x86/platform/efi/quirks.c b/arch/x86/platform/efi/quirks.c
+index 90a065fcb1fa..fb35cc316abc 100644
+--- a/arch/x86/platform/efi/quirks.c
++++ b/arch/x86/platform/efi/quirks.c
+@@ -397,11 +397,18 @@ static void __init efi_unmap_pages(efi_memory_desc_t *md)
+ 	if (efi_is_mixed())
+ 		return;
+ 
+-	if (kernel_unmap_pages_in_pgd(pgd, pa, md->num_pages))
+-		pr_err("Failed to unmap 1:1 mapping for 0x%llx\n", pa);
++	{
++		unsigned long phys_offset = pa & ~PAGE_MASK;
++		unsigned long total_size = phys_offset +
++					  (md->num_pages << EFI_PAGE_SHIFT);
++		unsigned long nkpages = DIV_ROUND_UP(total_size, PAGE_SIZE);
+ 
+-	if (kernel_unmap_pages_in_pgd(pgd, va, md->num_pages))
+-		pr_err("Failed to unmap VA mapping for 0x%llx\n", va);
++		if (kernel_unmap_pages_in_pgd(pgd, pa - phys_offset, nkpages))
++			pr_err("Failed to unmap 1:1 mapping for 0x%llx\n", pa);
++
++		if (kernel_unmap_pages_in_pgd(pgd, va - phys_offset, nkpages))
++			pr_err("Failed to unmap VA mapping for 0x%llx\n", va);
++	}
+ }
+ 
+ struct efi_freeable_range {
+diff --git a/arch/x86/realmode/init.c b/arch/x86/realmode/init.c
+index 88be32026768..cd5a56816e6d 100644
+--- a/arch/x86/realmode/init.c
++++ b/arch/x86/realmode/init.c
+@@ -54,8 +54,13 @@ void __init reserve_real_mode(void)
+ 
+ 	WARN_ON(slab_is_available());
+ 
+-	/* Has to be under 1M so we can execute real-mode AP code. */
+-	mem = memblock_phys_alloc_range(size, PAGE_SIZE, 0, 1<<20);
++	/*
++	 * Has to be under 1M so we can execute real-mode AP code.  Align to
++	 * MMUPAGE_SIZE (hardware page), not PAGE_SIZE: under page clustering a
++	 * PAGE_SIZE (e.g. 256K) alignment is unsatisfiable in a fragmented
++	 * sub-1M e820.  Identity at PAGE_MMUSHIFT == 0.
++	 */
++	mem = memblock_phys_alloc_range(size, MMUPAGE_SIZE, 0, 1<<20);
+ 	if (!mem)
+ 		pr_info("No sub-1M memory is available for the trampoline\n");
+ 	else
+@@ -97,7 +102,8 @@ static void __init setup_real_mode(void)
+ 	unsigned char *base;
+ 	unsigned long phys_base;
+ 	struct trampoline_header *trampoline_header;
+-	size_t size = PAGE_ALIGN(real_mode_blob_end - real_mode_blob);
++	/* MMUPAGE-granular to match reserve_real_mode()'s allocation size. */
++	size_t size = ALIGN(real_mode_blob_end - real_mode_blob, MMUPAGE_SIZE);
+ #ifdef CONFIG_X86_64
+ 	u64 *trampoline_pgd;
+ 	u64 efer;
+@@ -112,7 +118,14 @@ static void __init setup_real_mode(void)
+ 	 * successfully. This is not needed for SEV.
+ 	 */
+ 	if (cc_platform_has(CC_ATTR_HOST_MEM_ENCRYPT))
+-		set_memory_decrypted((unsigned long)base, size >> PAGE_SHIFT);
++		/*
++		 * Round up: under page clustering the trampoline is smaller than
++		 * a PAGE, so size >> PAGE_SHIFT would be 0.  set_memory_*
++		 * operates at PAGE granularity on the containing page.  Identity
++		 * at PAGE_MMUSHIFT == 0 (size is PAGE-aligned there).
++		 */
++		set_memory_decrypted((unsigned long)base,
++				     DIV_ROUND_UP(size, PAGE_SIZE));
+ 
+ 	memcpy(base, real_mode_blob, size);
+ 
+@@ -190,20 +203,43 @@ static void __init set_real_mode_permissions(void)
+ 	unsigned char *base = (unsigned char *) real_mode_header;
+ 	size_t size = PAGE_ALIGN(real_mode_blob_end - real_mode_blob);
+ 
+-	size_t ro_size =
+-		PAGE_ALIGN(real_mode_header->ro_end) -
+-		__pa(base);
++	/*
++	 * With PAGE_MMUSHIFT > 0, text_start may be MMUPAGE-aligned
++	 * rather than PAGE-aligned.  Round down to PAGE boundary so
++	 * the CPA code gets a page-aligned address.
++	 */
++	unsigned long text_start_phys =
++		PAGE_ALIGN_DOWN(real_mode_header->text_start);
+ 
+ 	size_t text_size =
+-		PAGE_ALIGN(real_mode_header->ro_end) -
+-		real_mode_header->text_start;
++		PAGE_ALIGN(real_mode_header->ro_end) - text_start_phys;
+ 
+ 	unsigned long text_start =
+-		(unsigned long) __va(real_mode_header->text_start);
++		(unsigned long) __va(text_start_phys);
++
++	if (PAGE_MMUSHIFT == 0) {
++		size_t ro_size =
++			PAGE_ALIGN(real_mode_header->ro_end) -
++			__pa(base);
+ 
+-	set_memory_nx((unsigned long) base, size >> PAGE_SHIFT);
+-	set_memory_ro((unsigned long) base, ro_size >> PAGE_SHIFT);
+-	set_memory_x((unsigned long) text_start, text_size >> PAGE_SHIFT);
++		set_memory_nx((unsigned long) base, size >> PAGE_SHIFT);
++		set_memory_ro((unsigned long) base, ro_size >> PAGE_SHIFT);
++		set_memory_x(text_start, text_size >> PAGE_SHIFT);
++	} else {
++		/*
++		 * With PAGE_MMUSHIFT > 0, CPA operates at PAGE_SIZE
++		 * granularity.  We can't do fine-grained NX+RO without
++		 * creating W+X on the data sections that share the same
++		 * PAGE.  But we MUST clear NX on the text, otherwise the
++		 * AP will triple-fault on instruction fetch (the direct
++		 * mapping uses PAGE_KERNEL which includes _PAGE_NX).
++		 *
++		 * Accept the W+X trade-off — the trampoline is only
++		 * used during AP boot and the security impact is
++		 * negligible.
++		 */
++		set_memory_x(text_start, text_size >> PAGE_SHIFT);
++	}
+ }
+ 
+ void __init init_real_mode(void)
+diff --git a/arch/x86/realmode/rm/realmode.lds.S b/arch/x86/realmode/rm/realmode.lds.S
+index 63aa51875ba0..e884bf584c1e 100644
+--- a/arch/x86/realmode/rm/realmode.lds.S
++++ b/arch/x86/realmode/rm/realmode.lds.S
+@@ -33,7 +33,7 @@ SECTIONS
+ 		video_cards_end = .;
+ 	}
+ 
+-	. = ALIGN(PAGE_SIZE);
++	. = ALIGN(MMUPAGE_SIZE);
+ 	pa_text_start = .;
+ 	.text : {
+ 		*(.text)
+@@ -51,7 +51,7 @@ SECTIONS
+ 	}
+ 	pa_ro_end = .;
+ 
+-	. = ALIGN(PAGE_SIZE);
++	. = ALIGN(MMUPAGE_SIZE);
+ 	.data : {
+ 		*(.data)
+ 		*(.data.*)
+diff --git a/arch/x86/realmode/rm/trampoline_32.S b/arch/x86/realmode/rm/trampoline_32.S
+index 3fad907a179f..4f9701a5f273 100644
+--- a/arch/x86/realmode/rm/trampoline_32.S
++++ b/arch/x86/realmode/rm/trampoline_32.S
+@@ -28,7 +28,7 @@
+ 	.text
+ 	.code16
+ 
+-	.balign	PAGE_SIZE
++	.balign	MMUPAGE_SIZE
+ SYM_CODE_START(trampoline_start)
+ 	wbinvd			# Needed for NUMA-Q should be harmless for others
+ 
+diff --git a/arch/x86/realmode/rm/trampoline_64.S b/arch/x86/realmode/rm/trampoline_64.S
+index 14d9c7daf90f..6d32a16c0ec2 100644
+--- a/arch/x86/realmode/rm/trampoline_64.S
++++ b/arch/x86/realmode/rm/trampoline_64.S
+@@ -57,7 +57,7 @@
+ 	movl	$rm_stack_end, %esp
+ .endm
+ 
+-	.balign	PAGE_SIZE
++	.balign	MMUPAGE_SIZE
+ SYM_CODE_START(trampoline_start)
+ 	cli			# We should be safe anyway
+ 	wbinvd
+@@ -279,8 +279,8 @@ SYM_DATA_START(tr_compat)
+ SYM_DATA_END(tr_compat)
+ 
+ 	.bss
+-	.balign	PAGE_SIZE
+-SYM_DATA(trampoline_pgd, .space PAGE_SIZE)
++	.balign	MMUPAGE_SIZE
++SYM_DATA(trampoline_pgd, .space MMUPAGE_SIZE)
+ 
+ 	.balign	8
+ SYM_DATA_START(trampoline_header)
+diff --git a/arch/x86/xen/mmu_pv.c b/arch/x86/xen/mmu_pv.c
+index 3eee5f84f8a7..4af9c01a093c 100644
+--- a/arch/x86/xen/mmu_pv.c
++++ b/arch/x86/xen/mmu_pv.c
+@@ -128,7 +128,7 @@ static int alloc_discontig_frames(unsigned int order)
+ 	unsigned long flags;
+ 
+ 	BUG_ON(order < MIN_CONTIG_ORDER);
+-	BUILD_BUG_ON(sizeof(discontig_frames_early) != PAGE_SIZE);
++	BUILD_BUG_ON(sizeof(discontig_frames_early) > PAGE_SIZE);
+ 
+ 	new_array = (unsigned long *)__get_free_pages(GFP_KERNEL,
+ 						      order - MIN_CONTIG_ORDER);
+-- 
+2.54.0
+

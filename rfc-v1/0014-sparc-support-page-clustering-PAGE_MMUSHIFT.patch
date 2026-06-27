@@ -1,0 +1,1279 @@
+From dc3aef049c1a50a403270fcf5ccca6b19c3c821a Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:33 +0200
+Subject: [RFC PATCH 14/28] sparc: support page clustering (PAGE_MMUSHIFT)
+
+---
+ arch/sparc/Kconfig                    | 10 ++++
+ arch/sparc/include/asm/elf_64.h       |  2 +-
+ arch/sparc/include/asm/page_64.h      | 11 +++-
+ arch/sparc/include/asm/pgtable_32.h   |  2 +-
+ arch/sparc/include/asm/pgtable_64.h   | 50 ++++++++++++-----
+ arch/sparc/include/asm/processor_64.h | 12 ++++-
+ arch/sparc/include/asm/shmparam_32.h  |  2 +-
+ arch/sparc/include/asm/shmparam_64.h  |  2 +-
+ arch/sparc/include/asm/tsb.h          | 18 +++----
+ arch/sparc/include/asm/vdso.h         |  2 +-
+ arch/sparc/kernel/dtlb_prot.S         |  4 +-
+ arch/sparc/kernel/sun4v_tlb_miss.S    |  6 +--
+ arch/sparc/kernel/sys_sparc_32.c      | 13 +++--
+ arch/sparc/kernel/sys_sparc_64.c      | 32 +++++++----
+ arch/sparc/kernel/tsb.S               | 12 ++---
+ arch/sparc/lib/copy_page.S            | 16 ++++--
+ arch/sparc/mm/fault_64.c              |  2 +-
+ arch/sparc/mm/hugetlbpage.c           |  4 +-
+ arch/sparc/mm/hypersparc.S            | 20 +++----
+ arch/sparc/mm/init_64.c               | 78 +++++++++++++++++++++++----
+ arch/sparc/mm/swift.S                 |  6 +--
+ arch/sparc/mm/tlb.c                   |  6 +--
+ arch/sparc/mm/tsb.c                   | 22 ++++----
+ arch/sparc/mm/tsunami.S               |  4 +-
+ arch/sparc/mm/ultra.S                 | 36 ++++++-------
+ arch/sparc/mm/viking.S                | 10 ++--
+ arch/sparc/vdso/vma.c                 | 42 +++++++++++----
+ 27 files changed, 289 insertions(+), 135 deletions(-)
+
+diff --git a/arch/sparc/Kconfig b/arch/sparc/Kconfig
+index a6b787efc2c4..f19baea35538 100644
+--- a/arch/sparc/Kconfig
++++ b/arch/sparc/Kconfig
+@@ -279,6 +279,16 @@ config ARCH_SPARSEMEM_DEFAULT
+ 
+ config ARCH_FORCE_MAX_ORDER
+ 	int "Order of maximal physically contiguous allocations"
++	# PGCL widens PAGE_SIZE by 2^PAGE_MMUSHIFT; cap MAX_PAGE_ORDER so
++	# PAGE_SHIFT + MAX_PAGE_ORDER stays under SECTION_SIZE_BITS (=30).
++	# `range` clauses force `make olddefconfig` to clamp a stale value
++	# from a smaller-PGCL .config when the user later raises PAGE_MMUSHIFT.
++	range 1 5 if PAGE_MMUSHIFT >= 6
++	range 1 8 if PAGE_MMUSHIFT >= 4
++	range 1 10 if PAGE_MMUSHIFT >= 2
++	default "5" if PAGE_MMUSHIFT >= 6
++	default "8" if PAGE_MMUSHIFT >= 4
++	default "10" if PAGE_MMUSHIFT >= 2
+ 	default "12"
+ 	help
+ 	  The kernel page allocator limits the size of maximal physically
+diff --git a/arch/sparc/include/asm/elf_64.h b/arch/sparc/include/asm/elf_64.h
+index 694ed081cf8d..29c66f90755b 100644
+--- a/arch/sparc/include/asm/elf_64.h
++++ b/arch/sparc/include/asm/elf_64.h
+@@ -182,7 +182,7 @@ typedef struct {
+ 					 (x)->e_machine == EM_SPARC32PLUS)
+ #define compat_start_thread		start_thread32
+ 
+-#define ELF_EXEC_PAGESIZE	PAGE_SIZE
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ 
+ /* This is the location that an ET_DYN program is loaded if exec'ed.  Typical
+    use of this is to invoke "./ld.so someprog" to test out a new version of
+diff --git a/arch/sparc/include/asm/page_64.h b/arch/sparc/include/asm/page_64.h
+index fd4dc85fb38b..e11fcce1fc7e 100644
+--- a/arch/sparc/include/asm/page_64.h
++++ b/arch/sparc/include/asm/page_64.h
+@@ -9,7 +9,7 @@
+ /* Flushing for D-cache alias handling is only needed if
+  * the page size is smaller than 16K.
+  */
+-#if PAGE_SHIFT < 14
++#if MMUPAGE_SHIFT < 14
+ #define DCACHE_ALIASING_POSSIBLE
+ #endif
+ 
+@@ -42,8 +42,17 @@ void hugetlb_setup(struct pt_regs *regs);
+ void _clear_page(void *page);
+ #define clear_page(X)	_clear_page((void *)(X))
+ struct page;
++#if PAGE_MMUSHIFT > 0
++/*
++ * With PGCL, TLBTEMP TLB entries map MMUPAGE_SIZE but copy/clear loops
++ * iterate PAGE_SIZE bytes.  Bypass TLBTEMP and use regular copy/clear.
++ * D-cache aliasing flush is handled separately by set_pte_at paths.
++ */
++#define clear_user_page(addr, vaddr, page)	clear_page(addr)
++#else
+ void clear_user_page(void *addr, unsigned long vaddr, struct page *page);
+ #define clear_user_page clear_user_page
++#endif
+ #define copy_page(X,Y)	memcpy((void *)(X), (void *)(Y), PAGE_SIZE)
+ void copy_user_page(void *to, void *from, unsigned long vaddr, struct page *topage);
+ #define __HAVE_ARCH_COPY_USER_HIGHPAGE
+diff --git a/arch/sparc/include/asm/pgtable_32.h b/arch/sparc/include/asm/pgtable_32.h
+index f89b1250661d..1baff25d41fb 100644
+--- a/arch/sparc/include/asm/pgtable_32.h
++++ b/arch/sparc/include/asm/pgtable_32.h
+@@ -246,7 +246,7 @@ static inline pte_t pte_mkyoung(pte_t pte)
+ 	return __pte(pte_val(pte) | SRMMU_REF);
+ }
+ 
+-#define PFN_PTE_SHIFT			(PAGE_SHIFT - 4)
++#define PFN_PTE_SHIFT			(MMUPAGE_SHIFT - 4)
+ 
+ static inline pte_t pfn_pte(unsigned long pfn, pgprot_t pgprot)
+ {
+diff --git a/arch/sparc/include/asm/pgtable_64.h b/arch/sparc/include/asm/pgtable_64.h
+index 74ede706fb32..0198a5d98a09 100644
+--- a/arch/sparc/include/asm/pgtable_64.h
++++ b/arch/sparc/include/asm/pgtable_64.h
+@@ -45,13 +45,16 @@
+ #define VMALLOC_START		_AC(0x0000000100000000,UL)
+ #define VMEMMAP_BASE		VMALLOC_END
+ 
+-/* PMD_SHIFT determines the size of the area a second-level page
+- * table can map
++/* Page table pages are MMUPAGE_SIZE (hardware page), each entry is 8 bytes.
++ * With PGCL, PAGE_SHIFT > MMUPAGE_SHIFT, but page table geometry must use
++ * MMUPAGE_SHIFT since PT pages are hardware-page-sized.
++ *
++ * PMD_SHIFT determines the size of the area a second-level page table can map.
+  */
+-#define PMD_SHIFT	(PAGE_SHIFT + (PAGE_SHIFT-3))
++#define PMD_SHIFT	(MMUPAGE_SHIFT + (MMUPAGE_SHIFT-3))
+ #define PMD_SIZE	(_AC(1,UL) << PMD_SHIFT)
+ #define PMD_MASK	(~(PMD_SIZE-1))
+-#define PMD_BITS	(PAGE_SHIFT - 3)
++#define PMD_BITS	(MMUPAGE_SHIFT - 3)
+ 
+ /* PUD_SHIFT determines the size of the area a third-level page
+  * table can map
+@@ -59,13 +62,13 @@
+ #define PUD_SHIFT	(PMD_SHIFT + PMD_BITS)
+ #define PUD_SIZE	(_AC(1,UL) << PUD_SHIFT)
+ #define PUD_MASK	(~(PUD_SIZE-1))
+-#define PUD_BITS	(PAGE_SHIFT - 3)
++#define PUD_BITS	(MMUPAGE_SHIFT - 3)
+ 
+ /* PGDIR_SHIFT determines what a fourth-level page table entry can map */
+ #define PGDIR_SHIFT	(PUD_SHIFT + PUD_BITS)
+ #define PGDIR_SIZE	(_AC(1,UL) << PGDIR_SHIFT)
+ #define PGDIR_MASK	(~(PGDIR_SIZE-1))
+-#define PGDIR_BITS	(PAGE_SHIFT - 3)
++#define PGDIR_BITS	(MMUPAGE_SHIFT - 3)
+ 
+ #if (MAX_PHYS_ADDRESS_BITS > PGDIR_SHIFT + PGDIR_BITS)
+ #error MAX_PHYS_ADDRESS_BITS exceeds what kernel page tables can support
+@@ -91,7 +94,7 @@ extern unsigned long VMALLOC_END;
+ bool kern_addr_valid(unsigned long addr);
+ 
+ /* Entries per page directory level. */
+-#define PTRS_PER_PTE	(1UL << (PAGE_SHIFT-3))
++#define PTRS_PER_PTE	(1UL << (MMUPAGE_SHIFT-3))
+ #define PTRS_PER_PMD	(1UL << PMD_BITS)
+ #define PTRS_PER_PUD	(1UL << PUD_BITS)
+ #define PTRS_PER_PGD	(1UL << PGDIR_BITS)
+@@ -923,14 +926,34 @@ static inline void __set_pte_at(struct mm_struct *mm, unsigned long addr,
+ 	pte_t orig = *ptep;
+ 
+ 	*ptep = pte;
+-	maybe_tlb_batch_add(mm, addr, ptep, orig, fullmm, PAGE_SHIFT);
++	maybe_tlb_batch_add(mm, addr, ptep, orig, fullmm, MMUPAGE_SHIFT);
+ }
+ 
+-#define PFN_PTE_SHIFT		PAGE_SHIFT
++#define PFN_PTE_SHIFT		MMUPAGE_SHIFT
+ 
+ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 		pte_t *ptep, pte_t pte, unsigned int nr)
+ {
++#if PAGE_MMUSHIFT > 0
++	if (nr == 1) {
++		/* Single PTE: caller already set up sub-page offset */
++		__set_pte_at(mm, addr, ptep, pte, 0);
++	} else {
++		unsigned int i;
++
++		/*
++		 * With page clustering, nr is the number of PTEs
++		 * (MMUPAGE-granular) to write.  Advance by MMUPAGE_SIZE
++		 * per PTE.
++		 */
++		for (i = 0; i < nr; i++) {
++			__set_pte_at(mm, addr, ptep, pte, 0);
++			ptep++;
++			addr += MMUPAGE_SIZE;
++			pte_val(pte) += MMUPAGE_SIZE;
++		}
++	}
++#else
+ 	for (;;) {
+ 		__set_pte_at(mm, addr, ptep, pte, 0);
+ 		if (--nr == 0)
+@@ -939,6 +962,7 @@ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 		pte_val(pte) += PAGE_SIZE;
+ 		addr += PAGE_SIZE;
+ 	}
++#endif
+ }
+ #define set_ptes set_ptes
+ 
+@@ -1009,13 +1033,13 @@ pgtable_t pgtable_trans_huge_withdraw(struct mm_struct *mm, pmd_t *pmdp);
+  *   1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0
+  *   --------------------> E <-- type ---> <------- zeroes -------->
+  */
+-#define __swp_type(entry)	(((entry).val >> PAGE_SHIFT) & 0x7fUL)
+-#define __swp_offset(entry)	((entry).val >> (PAGE_SHIFT + 8UL))
++#define __swp_type(entry)	(((entry).val >> MMUPAGE_SHIFT) & 0x7fUL)
++#define __swp_offset(entry)	((entry).val >> (MMUPAGE_SHIFT + 8UL))
+ #define __swp_entry(type, offset)	\
+ 	( (swp_entry_t) \
+ 	  { \
+-		((((long)(type) & 0x7fUL) << PAGE_SHIFT) | \
+-                 ((long)(offset) << (PAGE_SHIFT + 8UL))) \
++		((((long)(type) & 0x7fUL) << MMUPAGE_SHIFT) | \
++                 ((long)(offset) << (MMUPAGE_SHIFT + 8UL))) \
+ 	  } )
+ #define __pte_to_swp_entry(pte)		((swp_entry_t) { pte_val(pte) })
+ #define __swp_entry_to_pte(x)		((pte_t) { (x).val })
+diff --git a/arch/sparc/include/asm/processor_64.h b/arch/sparc/include/asm/processor_64.h
+index 485070495263..2150c5e16b2e 100644
+--- a/arch/sparc/include/asm/processor_64.h
++++ b/arch/sparc/include/asm/processor_64.h
+@@ -21,10 +21,18 @@
+  * XXX No longer using virtual page tables, kill this upper limit...
+  */
+ #define VA_BITS		44
++/*
++ * VPTE_SIZE: Virtual Page Table Entries size.  One 8-byte entry per
++ * hardware MMU page, so the VPTE region size depends on the MMU page
++ * shift (MMUPAGE_SHIFT), not the kernel page shift (PAGE_SHIFT).
++ * With PGCL, PAGE_SHIFT > MMUPAGE_SHIFT, and using PAGE_SHIFT here
++ * makes VPTE_SIZE too small, pushing TASK_SIZE into the kernel VA
++ * range and causing userspace to be mapped at kernel addresses.
++ */
+ #ifndef __ASSEMBLER__
+-#define VPTE_SIZE	(1UL << (VA_BITS - PAGE_SHIFT + 3))
++#define VPTE_SIZE	(1UL << (VA_BITS - MMUPAGE_SHIFT + 3))
+ #else
+-#define VPTE_SIZE	(1 << (VA_BITS - PAGE_SHIFT + 3))
++#define VPTE_SIZE	(1 << (VA_BITS - MMUPAGE_SHIFT + 3))
+ #endif
+ 
+ #define TASK_SIZE_OF(tsk) \
+diff --git a/arch/sparc/include/asm/shmparam_32.h b/arch/sparc/include/asm/shmparam_32.h
+index 9767a8b30242..49fedb92092f 100644
+--- a/arch/sparc/include/asm/shmparam_32.h
++++ b/arch/sparc/include/asm/shmparam_32.h
+@@ -5,6 +5,6 @@
+ #define __ARCH_FORCE_SHMLBA 	1
+ 
+ extern int vac_cache_size;
+-#define SHMLBA (vac_cache_size ? vac_cache_size : PAGE_SIZE)
++#define SHMLBA (vac_cache_size ? vac_cache_size : MMUPAGE_SIZE)
+ 
+ #endif /* _ASMSPARC_SHMPARAM_H */
+diff --git a/arch/sparc/include/asm/shmparam_64.h b/arch/sparc/include/asm/shmparam_64.h
+index c0731b57124c..42faa5fccb7e 100644
+--- a/arch/sparc/include/asm/shmparam_64.h
++++ b/arch/sparc/include/asm/shmparam_64.h
+@@ -6,6 +6,6 @@
+ 
+ #define __ARCH_FORCE_SHMLBA	1
+ /* attach addr a multiple of this */
+-#define	SHMLBA	((PAGE_SIZE > L1DCACHE_SIZE) ? PAGE_SIZE : L1DCACHE_SIZE)
++#define	SHMLBA	((MMUPAGE_SIZE > L1DCACHE_SIZE) ? MMUPAGE_SIZE : L1DCACHE_SIZE)
+ 
+ #endif /* _ASMSPARC64_SHMPARAM_H */
+diff --git a/arch/sparc/include/asm/tsb.h b/arch/sparc/include/asm/tsb.h
+index 239be259e166..849d7ac5ab28 100644
+--- a/arch/sparc/include/asm/tsb.h
++++ b/arch/sparc/include/asm/tsb.h
+@@ -157,12 +157,12 @@ extern struct tsb_phys_patch_entry __tsb_phys_patch, __tsb_phys_patch_end;
+ 	sethi		%hi(swapper_pg_dir), REG1; \
+ 	or		REG1, %lo(swapper_pg_dir), REG1; \
+ 	sllx		VADDR, 64 - (PGDIR_SHIFT + PGDIR_BITS), REG2; \
+-	srlx		REG2, 64 - PAGE_SHIFT, REG2; \
++	srlx		REG2, 64 - MMUPAGE_SHIFT, REG2; \
+ 	andn		REG2, 0x7, REG2; \
+ 	ldx		[REG1 + REG2], REG1; \
+ 	brz,pn		REG1, FAIL_LABEL; \
+ 	 sllx		VADDR, 64 - (PUD_SHIFT + PUD_BITS), REG2; \
+-	srlx		REG2, 64 - PAGE_SHIFT, REG2; \
++	srlx		REG2, 64 - MMUPAGE_SHIFT, REG2; \
+ 	andn		REG2, 0x7, REG2; \
+ 	ldxa		[REG1 + REG2] ASI_PHYS_USE_EC, REG1; \
+ 	brz,pn		REG1, FAIL_LABEL; \
+@@ -174,7 +174,7 @@ extern struct tsb_phys_patch_entry __tsb_phys_patch, __tsb_phys_patch_end;
+ 	bne,pt		%xcc, 697f; \
+ 	 sllx		REG2, 1, REG2; \
+ 	sllx		VADDR, 64 - (PMD_SHIFT + PMD_BITS), REG2; \
+-	srlx		REG2, 64 - PAGE_SHIFT, REG2; \
++	srlx		REG2, 64 - MMUPAGE_SHIFT, REG2; \
+ 	andn		REG2, 0x7, REG2; \
+ 	ldxa		[REG1 + REG2] ASI_PHYS_USE_EC, REG1; \
+ 	sethi		%uhi(_PAGE_PMD_HUGE), REG2; \
+@@ -189,7 +189,7 @@ extern struct tsb_phys_patch_entry __tsb_phys_patch, __tsb_phys_patch_end;
+ 	ba,pt		%xcc, 699f; \
+ 	 or		REG1, REG2, REG1; \
+ 698:	sllx		VADDR, 64 - PMD_SHIFT, REG2; \
+-	srlx		REG2, 64 - PAGE_SHIFT, REG2; \
++	srlx		REG2, 64 - MMUPAGE_SHIFT, REG2; \
+ 	andn		REG2, 0x7, REG2; \
+ 	ldxa		[REG1 + REG2] ASI_PHYS_USE_EC, REG1; \
+ 	brgez,pn	REG1, FAIL_LABEL; \
+@@ -270,23 +270,23 @@ extern struct tsb_phys_patch_entry __tsb_phys_patch, __tsb_phys_patch_end;
+ 	 */
+ #define USER_PGTABLE_WALK_TL1(VADDR, PHYS_PGD, REG1, REG2, FAIL_LABEL)	\
+ 	sllx		VADDR, 64 - (PGDIR_SHIFT + PGDIR_BITS), REG2; \
+-	srlx		REG2, 64 - PAGE_SHIFT, REG2; \
++	srlx		REG2, 64 - MMUPAGE_SHIFT, REG2; \
+ 	andn		REG2, 0x7, REG2; \
+ 	ldxa		[PHYS_PGD + REG2] ASI_PHYS_USE_EC, REG1; \
+ 	brz,pn		REG1, FAIL_LABEL; \
+ 	 sllx		VADDR, 64 - (PUD_SHIFT + PUD_BITS), REG2; \
+-	srlx		REG2, 64 - PAGE_SHIFT, REG2; \
++	srlx		REG2, 64 - MMUPAGE_SHIFT, REG2; \
+ 	andn		REG2, 0x7, REG2; \
+ 	ldxa		[REG1 + REG2] ASI_PHYS_USE_EC, REG1; \
+ 	USER_PGTABLE_CHECK_PUD_HUGE(VADDR, REG1, REG2, FAIL_LABEL, 800f) \
+ 	brz,pn		REG1, FAIL_LABEL; \
+ 	 sllx		VADDR, 64 - (PMD_SHIFT + PMD_BITS), REG2; \
+-	srlx		REG2, 64 - PAGE_SHIFT, REG2; \
++	srlx		REG2, 64 - MMUPAGE_SHIFT, REG2; \
+ 	andn		REG2, 0x7, REG2; \
+ 	ldxa		[REG1 + REG2] ASI_PHYS_USE_EC, REG1; \
+ 	USER_PGTABLE_CHECK_PMD_HUGE(VADDR, REG1, REG2, FAIL_LABEL, 800f) \
+ 	sllx		VADDR, 64 - PMD_SHIFT, REG2; \
+-	srlx		REG2, 64 - PAGE_SHIFT, REG2; \
++	srlx		REG2, 64 - MMUPAGE_SHIFT, REG2; \
+ 	andn		REG2, 0x7, REG2; \
+ 	add		REG1, REG2, REG1; \
+ 	ldxa		[REG1] ASI_PHYS_USE_EC, REG1; \
+@@ -345,7 +345,7 @@ extern struct tsb_phys_patch_entry __tsb_phys_patch, __tsb_phys_patch_end;
+ 	.previous; \
+ 	sllx		REG1, 32, REG1; \
+ 	or		REG1, REG2, REG1; \
+-	srlx		VADDR, PAGE_SHIFT, REG2; \
++	srlx		VADDR, MMUPAGE_SHIFT, REG2; \
+ 	and		REG2, (KERNEL_TSB_NENTRIES - 1), REG2; \
+ 	sllx		REG2, 4, REG2; \
+ 	add		REG1, REG2, REG2; \
+diff --git a/arch/sparc/include/asm/vdso.h b/arch/sparc/include/asm/vdso.h
+index f08562d10215..09239a01a32f 100644
+--- a/arch/sparc/include/asm/vdso.h
++++ b/arch/sparc/include/asm/vdso.h
+@@ -7,7 +7,7 @@
+ 
+ struct vdso_image {
+ 	void *data;
+-	unsigned long size;   /* Always a multiple of PAGE_SIZE */
++	unsigned long size;   /* Always a multiple of MMUPAGE_SIZE */
+ };
+ 
+ #ifdef CONFIG_SPARC64
+diff --git a/arch/sparc/kernel/dtlb_prot.S b/arch/sparc/kernel/dtlb_prot.S
+index 9f945771bbd1..d8aeb09ab018 100644
+--- a/arch/sparc/kernel/dtlb_prot.S
++++ b/arch/sparc/kernel/dtlb_prot.S
+@@ -26,8 +26,8 @@
+ 
+ /* PROT ** ICACHE line 2: More real fault processing */
+ 	ldxa		[%g4] ASI_DMMU, %g5		! Put tagaccess in %g5
+-	srlx		%g5, PAGE_SHIFT, %g5
+-	sllx		%g5, PAGE_SHIFT, %g5		! Clear context ID bits
++	srlx		%g5, MMUPAGE_SHIFT, %g5
++	sllx		%g5, MMUPAGE_SHIFT, %g5		! Clear context ID bits
+ 	bgu,pn		%xcc, winfix_trampoline		! Yes, perform winfixup
+ 	 mov		FAULT_CODE_DTLB | FAULT_CODE_WRITE, %g4
+ 	ba,pt		%xcc, sparc64_realfault_common	! Nope, normal fault
+diff --git a/arch/sparc/kernel/sun4v_tlb_miss.S b/arch/sparc/kernel/sun4v_tlb_miss.S
+index 7ac9f3367674..a78d12ba2437 100644
+--- a/arch/sparc/kernel/sun4v_tlb_miss.S
++++ b/arch/sparc/kernel/sun4v_tlb_miss.S
+@@ -54,7 +54,7 @@ sun4v_itlb_miss:
+ 
+ 	LOAD_ITLB_INFO(%g2, %g4, %g5)
+ 	COMPUTE_TAG_TARGET(%g6, %g4, %g5, kvmap_itlb_4v)
+-	COMPUTE_TSB_PTR(%g1, %g4, PAGE_SHIFT, %g3, %g7)
++	COMPUTE_TSB_PTR(%g1, %g4, MMUPAGE_SHIFT, %g3, %g7)
+ 
+ 	/* Load TSB tag/pte into %g2/%g3 and compare the tag.  */
+ 	ldda	[%g1] ASI_QUAD_LDD_PHYS_4V, %g2
+@@ -100,7 +100,7 @@ sun4v_dtlb_miss:
+ 
+ 	LOAD_DTLB_INFO(%g2, %g4, %g5)
+ 	COMPUTE_TAG_TARGET(%g6, %g4, %g5, kvmap_dtlb_4v)
+-	COMPUTE_TSB_PTR(%g1, %g4, PAGE_SHIFT, %g3, %g7)
++	COMPUTE_TSB_PTR(%g1, %g4, MMUPAGE_SHIFT, %g3, %g7)
+ 
+ 	/* Load TSB tag/pte into %g2/%g3 and compare the tag.  */
+ 	ldda	[%g1] ASI_QUAD_LDD_PHYS_4V, %g2
+@@ -173,7 +173,7 @@ sun4v_dtsb_miss:
+ 	/* fallthrough */
+ 
+ sun4v_tsb_miss_common:
+-	COMPUTE_TSB_PTR(%g1, %g4, PAGE_SHIFT, %g5, %g7)
++	COMPUTE_TSB_PTR(%g1, %g4, MMUPAGE_SHIFT, %g5, %g7)
+ 
+ 	sub	%g2, TRAP_PER_CPU_FAULT_INFO, %g2
+ 
+diff --git a/arch/sparc/kernel/sys_sparc_32.c b/arch/sparc/kernel/sys_sparc_32.c
+index fb31bc0c5b48..ab22c9ad4890 100644
+--- a/arch/sparc/kernel/sys_sparc_32.c
++++ b/arch/sparc/kernel/sys_sparc_32.c
+@@ -53,7 +53,7 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsi
+ 		 * cache aliasing constraints.
+ 		 */
+ 		if (!file_hugepage && (flags & MAP_SHARED) &&
+-		    ((addr - (pgoff << PAGE_SHIFT)) & (SHMLBA - 1)))
++		    ((addr - (pgoff << MMUPAGE_SHIFT)) & (SHMLBA - 1)))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -68,9 +68,12 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsi
+ 	info.low_limit = addr;
+ 	info.high_limit = TASK_SIZE;
+ 	if (!file_hugepage) {
++		/* Colour bits live between MMUPAGE_SHIFT and SHMLBA; under page
++		 * clustering PAGE_SIZE can exceed SHMLBA so PAGE_MASK would
++		 * collapse the mask. pgoff is MMUPAGE-granular. */
+ 		info.align_mask = (flags & MAP_SHARED) ?
+-			(PAGE_MASK & (SHMLBA - 1)) : 0;
+-		info.align_offset = pgoff << PAGE_SHIFT;
++			(MMUPAGE_MASK & (SHMLBA - 1)) : 0;
++		info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	} else {
+ 		info.align_mask = huge_page_mask_align(filp);
+ 	}
+@@ -113,7 +116,7 @@ SYSCALL_DEFINE6(mmap2, unsigned long, addr, unsigned long, len,
+ 	/* Make sure the shift for mmap2 is constant (12), no matter what PAGE_SIZE
+ 	   we have. */
+ 	return ksys_mmap_pgoff(addr, len, prot, flags, fd,
+-			       pgoff >> (PAGE_SHIFT - 12));
++			       pgoff >> (MMUPAGE_SHIFT - 12));
+ }
+ 
+ SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
+@@ -121,7 +124,7 @@ SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
+ 	unsigned long, off)
+ {
+ 	/* no alignment check? */
+-	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
++	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> MMUPAGE_SHIFT);
+ }
+ 
+ SYSCALL_DEFINE5(sparc_remap_file_pages, unsigned long, start, unsigned long, size,
+diff --git a/arch/sparc/kernel/sys_sparc_64.c b/arch/sparc/kernel/sys_sparc_64.c
+index ecefcffcf7b1..fecc232d412a 100644
+--- a/arch/sparc/kernel/sys_sparc_64.c
++++ b/arch/sparc/kernel/sys_sparc_64.c
+@@ -83,7 +83,7 @@ static inline unsigned long COLOR_ALIGN(unsigned long addr,
+ 					 unsigned long pgoff)
+ {
+ 	unsigned long base = (addr+SHMLBA-1)&~(SHMLBA-1);
+-	unsigned long off = (pgoff<<PAGE_SHIFT) & (SHMLBA-1);
++	unsigned long off = (pgoff<<MMUPAGE_SHIFT) & (SHMLBA-1);
+ 
+ 	return base + off;
+ }
+@@ -93,7 +93,17 @@ static unsigned long get_align_mask(struct file *filp, unsigned long flags)
+ 	if (filp && is_file_hugepages(filp))
+ 		return huge_page_mask_align(filp);
+ 	if (filp || (flags & MAP_SHARED))
+-		return PAGE_MASK & (SHMLBA - 1);
++		/*
++		 * Cache-colour alignment.  The colour bits live between the
++		 * userspace base-page boundary (MMUPAGE_SHIFT) and SHMLBA.
++		 * Use MMUPAGE_MASK, not PAGE_MASK: under page clustering
++		 * (PAGE_MMUSHIFT>0) PAGE_SIZE can exceed SHMLBA (e.g. 512K
++		 * vs 16K), so PAGE_MASK & (SHMLBA-1) collapses to 0 and the
++		 * shared/file mapping is returned only MMUPAGE-aligned, not
++		 * SHMLBA-coloured -- which then trips the MAP_FIXED colour
++		 * sanity check on any later MREMAP_FIXED of that mapping.
++		 */
++		return MMUPAGE_MASK & (SHMLBA - 1);
+ 
+ 	return 0;
+ }
+@@ -115,7 +125,7 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsi
+ 		 * cache aliasing constraints.
+ 		 */
+ 		if (!file_hugepage && (flags & MAP_SHARED) &&
+-		    ((addr - (pgoff << PAGE_SHIFT)) & (SHMLBA - 1)))
++		    ((addr - (pgoff << MMUPAGE_SHIFT)) & (SHMLBA - 1)))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -146,10 +156,10 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsi
+ 	info.high_limit = min(task_size, VA_EXCLUDE_START);
+ 	info.align_mask = get_align_mask(filp, flags);
+ 	if (!file_hugepage)
+-		info.align_offset = pgoff << PAGE_SHIFT;
++		info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	addr = vm_unmapped_area(&info);
+ 
+-	if ((addr & ~PAGE_MASK) && task_size > VA_EXCLUDE_END) {
++	if ((addr & ~MMUPAGE_MASK) && task_size > VA_EXCLUDE_END) {
+ 		VM_BUG_ON(addr != -ENOMEM);
+ 		info.low_limit = VA_EXCLUDE_END;
+ 		info.high_limit = task_size;
+@@ -183,7 +193,7 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
+ 		 * cache aliasing constraints.
+ 		 */
+ 		if (!file_hugepage && (flags & MAP_SHARED) &&
+-		    ((addr - (pgoff << PAGE_SHIFT)) & (SHMLBA - 1)))
++		    ((addr - (pgoff << MMUPAGE_SHIFT)) & (SHMLBA - 1)))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -214,7 +224,7 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
+ 	info.high_limit = mm->mmap_base;
+ 	info.align_mask = get_align_mask(filp, flags);
+ 	if (!file_hugepage)
+-		info.align_offset = pgoff << PAGE_SHIFT;
++		info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	addr = vm_unmapped_area(&info);
+ 
+ 	/*
+@@ -223,7 +233,7 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
+ 	 * can happen with large stack limits and large mmap()
+ 	 * allocations.
+ 	 */
+-	if (addr & ~PAGE_MASK) {
++	if (addr & ~MMUPAGE_MASK) {
+ 		VM_BUG_ON(addr != -ENOMEM);
+ 		info.flags = 0;
+ 		info.low_limit = TASK_UNMAPPED_BASE;
+@@ -475,11 +485,11 @@ SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
+ {
+ 	unsigned long retval = -EINVAL;
+ 
+-	if ((off + PAGE_ALIGN(len)) < off)
++	if ((off + MMUPAGE_ALIGN(len)) < off)
+ 		goto out;
+-	if (off & ~PAGE_MASK)
++	if (off & ~MMUPAGE_MASK)
+ 		goto out;
+-	retval = ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
++	retval = ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> MMUPAGE_SHIFT);
+ out:
+ 	return retval;
+ }
+diff --git a/arch/sparc/kernel/tsb.S b/arch/sparc/kernel/tsb.S
+index eaed39ce8938..6baa81295f28 100644
+--- a/arch/sparc/kernel/tsb.S
++++ b/arch/sparc/kernel/tsb.S
+@@ -31,16 +31,16 @@
+ tsb_miss_dtlb:
+ 	mov		TLB_TAG_ACCESS, %g4
+ 	ldxa		[%g4] ASI_DMMU, %g4
+-	srlx		%g4, PAGE_SHIFT, %g4
++	srlx		%g4, MMUPAGE_SHIFT, %g4
+ 	ba,pt		%xcc, tsb_miss_page_table_walk
+-	 sllx		%g4, PAGE_SHIFT, %g4
++	 sllx		%g4, MMUPAGE_SHIFT, %g4
+ 
+ tsb_miss_itlb:
+ 	mov		TLB_TAG_ACCESS, %g4
+ 	ldxa		[%g4] ASI_IMMU, %g4
+-	srlx		%g4, PAGE_SHIFT, %g4
++	srlx		%g4, MMUPAGE_SHIFT, %g4
+ 	ba,pt		%xcc, tsb_miss_page_table_walk
+-	 sllx		%g4, PAGE_SHIFT, %g4
++	 sllx		%g4, MMUPAGE_SHIFT, %g4
+ 
+ 	/* At this point we have:
+ 	 * %g1 --	PAGE_SIZE TSB entry address
+@@ -275,8 +275,8 @@ tsb_do_dtlb_fault:
+ 	.previous
+ 
+ 	/* Clear context ID bits.  */
+-	srlx		%g5, PAGE_SHIFT, %g5
+-	sllx		%g5, PAGE_SHIFT, %g5
++	srlx		%g5, MMUPAGE_SHIFT, %g5
++	sllx		%g5, MMUPAGE_SHIFT, %g5
+ 
+ 	be,pt	%xcc, sparc64_realfault_common
+ 	 mov	FAULT_CODE_DTLB, %g4
+diff --git a/arch/sparc/lib/copy_page.S b/arch/sparc/lib/copy_page.S
+index 7a041f3ebc58..dbe3834a41c2 100644
+--- a/arch/sparc/lib/copy_page.S
++++ b/arch/sparc/lib/copy_page.S
+@@ -27,12 +27,20 @@
+ 
+ #define	DCACHE_SIZE	(PAGE_SIZE * 2)
+ 
+-#if (PAGE_SHIFT == 13)
++/*
++ * PAGE_SIZE_REM = PAGE_SIZE mod 0xC0 (192).  The copy loop processes
++ * 3 x 64-byte blocks per iteration; the remainder is handled in the
++ * epilogue.  Values that yield 0x80 use a 2-block epilogue; 0x100
++ * uses a 4-block epilogue.
++ */
++#if (PAGE_SIZE % 192) == 128
+ #define PAGE_SIZE_REM	0x80
+-#elif (PAGE_SHIFT == 16)
++#elif (PAGE_SIZE % 192) == 64
++/* PAGE_SHIFT==16 (64K): 65536 mod 192 = 64, but the original code
++ * used 0x100 with a 4-block epilogue.  Preserve that. */
+ #define PAGE_SIZE_REM	0x100
+ #else
+-#error Wrong PAGE_SHIFT specified
++#error PAGE_SIZE not supported by copy_page loop structure
+ #endif
+ 
+ #define TOUCH(reg0, reg1, reg2, reg3, reg4, reg5, reg6, reg7)	\
+@@ -201,7 +209,7 @@ cheetah_copy_page_insn:
+ 	cmp		%o2, PAGE_SIZE_REM
+ 	bne,pt		%xcc, 1b
+ 	 add		%o0, 0x40, %o0
+-#if (PAGE_SHIFT == 16)
++#if (PAGE_SIZE_REM == 0x100)
+ 	TOUCH(f0, f2, f4, f6, f8, f10, f12, f14)
+ 	ldda		[%o1] ASI_BLK_P, %f32
+ 	stda		%f48, [%o0] %asi
+diff --git a/arch/sparc/mm/fault_64.c b/arch/sparc/mm/fault_64.c
+index e326caf708c6..c9b6ed13bbbd 100644
+--- a/arch/sparc/mm/fault_64.c
++++ b/arch/sparc/mm/fault_64.c
+@@ -465,7 +465,7 @@ asmlinkage void __kprobes do_sparc64_fault(struct pt_regs *regs)
+ lock_released:
+ 	mm_rss = get_mm_rss(mm);
+ #if defined(CONFIG_TRANSPARENT_HUGEPAGE)
+-	mm_rss -= (mm->context.thp_pte_count * (HPAGE_SIZE / PAGE_SIZE));
++	mm_rss -= (mm->context.thp_pte_count * (HPAGE_SIZE / MMUPAGE_SIZE));
+ #endif
+ 	if (unlikely(mm_rss >
+ 		     mm->context.tsb_block[MM_TSB_BASE].tsb_rss_limit))
+diff --git a/arch/sparc/mm/hugetlbpage.c b/arch/sparc/mm/hugetlbpage.c
+index 4652e868663b..0d5c1ecde6f2 100644
+--- a/arch/sparc/mm/hugetlbpage.c
++++ b/arch/sparc/mm/hugetlbpage.c
+@@ -127,7 +127,7 @@ static unsigned int sun4v_huge_tte_to_shift(pte_t entry)
+ 		shift = HPAGE_64K_SHIFT;
+ 		break;
+ 	default:
+-		shift = PAGE_SHIFT;
++		shift = MMUPAGE_SHIFT;
+ 		break;
+ 	}
+ 	return shift;
+@@ -149,7 +149,7 @@ static unsigned int sun4u_huge_tte_to_shift(pte_t entry)
+ 		shift = HPAGE_64K_SHIFT;
+ 		break;
+ 	default:
+-		shift = PAGE_SHIFT;
++		shift = MMUPAGE_SHIFT;
+ 		break;
+ 	}
+ 	return shift;
+diff --git a/arch/sparc/mm/hypersparc.S b/arch/sparc/mm/hypersparc.S
+index 6c2521e85a42..0c05fdf8274c 100644
+--- a/arch/sparc/mm/hypersparc.S
++++ b/arch/sparc/mm/hypersparc.S
+@@ -90,10 +90,10 @@ hypersparc_flush_cache_range:
+ 	ld	[%g2 + %lo(vac_cache_size)], %o3
+ 
+ 	/* Here comes the fun part... */
+-	add	%o2, (PAGE_SIZE - 1), %o2
+-	andn	%o1, (PAGE_SIZE - 1), %o1
++	add	%o2, (MMUPAGE_SIZE - 1), %o2
++	andn	%o1, (MMUPAGE_SIZE - 1), %o1
+ 	add	%o4, %o4, %o5
+-	andn	%o2, (PAGE_SIZE - 1), %o2
++	andn	%o2, (MMUPAGE_SIZE - 1), %o2
+ 	add	%o4, %o5, %g1
+ 	sub	%o2, %o1, %g4
+ 	add	%o4, %g1, %g2
+@@ -128,7 +128,7 @@ hypersparc_flush_cache_range:
+ 	mov	SRMMU_CTX_REG, %g7
+ 	lda	[%g7] ASI_M_MMUREGS, %o3
+ 	sta	%o0, [%g7] ASI_M_MMUREGS
+-	add	%o2, -PAGE_SIZE, %o0
++	add	%o2, -MMUPAGE_SIZE, %o0
+ 1:
+ 	or	%o0, 0x400, %g7
+ 	lda	[%g7] ASI_M_FLUSH_PROBE, %g7
+@@ -151,7 +151,7 @@ hypersparc_flush_cache_range:
+ 3:
+ 	cmp	%o2, %o1
+ 	bne	1b
+-	 add	%o2, -PAGE_SIZE, %o0
++	 add	%o2, -MMUPAGE_SIZE, %o0
+ 	mov	SRMMU_FAULT_STATUS, %g5
+ 	lda	[%g5] ASI_M_MMUREGS, %g0
+ 	mov	SRMMU_CTX_REG, %g7
+@@ -176,7 +176,7 @@ hypersparc_flush_cache_page:
+ 	sethi	%hi(vac_line_size), %g1
+ 	ld	[%g1 + %lo(vac_line_size)], %o4
+ 	mov	SRMMU_CTX_REG, %o3
+-	andn	%o1, (PAGE_SIZE - 1), %o1
++	andn	%o1, (MMUPAGE_SIZE - 1), %o1
+ 	lda	[%o3] ASI_M_MMUREGS, %o2
+ 	sta	%g2, [%o3] ASI_M_MMUREGS
+ 	or	%o1, 0x400, %o5
+@@ -184,7 +184,7 @@ hypersparc_flush_cache_page:
+ 	orcc	%g0, %g1, %g0
+ 	be	2f
+ 	 add	%o4, %o4, %o5
+-	sub	%o1, -PAGE_SIZE, %o1
++	sub	%o1, -MMUPAGE_SIZE, %o1
+ 	add	%o4, %o5, %g1
+ 	add	%o4, %g1, %g2
+ 	add	%o4, %g2, %g3
+@@ -223,7 +223,7 @@ hypersparc_flush_sig_insns:
+ hypersparc_flush_page_to_ram:
+ 	sethi	%hi(vac_line_size), %g1
+ 	ld	[%g1 + %lo(vac_line_size)], %o4
+-	andn	%o0, (PAGE_SIZE - 1), %o0
++	andn	%o0, (MMUPAGE_SIZE - 1), %o0
+ 	add	%o4, %o4, %o5
+ 	or	%o0, 0x400, %g7
+ 	lda	[%g7] ASI_M_FLUSH_PROBE, %g5
+@@ -232,7 +232,7 @@ hypersparc_flush_page_to_ram:
+ 	be	2f
+ 	 add	%o4, %g1, %g2
+ 	add	%o4, %g2, %g3
+-	sub	%o0, -PAGE_SIZE, %o0
++	sub	%o0, -MMUPAGE_SIZE, %o0
+ 	add	%o4, %g3, %g4
+ 	add	%o4, %g4, %g5
+ 	add	%o4, %g5, %g7
+@@ -312,7 +312,7 @@ hypersparc_flush_tlb_page:
+ 	ld	[%o0 + VMA_VM_MM], %o0
+ 	mov	SRMMU_CTX_REG, %g1
+ 	ld	[%o0 + AOFF_mm_context], %o3
+-	andn	%o1, (PAGE_SIZE - 1), %o1
++	andn	%o1, (MMUPAGE_SIZE - 1), %o1
+ #ifndef CONFIG_SMP
+ 	cmp	%o3, -1
+ 	be	hypersparc_flush_tlb_page_out
+diff --git a/arch/sparc/mm/init_64.c b/arch/sparc/mm/init_64.c
+index 367c269305e5..3e7f9540aeed 100644
+--- a/arch/sparc/mm/init_64.c
++++ b/arch/sparc/mm/init_64.c
+@@ -330,10 +330,34 @@ static void __update_mmu_tsb_insert(struct mm_struct *mm, unsigned long tsb_inde
+ #ifdef CONFIG_HUGETLB_PAGE
+ static int __init hugetlbpage_init(void)
+ {
+-	hugetlb_add_hstate(HPAGE_64K_SHIFT - PAGE_SHIFT);
+-	hugetlb_add_hstate(HPAGE_SHIFT - PAGE_SHIFT);
+-	hugetlb_add_hstate(HPAGE_256MB_SHIFT - PAGE_SHIFT);
+-	hugetlb_add_hstate(HPAGE_2GB_SHIFT - PAGE_SHIFT);
++	/*
++	 * mm/hugetlb.c BUG_ONs hugetlb_add_hstate with order <
++	 * order_base_2(__NR_USED_SUBPAGE) (== 2): a hstate must have
++	 * at least __NR_USED_SUBPAGE sub-pages for tail-page bookkeeping.
++	 * Under PGCL (PAGE_SHIFT = MMUPAGE_SHIFT + CONFIG_PAGE_MMUSHIFT)
++	 * the kernel PAGE can grow past a given HPAGE_*_SHIFT, in which
++	 * case the corresponding hstate has too few (or zero) sub-pages.
++	 *
++	 * Concretely on sparc64 (MMUPAGE_SHIFT == 13):
++	 *   PGCL=2 (PAGE_SHIFT=15) HPAGE_64K_SHIFT - PAGE_SHIFT = 1 → BUG
++	 *   PGCL=4 (PAGE_SHIFT=17) HPAGE_64K_SHIFT - PAGE_SHIFT < 0 (handled
++	 *     by the existing > PAGE_SHIFT gate)
++	 * The larger sizes are safe up to PGCL=6 today, but apply the
++	 * same guard uniformly so future PGCL bumps are not load-bearing
++	 * for these arithmetic margins.
++	 */
++#define ADD_HSTATE_IF_FITS(shift) do {					\
++	int __order = (int)(shift) - PAGE_SHIFT;			\
++	if (__order >= order_base_2(__NR_USED_SUBPAGE))			\
++		hugetlb_add_hstate(__order);				\
++} while (0)
++
++	ADD_HSTATE_IF_FITS(HPAGE_64K_SHIFT);
++	ADD_HSTATE_IF_FITS(HPAGE_SHIFT);
++	ADD_HSTATE_IF_FITS(HPAGE_256MB_SHIFT);
++	ADD_HSTATE_IF_FITS(HPAGE_2GB_SHIFT);
++
++#undef ADD_HSTATE_IF_FITS
+ 
+ 	return 0;
+ }
+@@ -412,7 +436,7 @@ void update_mmu_cache_range(struct vm_fault *vmf, struct vm_area_struct *vma,
+ 	is_huge_tsb = false;
+ #if defined(CONFIG_HUGETLB_PAGE) || defined(CONFIG_TRANSPARENT_HUGEPAGE)
+ 	if (mm->context.hugetlb_pte_count || mm->context.thp_pte_count) {
+-		unsigned long hugepage_size = PAGE_SIZE;
++		unsigned long hugepage_size = MMUPAGE_SIZE;
+ 
+ 		if (is_vm_hugetlb_page(vma))
+ 			hugepage_size = huge_page_size(hstate_vma(vma));
+@@ -440,11 +464,24 @@ void update_mmu_cache_range(struct vm_fault *vmf, struct vm_area_struct *vma,
+ 	}
+ #endif
+ 	if (!is_huge_tsb) {
+-		for (i = 0; i < nr; i++) {
+-			__update_mmu_tsb_insert(mm, MM_TSB_BASE, PAGE_SHIFT,
++		if (nr == 1) {
++			/* Single PTE: only one MMUPAGE has a page table entry */
++			__update_mmu_tsb_insert(mm, MM_TSB_BASE, MMUPAGE_SHIFT,
+ 						address, pte_val(pte));
+-			address += PAGE_SIZE;
+-			pte_val(pte) += PAGE_SIZE;
++		} else {
++			/*
++			 * nr is the number of PTEs (MMUPAGE-granular) that
++			 * exist in the page table.  Insert one TSB entry per
++			 * PTE.  Do NOT multiply by PAGE_MMUCOUNT — callers
++			 * already pass the MMUPAGE count.
++			 */
++			for (i = 0; i < nr; i++) {
++				__update_mmu_tsb_insert(mm, MM_TSB_BASE,
++							MMUPAGE_SHIFT,
++							address, pte_val(pte));
++				address += MMUPAGE_SIZE;
++				pte_val(pte) += MMUPAGE_SIZE;
++			}
+ 		}
+ 	}
+ 
+@@ -2490,10 +2527,26 @@ static void __init register_page_bootmem_info(void)
+ 
+ void __init arch_setup_zero_pages(void)
+ {
++#if PAGE_MMUSHIFT > 0
++	/*
++	 * PGCL: the static empty_zero_page buffer is only MMUPAGE_SIZE
++	 * aligned (assembler limit on some arches forced relaxation in
++	 * mm_init.c).  Using its symbol address would yield a struct
++	 * page covering a kernel page that also contains adjacent BSS
++	 * data, leaking it through the zero-page mapping.  Allocate a
++	 * fresh PAGE_SIZE-aligned zero page from memblock instead.
++	 */
++	void *z = memblock_alloc(PAGE_SIZE, PAGE_SIZE);
++
++	if (!z)
++		panic("Failed to allocate zero page");
++	__zero_page = virt_to_page(z);
++#else
+ 	phys_addr_t zero_page_pa = kern_base +
+ 		((unsigned long)&empty_zero_page[0] - KERNBASE);
+ 
+ 	__zero_page = phys_to_page(zero_page_pa);
++#endif
+ }
+ 
+ void __init mem_init(void)
+@@ -3105,7 +3158,14 @@ void copy_user_highpage(struct page *to, struct page *from,
+ 
+ 	vfrom = kmap_atomic(from);
+ 	vto = kmap_atomic(to);
++#if PAGE_MMUSHIFT > 0
++	/* TLBTEMP TLB entry maps MMUPAGE_SIZE, can't cover full PAGE_SIZE.
++	 * Use regular copy_page; D-cache flush handled by set_pte_at.
++	 */
++	copy_page(vto, vfrom);
++#else
+ 	copy_user_page(vto, vfrom, vaddr, to);
++#endif
+ 	kunmap_atomic(vto);
+ 	kunmap_atomic(vfrom);
+ 
+diff --git a/arch/sparc/mm/swift.S b/arch/sparc/mm/swift.S
+index f414bfd8d899..f9a056a843f1 100644
+--- a/arch/sparc/mm/swift.S
++++ b/arch/sparc/mm/swift.S
+@@ -132,7 +132,7 @@ swift_flush_cache_page:
+ 	lda	[%g7] ASI_M_MMUREGS, %g5
+ 	sta	%g2, [%g7] ASI_M_MMUREGS
+ 
+-	andn	%o1, (PAGE_SIZE - 1), %o1
++	andn	%o1, (MMUPAGE_SIZE - 1), %o1
+ #if 1
+ 	sethi	%hi(0x1000), %o0
+ 1:	subcc	%o0, 0x10, %o0
+@@ -178,7 +178,7 @@ swift_flush_cache_page_out:
+ 	.globl	swift_flush_page_to_ram
+ swift_flush_page_for_dma:
+ swift_flush_page_to_ram:
+-	andn	%o0, (PAGE_SIZE - 1), %o1
++	andn	%o0, (MMUPAGE_SIZE - 1), %o1
+ #if 1
+ 	sethi	%hi(0x1000), %o0
+ 1:	subcc	%o0, 0x10, %o0
+@@ -237,7 +237,7 @@ swift_flush_tlb_page:
+ 	ld	[%o0 + VMA_VM_MM], %o0
+ 	mov	SRMMU_CTX_REG, %g1
+ 	ld	[%o0 + AOFF_mm_context], %o3
+-	andn	%o1, (PAGE_SIZE - 1), %o1
++	andn	%o1, (MMUPAGE_SIZE - 1), %o1
+ 	cmp	%o3, -1
+ 	be	swift_flush_tlb_page_out
+ 	 nop
+diff --git a/arch/sparc/mm/tlb.c b/arch/sparc/mm/tlb.c
+index 6d9dd5eb1328..3b0e87b5a5d1 100644
+--- a/arch/sparc/mm/tlb.c
++++ b/arch/sparc/mm/tlb.c
+@@ -81,7 +81,7 @@ static void tlb_batch_add_one(struct mm_struct *mm, unsigned long vaddr,
+ 	struct tlb_batch *tb = &get_cpu_var(tlb_batch);
+ 	unsigned long nr;
+ 
+-	vaddr &= PAGE_MASK;
++	vaddr &= MMUPAGE_MASK;
+ 	if (exec)
+ 		vaddr |= 0x1UL;
+ 
+@@ -167,10 +167,10 @@ static void tlb_batch_pmd_scan(struct mm_struct *mm, unsigned long vaddr,
+ 		if (pte_val(*pte) & _PAGE_VALID) {
+ 			bool exec = pte_exec(*pte);
+ 
+-			tlb_batch_add_one(mm, vaddr, exec, PAGE_SHIFT);
++			tlb_batch_add_one(mm, vaddr, exec, MMUPAGE_SHIFT);
+ 		}
+ 		pte++;
+-		vaddr += PAGE_SIZE;
++		vaddr += MMUPAGE_SIZE;
+ 	}
+ 	pte_unmap(pte);
+ }
+diff --git a/arch/sparc/mm/tsb.c b/arch/sparc/mm/tsb.c
+index 5fe52a64c7e7..12a2e3b3a187 100644
+--- a/arch/sparc/mm/tsb.c
++++ b/arch/sparc/mm/tsb.c
+@@ -53,11 +53,11 @@ void flush_tsb_kernel_range(unsigned long start, unsigned long end)
+ {
+ 	unsigned long v;
+ 
+-	if ((end - start) >> PAGE_SHIFT >= 2 * KERNEL_TSB_NENTRIES)
++	if ((end - start) >> MMUPAGE_SHIFT >= 2 * KERNEL_TSB_NENTRIES)
+ 		return flush_tsb_kernel_range_scan(start, end);
+ 
+-	for (v = start; v < end; v += PAGE_SIZE) {
+-		unsigned long hash = tsb_hash(v, PAGE_SHIFT,
++	for (v = start; v < end; v += MMUPAGE_SIZE) {
++		unsigned long hash = tsb_hash(v, MMUPAGE_SHIFT,
+ 					      KERNEL_TSB_NENTRIES);
+ 		struct tsb *ent = &swapper_tsb[hash];
+ 
+@@ -128,11 +128,11 @@ void flush_tsb_user(struct tlb_batch *tb)
+ 		nentries = mm->context.tsb_block[MM_TSB_BASE].tsb_nentries;
+ 		if (tlb_type == cheetah_plus || tlb_type == hypervisor)
+ 			base = __pa(base);
+-		if (tb->hugepage_shift == PAGE_SHIFT)
+-			__flush_tsb_one(tb, PAGE_SHIFT, base, nentries);
++		if (tb->hugepage_shift == MMUPAGE_SHIFT)
++			__flush_tsb_one(tb, MMUPAGE_SHIFT, base, nentries);
+ #if defined(CONFIG_HUGETLB_PAGE)
+ 		else
+-			__flush_huge_tsb_one(tb, PAGE_SHIFT, base, nentries,
++			__flush_huge_tsb_one(tb, MMUPAGE_SHIFT, base, nentries,
+ 					     tb->hugepage_shift);
+ #endif
+ 	}
+@@ -161,12 +161,12 @@ void flush_tsb_user_page(struct mm_struct *mm, unsigned long vaddr,
+ 		nentries = mm->context.tsb_block[MM_TSB_BASE].tsb_nentries;
+ 		if (tlb_type == cheetah_plus || tlb_type == hypervisor)
+ 			base = __pa(base);
+-		if (hugepage_shift == PAGE_SHIFT)
+-			__flush_tsb_one_entry(base, vaddr, PAGE_SHIFT,
++		if (hugepage_shift == MMUPAGE_SHIFT)
++			__flush_tsb_one_entry(base, vaddr, MMUPAGE_SHIFT,
+ 					      nentries);
+ #if defined(CONFIG_HUGETLB_PAGE)
+ 		else
+-			__flush_huge_tsb_one_entry(base, vaddr, PAGE_SHIFT,
++			__flush_huge_tsb_one_entry(base, vaddr, MMUPAGE_SHIFT,
+ 						   nentries, hugepage_shift);
+ #endif
+ 	}
+@@ -508,7 +508,7 @@ void tsb_grow(struct mm_struct *mm, unsigned long tsb_index, unsigned long rss)
+ 		}
+ 		copy_tsb(old_tsb_base, old_size, new_tsb_base, new_size,
+ 			tsb_index == MM_TSB_BASE ?
+-			PAGE_SHIFT : REAL_HPAGE_SHIFT);
++			MMUPAGE_SHIFT : REAL_HPAGE_SHIFT);
+ 	}
+ 
+ 	mm->context.tsb_block[tsb_index].tsb = new_tsb;
+@@ -559,7 +559,7 @@ int init_new_context(struct task_struct *tsk, struct mm_struct *mm)
+ 	mm->context.hugetlb_pte_count = 0;
+ 	mm->context.thp_pte_count = 0;
+ 
+-	mm_rss -= saved_thp_pte_count * (HPAGE_SIZE / PAGE_SIZE);
++	mm_rss -= saved_thp_pte_count * (HPAGE_SIZE / MMUPAGE_SIZE);
+ #endif
+ 
+ 	/* copy_mm() copies over the parent's mm_struct before calling
+diff --git a/arch/sparc/mm/tsunami.S b/arch/sparc/mm/tsunami.S
+index 62b742df65dc..4126ae15bbec 100644
+--- a/arch/sparc/mm/tsunami.S
++++ b/arch/sparc/mm/tsunami.S
+@@ -69,7 +69,7 @@ tsunami_flush_tlb_page:
+ 	ld	[%o0 + VMA_VM_MM], %o0
+ 	mov	SRMMU_CTX_REG, %g1
+ 	ld	[%o0 + AOFF_mm_context], %o3
+-	andn	%o1, (PAGE_SIZE - 1), %o1
++	andn	%o1, (MMUPAGE_SIZE - 1), %o1
+ 	cmp	%o3, -1
+ 	be	tsunami_flush_tlb_page_out
+ 	 lda	[%g1] ASI_M_MMUREGS, %g5
+@@ -96,7 +96,7 @@ tsunami_flush_tlb_page_out:
+ 
+ tsunami_copy_1page:
+ /* NOTE: This routine has to be shorter than 70insns --jj */
+-	or	%g0, (PAGE_SIZE >> 8), %g1
++	or	%g0, (MMUPAGE_SIZE >> 8), %g1
+ 1:
+ 	MIRROR_BLOCK(%o0, %o1, 0x00, %o2, %o3, %o4, %o5)
+ 	MIRROR_BLOCK(%o0, %o1, 0x20, %o2, %o3, %o4, %o5)
+diff --git a/arch/sparc/mm/ultra.S b/arch/sparc/mm/ultra.S
+index 70e658d107e0..f1d89b68093a 100644
+--- a/arch/sparc/mm/ultra.S
++++ b/arch/sparc/mm/ultra.S
+@@ -121,7 +121,7 @@ __flush_tlb_kernel_range:	/* 31 insns */
+ 	 sub		%o1, %o0, %o3
+ 	srlx		%o3, 18, %o4
+ 	brnz,pn		%o4, __spitfire_flush_tlb_kernel_range_slow
+-	 sethi		%hi(PAGE_SIZE), %o4
++	 sethi		%hi(MMUPAGE_SIZE), %o4
+ 	sub		%o3, %o4, %o3
+ 	or		%o0, 0x20, %o0		! Nucleus
+ 1:	stxa		%g0, [%o0 + %o3] ASI_DMMU_DEMAP
+@@ -193,7 +193,7 @@ __flush_icache_page:	/* %o0 = phys_page */
+ 	srlx		%o0, PAGE_SHIFT, %o0
+ 	sethi		%hi(PAGE_OFFSET), %g1
+ 	sllx		%o0, PAGE_SHIFT, %o0
+-	sethi		%hi(PAGE_SIZE), %g2
++	sethi		%hi(MMUPAGE_SIZE), %g2
+ 	ldx		[%g1 + %lo(PAGE_OFFSET)], %g1
+ 	add		%o0, %g1, %o0
+ 1:	subcc		%g2, 32, %g2
+@@ -204,8 +204,8 @@ __flush_icache_page:	/* %o0 = phys_page */
+ 
+ #ifdef DCACHE_ALIASING_POSSIBLE
+ 
+-#if (PAGE_SHIFT != 13)
+-#error only page shift of 13 is supported by dcache flush
++#if (MMUPAGE_SHIFT != 13)
++#error only MMU page shift of 13 is supported by dcache flush
+ #endif
+ 
+ #define DTAG_MASK 0x3
+@@ -330,7 +330,7 @@ __cheetah_flush_tlb_kernel_range:	/* 31 insns */
+ 	 sub		%o1, %o0, %o3
+ 	srlx		%o3, 18, %o4
+ 	brnz,pn		%o4, 3f
+-	 sethi		%hi(PAGE_SIZE), %o4
++	 sethi		%hi(MMUPAGE_SIZE), %o4
+ 	sub		%o3, %o4, %o3
+ 	or		%o0, 0x20, %o0		! Nucleus
+ 1:	stxa		%g0, [%o0 + %o3] ASI_DMMU_DEMAP
+@@ -362,7 +362,7 @@ __cheetah_flush_dcache_page: /* 11 insns */
+ 	sethi		%hi(PAGE_OFFSET), %g1
+ 	ldx		[%g1 + %lo(PAGE_OFFSET)], %g1
+ 	sub		%o0, %g1, %o0
+-	sethi		%hi(PAGE_SIZE), %o4
++	sethi		%hi(MMUPAGE_SIZE), %o4
+ 1:	subcc		%o4, (1 << 5), %o4
+ 	stxa		%g0, [%o0 + %o4] ASI_DCACHE_INVALIDATE
+ 	membar		#Sync
+@@ -465,7 +465,7 @@ __hypervisor_flush_tlb_kernel_range: /* 31 insns */
+ 	srlx		%g2, 18, %g3
+ 	brnz,pn		%g3, 4f
+ 	 mov		%o0, %g1
+-	sethi		%hi(PAGE_SIZE), %g3
++	sethi		%hi(MMUPAGE_SIZE), %g3
+ 	sub		%g2, %g3, %g2
+ 1:	add		%g1, %g2, %o0	/* ARG0: virtual address */
+ 	mov		0, %o1		/* ARG1: mmu context */
+@@ -580,14 +580,14 @@ xcall_flush_tlb_page:	/* 20 insns */
+ 
+ 	.globl		xcall_flush_tlb_kernel_range
+ xcall_flush_tlb_kernel_range:	/* 44 insns */
+-	sethi		%hi(PAGE_SIZE - 1), %g2
+-	or		%g2, %lo(PAGE_SIZE - 1), %g2
++	sethi		%hi(MMUPAGE_SIZE - 1), %g2
++	or		%g2, %lo(MMUPAGE_SIZE - 1), %g2
+ 	andn		%g1, %g2, %g1
+ 	andn		%g7, %g2, %g7
+ 	sub		%g7, %g1, %g3
+ 	srlx		%g3, 18, %g2
+ 	brnz,pn		%g2, 2f
+-	 sethi		%hi(PAGE_SIZE), %g2
++	 sethi		%hi(MMUPAGE_SIZE), %g2
+ 	sub		%g3, %g2, %g3
+ 	or		%g1, 0x20, %g1		! Nucleus
+ 1:	stxa		%g0, [%g1 + %g3] ASI_DMMU_DEMAP
+@@ -744,14 +744,14 @@ xcall_fetch_glob_pmu_n4:
+ 	retry
+ 
+ __cheetah_xcall_flush_tlb_kernel_range:	/* 44 insns */
+-	sethi		%hi(PAGE_SIZE - 1), %g2
+-	or		%g2, %lo(PAGE_SIZE - 1), %g2
++	sethi		%hi(MMUPAGE_SIZE - 1), %g2
++	or		%g2, %lo(MMUPAGE_SIZE - 1), %g2
+ 	andn		%g1, %g2, %g1
+ 	andn		%g7, %g2, %g7
+ 	sub		%g7, %g1, %g3
+ 	srlx		%g3, 18, %g2
+ 	brnz,pn		%g2, 2f
+-	 sethi		%hi(PAGE_SIZE), %g2
++	 sethi		%hi(MMUPAGE_SIZE), %g2
+ 	sub		%g3, %g2, %g3
+ 	or		%g1, 0x20, %g1		! Nucleus
+ 1:	stxa		%g0, [%g1 + %g3] ASI_DMMU_DEMAP
+@@ -793,7 +793,7 @@ __cheetah_xcall_flush_tlb_kernel_range:	/* 44 insns */
+ 	.align		32
+ 	.globl		xcall_flush_dcache_page_cheetah
+ xcall_flush_dcache_page_cheetah: /* %g1 == physical page address */
+-	sethi		%hi(PAGE_SIZE), %g3
++	sethi		%hi(MMUPAGE_SIZE), %g3
+ 1:	subcc		%g3, (1 << 5), %g3
+ 	stxa		%g0, [%g1 + %g3] ASI_DCACHE_INVALIDATE
+ 	membar		#Sync
+@@ -827,7 +827,7 @@ xcall_flush_dcache_page_spitfire: /* %g1 == physical page address
+ 
+ 	brz,pn		%g5, 2f
+ #endif /* DCACHE_ALIASING_POSSIBLE */
+-	 sethi		%hi(PAGE_SIZE), %g3
++	 sethi		%hi(MMUPAGE_SIZE), %g3
+ 
+ 1:	flush		%g7
+ 	subcc		%g3, (1 << 5), %g3
+@@ -906,8 +906,8 @@ __hypervisor_xcall_flush_tlb_page: /* 20 insns */
+ 	.globl		__hypervisor_xcall_flush_tlb_kernel_range
+ __hypervisor_xcall_flush_tlb_kernel_range: /* 44 insns */
+ 	/* %g1=start, %g7=end, g2,g3,g4,g5,g6=scratch */
+-	sethi		%hi(PAGE_SIZE - 1), %g2
+-	or		%g2, %lo(PAGE_SIZE - 1), %g2
++	sethi		%hi(MMUPAGE_SIZE - 1), %g2
++	or		%g2, %lo(MMUPAGE_SIZE - 1), %g2
+ 	andn		%g1, %g2, %g1
+ 	andn		%g7, %g2, %g7
+ 	sub		%g7, %g1, %g3
+@@ -925,7 +925,7 @@ __hypervisor_xcall_flush_tlb_kernel_range: /* 44 insns */
+ 	mov		HV_MMU_UNMAP_ADDR_TRAP, %g6
+ 	brnz,pn		%o0, 1f
+ 	 mov		%o0, %g5
+-	sethi		%hi(PAGE_SIZE), %o2
++	sethi		%hi(MMUPAGE_SIZE), %o2
+ 	brnz,pt		%g3, 1b
+ 	 sub		%g3, %o2, %g3
+ 5:	mov		%g2, %o0
+diff --git a/arch/sparc/mm/viking.S b/arch/sparc/mm/viking.S
+index 48f062de7a7f..5d4d3c5e6331 100644
+--- a/arch/sparc/mm/viking.S
++++ b/arch/sparc/mm/viking.S
+@@ -41,11 +41,11 @@ viking_flush_page:
+ 	srl	%g3, 12, %g1		! ppage >> 12
+ 
+ 	clr	%o1			! set counter, 0 - 127
+-	sethi	%hi(PAGE_OFFSET + PAGE_SIZE - 0x80000000), %o3
++	sethi	%hi(PAGE_OFFSET + MMUPAGE_SIZE - 0x80000000), %o3
+ 	sethi	%hi(0x80000000), %o4
+ 	sethi	%hi(VIKING_PTAG_VALID), %o5
+-	sethi	%hi(2*PAGE_SIZE), %o0
+-	sethi	%hi(PAGE_SIZE), %g7
++	sethi	%hi(2*MMUPAGE_SIZE), %o0
++	sethi	%hi(MMUPAGE_SIZE), %g7
+ 	clr	%o2			! block counter, 0 - 3
+ 5:
+ 	sll	%o1, 5, %g4
+@@ -61,7 +61,7 @@ viking_flush_page:
+ 
+ 	andcc	%g2, %o5, %g0		! ptag VALID?
+ 	be	7f
+-	 add	%g4, %o3, %g2		! (PAGE_OFFSET + PAGE_SIZE) | (set << 5)
++	 add	%g4, %o3, %g2		! (PAGE_OFFSET + MMUPAGE_SIZE) | (set << 5)
+ 	ld	[%g2], %g3
+ 	ld	[%g2 + %g7], %g3
+ 	add	%g2, %o0, %g2
+@@ -91,7 +91,7 @@ viking_flush_page:
+ viking_mxcc_flush_page:
+ 	sethi	%hi(PAGE_OFFSET), %g2
+ 	sub	%o0, %g2, %g3
+-	sub	%g3, -PAGE_SIZE, %g3		! ppage + PAGE_SIZE
++	sub	%g3, -MMUPAGE_SIZE, %g3		! ppage + MMUPAGE_SIZE
+ 	sethi	%hi(MXCC_SRCSTREAM), %o3	! assume %hi(MXCC_SRCSTREAM) == %hi(MXCC_DESTSTREAM)
+ 	mov	0x10, %g2			! set cacheable bit
+ 	or	%o3, %lo(MXCC_SRCSTREAM), %o2
+diff --git a/arch/sparc/vdso/vma.c b/arch/sparc/vdso/vma.c
+index 60029d60f4d3..afe83fe64c4c 100644
+--- a/arch/sparc/vdso/vma.c
++++ b/arch/sparc/vdso/vma.c
+@@ -47,15 +47,21 @@ static int __init init_vdso_image(const struct vdso_image *image,
+ 				  struct vm_special_mapping *vdso_mapping,
+ 				  bool elf64)
+ {
+-	int cnpages = (image->size) / PAGE_SIZE;
++	/*
++	 * With PGCL, PAGE_SIZE > MMUPAGE_SIZE.  The vDSO image is sized in
++	 * MMUPAGE units (hardware pages), so use MMUPAGE_SIZE throughout.
++	 * Multiple MMUPAGE slots may share the same kernel page.
++	 */
++	int cnpages = (image->size) / MMUPAGE_SIZE;
++	int knpages = DIV_ROUND_UP(image->size, PAGE_SIZE);
+ 	struct page *cp, **cpp = NULL;
+ 	int i;
+ 
+ 	/*
+ 	 * First, the vdso text.  This is initialied data, an integral number of
+-	 * pages long.
++	 * MMU pages long.
+ 	 */
+-	if (WARN_ON(image->size % PAGE_SIZE != 0))
++	if (WARN_ON(image->size % MMUPAGE_SIZE != 0))
+ 		goto oom;
+ 
+ 	cpp = kzalloc_objs(struct page *, cnpages);
+@@ -64,19 +70,35 @@ static int __init init_vdso_image(const struct vdso_image *image,
+ 	if (!cpp)
+ 		goto oom;
+ 
+-	for (i = 0; i < cnpages; i++) {
++	/*
++	 * Allocate kernel pages and copy vDSO data.  Each kernel page holds
++	 * PAGE_MMUCOUNT MMUPAGEs.  Fill the pages[] array so that each
++	 * MMUPAGE slot points to the kernel page containing it.
++	 */
++	for (i = 0; i < knpages; i++) {
++		unsigned long off = (unsigned long)i * PAGE_SIZE;
++		unsigned long len = min_t(unsigned long, PAGE_SIZE,
++					  image->size - off);
++		int j;
++
+ 		cp = alloc_page(GFP_KERNEL);
+ 		if (!cp)
+ 			goto oom;
+-		cpp[i] = cp;
+-		copy_page(page_address(cp), image->data + i * PAGE_SIZE);
++		memcpy(page_address(cp), image->data + off, len);
++		if (len < PAGE_SIZE)
++			memset(page_address(cp) + len, 0, PAGE_SIZE - len);
++
++		/* Point all MMUPAGE slots within this kernel page */
++		for (j = 0; j < PAGE_MMUCOUNT && (i * PAGE_MMUCOUNT + j) < cnpages; j++)
++			cpp[i * PAGE_MMUCOUNT + j] = cp;
+ 	}
+ 
+ 	return 0;
+  oom:
+ 	if (cpp != NULL) {
+ 		for (i = 0; i < cnpages; i++) {
+-			if (cpp[i] != NULL)
++			/* Only free each kernel page once (first slot) */
++			if (cpp[i] != NULL && (i % PAGE_MMUCOUNT == 0))
+ 				__free_page(cpp[i]);
+ 		}
+ 		kfree(cpp);
+@@ -114,7 +136,7 @@ static unsigned long vdso_addr(unsigned long start, unsigned int len)
+ 
+ 	/* This loses some more bits than a modulo, but is cheaper */
+ 	offset = get_random_u32_below(PTRS_PER_PTE);
+-	return start + (offset << PAGE_SHIFT);
++	return start + (offset << MMUPAGE_SHIFT);
+ }
+ 
+ static_assert(VDSO_NR_PAGES == __VDSO_PAGES);
+@@ -122,7 +144,7 @@ static_assert(VDSO_NR_PAGES == __VDSO_PAGES);
+ static int map_vdso(const struct vdso_image *image,
+ 		struct vm_special_mapping *vdso_mapping)
+ {
+-	const size_t area_size = image->size + VDSO_NR_PAGES * PAGE_SIZE;
++	const size_t area_size = image->size + VDSO_NR_PAGES * MMUPAGE_SIZE;
+ 	struct mm_struct *mm = current->mm;
+ 	struct vm_area_struct *vma;
+ 	unsigned long text_start, addr = 0;
+@@ -148,7 +170,7 @@ static int map_vdso(const struct vdso_image *image,
+ 		goto up_fail;
+ 	}
+ 
+-	text_start = addr + VDSO_NR_PAGES * PAGE_SIZE;
++	text_start = addr + VDSO_NR_PAGES * MMUPAGE_SIZE;
+ 	current->mm->context.vdso = (void __user *)text_start;
+ 
+ 	/*
+-- 
+2.54.0
+

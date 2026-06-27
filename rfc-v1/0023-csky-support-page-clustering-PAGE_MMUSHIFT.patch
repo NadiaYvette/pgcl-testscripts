@@ -1,0 +1,268 @@
+From 1b97bf076d565e920fac716ea77a90e9831259ce Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:40 +0200
+Subject: [RFC PATCH 23/28] csky: support page clustering (PAGE_MMUSHIFT)
+
+---
+ arch/csky/abiv1/mmap.c           | 13 +++++++++----
+ arch/csky/abiv2/inc/abi/entry.h  |  8 +++++++-
+ arch/csky/include/asm/pgtable.h  | 18 +++++++++++++++---
+ arch/csky/include/asm/shmparam.h |  2 +-
+ arch/csky/kernel/syscall.c       |  4 ++--
+ arch/csky/mm/fault.c             | 10 +++++++++-
+ arch/csky/mm/init.c              | 25 +++++++++++++++++++++++--
+ arch/csky/mm/tlb.c               | 18 ++++++++++++------
+ 8 files changed, 78 insertions(+), 20 deletions(-)
+
+diff --git a/arch/csky/abiv1/mmap.c b/arch/csky/abiv1/mmap.c
+index 1047865e82a9..e840181bed60 100644
+--- a/arch/csky/abiv1/mmap.c
++++ b/arch/csky/abiv1/mmap.c
+@@ -9,9 +9,14 @@
+ #include <linux/random.h>
+ #include <linux/io.h>
+ 
++/*
++ * pgoff is in MMUPAGE units; colour byte offset is pgoff << MMUPAGE_SHIFT.
++ * Under page clustering (PAGE_MMUSHIFT > 0) PAGE_SIZE > MMUPAGE_SIZE, so
++ * PAGE_SHIFT would miscompute the colour.
++ */
+ #define COLOUR_ALIGN(addr,pgoff)		\
+ 	((((addr)+SHMLBA-1)&~(SHMLBA-1)) +	\
+-	 (((pgoff)<<PAGE_SHIFT) & (SHMLBA-1)))
++	 (((pgoff)<<MMUPAGE_SHIFT) & (SHMLBA-1)))
+ 
+ /*
+  * We need to ensure that shared mappings are correctly aligned to
+@@ -33,7 +38,7 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 		.length = len,
+ 		.low_limit = mm->mmap_base,
+ 		.high_limit = TASK_SIZE,
+-		.align_offset = pgoff << PAGE_SHIFT
++		.align_offset = pgoff << MMUPAGE_SHIFT
+ 	};
+ 
+ 	/*
+@@ -47,7 +52,7 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 	 */
+ 	if (flags & MAP_FIXED) {
+ 		if (flags & MAP_SHARED &&
+-		    (addr - (pgoff << PAGE_SHIFT)) & (SHMLBA - 1))
++		    (addr - (pgoff << MMUPAGE_SHIFT)) & (SHMLBA - 1))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -67,6 +72,6 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 			return addr;
+ 	}
+ 
+-	info.align_mask = do_align ? (PAGE_MASK & (SHMLBA - 1)) : 0;
++	info.align_mask = do_align ? (MMUPAGE_MASK & (SHMLBA - 1)) : 0;
+ 	return vm_unmapped_area(&info);
+ }
+diff --git a/arch/csky/abiv2/inc/abi/entry.h b/arch/csky/abiv2/inc/abi/entry.h
+index cca63e699b58..78f27f9f4b7e 100644
+--- a/arch/csky/abiv2/inc/abi/entry.h
++++ b/arch/csky/abiv2/inc/abi/entry.h
+@@ -269,7 +269,13 @@
+ 	mtcr	r6, cr<6, 15> /* Set MPR with 4K page size */
+ 
+ 	grs	r6, 1f /* Get current pa by PC */
+-	bmaski  r7, (PAGE_SHIFT + 1) /* r7 = 0x1fff */
++	/*
++	 * Align PC down to a dual-page (2 * MMUPAGE_SIZE) TLB-entry boundary.
++	 * The bootstrap entry maps two MMUPAGE-sized hardware pages (MEL0/MEL1
++	 * below) with a 4K MPR, so the mask is MMUPAGE_SHIFT + 1, independent of
++	 * the (possibly clustered) PAGE_SIZE.
++	 */
++	bmaski  r7, (MMUPAGE_SHIFT + 1) /* r7 = 0x1fff */
+ 	andn    r6, r7
+ 	mtcr	r6, cr<4, 15> /* Set MEH */
+ 
+diff --git a/arch/csky/include/asm/pgtable.h b/arch/csky/include/asm/pgtable.h
+index bafcd5823531..22d43a4088d9 100644
+--- a/arch/csky/include/asm/pgtable.h
++++ b/arch/csky/include/asm/pgtable.h
+@@ -17,18 +17,30 @@
+ 
+ /*
+  * C-SKY is two-level paging structure:
++ *
++ * Under page clustering (CONFIG_PAGE_MMUSHIFT > 0) the kernel PAGE_SIZE is a
++ * multiple of the hardware MMU page size (MMUPAGE_SIZE).  The C-SKY MMU,
++ * however, always walks the page tables with a fixed 4KB (MMUPAGE) page and a
++ * fixed 4MB (PGDIR_SIZE) per-PGD-entry span: one PGD page and one PTE table
++ * each occupy a single MMUPAGE_SIZE hardware page holding MMUPAGE_SIZE/4 byte
++ * entries.  The table geometry must therefore be expressed in MMUPAGE units,
++ * not in the (clustered) PAGE_SIZE, so that pgd_index()/pte_index() and the
++ * hardware table-walk agree.  A PTE table is still allocated as a full
++ * PAGE_SIZE chunk; only its first MMUPAGE worth of entries is used by the MMU.
++ * When PAGE_MMUSHIFT == 0, MMUPAGE_SIZE == PAGE_SIZE and these reduce to the
++ * stock 1024-entry tables.
+  */
+ 
+-#define PTRS_PER_PGD	(PAGE_SIZE / sizeof(pgd_t))
++#define PTRS_PER_PGD	(MMUPAGE_SIZE / sizeof(pgd_t))
+ #define PTRS_PER_PMD	1
+-#define PTRS_PER_PTE	(PAGE_SIZE / sizeof(pte_t))
++#define PTRS_PER_PTE	(MMUPAGE_SIZE / sizeof(pte_t))
+ 
+ #define pte_ERROR(e) \
+ 	pr_err("%s:%d: bad pte %08lx.\n", __FILE__, __LINE__, (e).pte_low)
+ #define pgd_ERROR(e) \
+ 	pr_err("%s:%d: bad pgd %08lx.\n", __FILE__, __LINE__, pgd_val(e))
+ 
+-#define PFN_PTE_SHIFT	PAGE_SHIFT
++#define PFN_PTE_SHIFT	MMUPAGE_SHIFT
+ #define pmd_pfn(pmd)	(pmd_phys(pmd) >> PAGE_SHIFT)
+ #define pmd_page(pmd)	(pfn_to_page(pmd_phys(pmd) >> PAGE_SHIFT))
+ #define pte_clear(mm, addr, ptep)	set_pte((ptep), \
+diff --git a/arch/csky/include/asm/shmparam.h b/arch/csky/include/asm/shmparam.h
+index 2fe6cea0dae9..76ce14a4e3a2 100644
+--- a/arch/csky/include/asm/shmparam.h
++++ b/arch/csky/include/asm/shmparam.h
+@@ -3,7 +3,7 @@
+ #ifndef __ASM_CSKY_SHMPARAM_H
+ #define __ASM_CSKY_SHMPARAM_H
+ 
+-#define SHMLBA	(4 * PAGE_SIZE)
++#define SHMLBA	(4 * MMUPAGE_SIZE)
+ 
+ #define __ARCH_FORCE_SHMLBA
+ 
+diff --git a/arch/csky/kernel/syscall.c b/arch/csky/kernel/syscall.c
+index 4540a271ee39..fabd0017ccb5 100644
+--- a/arch/csky/kernel/syscall.c
++++ b/arch/csky/kernel/syscall.c
+@@ -22,11 +22,11 @@ SYSCALL_DEFINE6(mmap2,
+ 	unsigned long, fd,
+ 	unsigned long, offset)
+ {
+-	if (unlikely(offset & (~PAGE_MASK >> 12)))
++	if (unlikely(offset & (~MMUPAGE_MASK >> 12)))
+ 		return -EINVAL;
+ 
+ 	return ksys_mmap_pgoff(addr, len, prot, flags, fd,
+-			       offset >> (PAGE_SHIFT - 12));
++			       offset >> (MMUPAGE_SHIFT - 12));
+ }
+ 
+ /*
+diff --git a/arch/csky/mm/fault.c b/arch/csky/mm/fault.c
+index 7ff401108985..33fb4e51fa09 100644
+--- a/arch/csky/mm/fault.c
++++ b/arch/csky/mm/fault.c
+@@ -189,7 +189,15 @@ asmlinkage void do_page_fault(struct pt_regs *regs)
+ 	struct task_struct *tsk;
+ 	struct vm_area_struct *vma;
+ 	struct mm_struct *mm;
+-	unsigned long addr = read_mmu_entryhi() & PAGE_MASK;
++	/*
++	 * The C-SKY MMU faults on MMUPAGE_SIZE (hardware page) granularity.
++	 * Under page clustering (PAGE_MMUSHIFT > 0) PAGE_MASK rounds to the
++	 * larger clustered PAGE_SIZE and would discard the sub-cluster offset of
++	 * the faulting hardware page, faulting in the wrong address.  Mask to
++	 * MMUPAGE granularity so handle_mm_fault() services the page the MMU
++	 * actually faulted on.  Reduces to PAGE_MASK when PAGE_MMUSHIFT == 0.
++	 */
++	unsigned long addr = read_mmu_entryhi() & MMUPAGE_MASK;
+ 	unsigned int flags = FAULT_FLAG_DEFAULT;
+ 	int code = SEGV_MAPERR;
+ 	vm_fault_t fault;
+diff --git a/arch/csky/mm/init.c b/arch/csky/mm/init.c
+index fa16015ea1c0..faa48e1933ed 100644
+--- a/arch/csky/mm/init.c
++++ b/arch/csky/mm/init.c
+@@ -69,8 +69,29 @@ void __init mmu_init(unsigned long min_pfn, unsigned long max_pfn)
+ 	for (i = 0; i < PTRS_KERN_TABLE; i++)
+ 		set_pte(&kernel_pte_tables[i], __pte(_PAGE_GLOBAL));
+ 
+-	for (i = min_pfn; i < max_pfn; i++)
+-		set_pte(&kernel_pte_tables[i - PFN_DOWN(va_pa_offset)], pfn_pte(i, PAGE_KERNEL));
++	/*
++	 * Build the kernel direct map in the static kernel_pte_tables.
++	 *
++	 * The C-SKY MMU always maps MMUPAGE_SIZE (4KB) hardware pages, so the
++	 * page tables hold one entry per MMUPAGE.  Under page clustering
++	 * (PAGE_MMUSHIFT > 0) min_pfn/max_pfn and va_pa_offset count PAGE_SIZE
++	 * clusters, so iterate the corresponding MMUPAGE frames and emit one PTE
++	 * for each.  kernel_pte_tables is indexed in MMUPAGE units (entry j maps
++	 * the virtual page at PAGE_OFFSET + j * MMUPAGE_SIZE), so the index must
++	 * be the MMUPAGE distance from the direct-map base.  When PAGE_MMUSHIFT
++	 * == 0 this reduces to the original one-entry-per-PAGE loop.
++	 */
++	{
++		unsigned long base_mmupfn = va_pa_offset >> MMUPAGE_SHIFT;
++		unsigned long start_mmupfn = (unsigned long)min_pfn << PAGE_MMUSHIFT;
++		unsigned long end_mmupfn = (unsigned long)max_pfn << PAGE_MMUSHIFT;
++		unsigned long m;
++
++		for (m = start_mmupfn; m < end_mmupfn; m++)
++			set_pte(&kernel_pte_tables[m - base_mmupfn],
++				__pte(((unsigned long long)m << MMUPAGE_SHIFT) |
++				      pgprot_val(PAGE_KERNEL)));
++	}
+ 
+ 	flush_tlb_all();
+ 	local_icache_inv_all(NULL);
+diff --git a/arch/csky/mm/tlb.c b/arch/csky/mm/tlb.c
+index 9234c5e5ceaf..75a5eab023a8 100644
+--- a/arch/csky/mm/tlb.c
++++ b/arch/csky/mm/tlb.c
+@@ -12,9 +12,15 @@
+ /*
+  * One C-SKY MMU TLB entry contain two PFN/page entry, ie:
+  * 1VPN -> 2PFN
++ *
++ * The hardware page (PFN) is always MMUPAGE_SIZE; under page clustering
++ * (PAGE_MMUSHIFT > 0) the kernel PAGE_SIZE is larger, but the TLB still maps
++ * two MMUPAGE-sized hardware pages per entry.  Size the TLB stride/mask in
++ * MMUPAGE units so the flush loops walk real TLB entries.  Reduces to
++ * (PAGE_SIZE * 2)/(PAGE_MASK << 1) when PAGE_MMUSHIFT == 0.
+  */
+-#define TLB_ENTRY_SIZE		(PAGE_SIZE * 2)
+-#define TLB_ENTRY_SIZE_MASK	(PAGE_MASK << 1)
++#define TLB_ENTRY_SIZE		(MMUPAGE_SIZE * 2)
++#define TLB_ENTRY_SIZE_MASK	(MMUPAGE_MASK << 1)
+ 
+ void flush_tlb_all(void)
+ {
+@@ -67,7 +73,7 @@ void flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 			: "r" (start | newpid)
+ 			: "memory");
+ 
+-		start += 2*PAGE_SIZE;
++		start += TLB_ENTRY_SIZE;
+ 	}
+ 	asm volatile("sync.i\n");
+ #else
+@@ -80,7 +86,7 @@ void flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 		int idx;
+ 
+ 		write_mmu_entryhi(start | newpid);
+-		start += 2*PAGE_SIZE;
++		start += TLB_ENTRY_SIZE;
+ 		tlb_probe();
+ 		idx = read_mmu_index();
+ 		if (idx >= 0)
+@@ -107,7 +113,7 @@ void flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ 			: "r" (start)
+ 			: "memory");
+ 
+-		start += 2*PAGE_SIZE;
++		start += TLB_ENTRY_SIZE;
+ 	}
+ 	asm volatile("sync.i\n");
+ #else
+@@ -120,7 +126,7 @@ void flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ 		int idx;
+ 
+ 		write_mmu_entryhi(start | oldpid);
+-		start += 2*PAGE_SIZE;
++		start += TLB_ENTRY_SIZE;
+ 		tlb_probe();
+ 		idx = read_mmu_index();
+ 		if (idx >= 0)
+-- 
+2.54.0
+

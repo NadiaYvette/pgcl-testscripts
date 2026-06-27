@@ -1,0 +1,860 @@
+From 52d78116db424c0bf729e11d283daaafc0d844e1 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:43 +0200
+Subject: [RFC PATCH 27/28] selftests/mm, Documentation: page clustering
+
+---
+ .../mm/sub-pmd-superpages-walkers.rst         | 253 ++++++++++++++++
+ Documentation/mm/sub-pmd-superpages.rst       | 278 ++++++++++++++++++
+ tools/include/nolibc/arch-csky.h              | 156 ++++++++++
+ tools/include/nolibc/arch.h                   |   2 +
+ tools/testing/selftests/mm/cow.c              |  41 ++-
+ tools/testing/selftests/mm/mlock2-tests.c     |  11 +
+ tools/testing/selftests/mm/vm_util.c          |  21 +-
+ 7 files changed, 744 insertions(+), 18 deletions(-)
+ create mode 100644 Documentation/mm/sub-pmd-superpages-walkers.rst
+ create mode 100644 Documentation/mm/sub-pmd-superpages.rst
+ create mode 100644 tools/include/nolibc/arch-csky.h
+
+diff --git a/Documentation/mm/sub-pmd-superpages-walkers.rst b/Documentation/mm/sub-pmd-superpages-walkers.rst
+new file mode 100644
+index 000000000000..04e3ec997d9a
+--- /dev/null
++++ b/Documentation/mm/sub-pmd-superpages-walkers.rst
+@@ -0,0 +1,253 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++==========================================
++PTE-Walker Inventory (Sub-PMD Superpages)
++==========================================
++
++This document is the companion inventory to
++:doc:`sub-pmd-superpages`.  It catalogues every PTE-walking code path in
++the kernel and classifies its **batch awareness**, **lock state**, and
++**risk** for the sub-PMD superpage (mTHP) correctness work.
++
++The classifications drive the Phase 2c/2d/2e remediation priority:
++high-risk walkers that modify rmap/refcount without batch awareness are
++converted first, low-risk read-only walkers last.
++
++.. contents:: :local:
++
++Inventory
++=========
++
++Lock-state notation: ``PTL`` is always implied for PTE walkers.  Other
++locks are noted: ``mmap_R``/``mmap_W`` for read/write, ``folio_L`` for
++folio_lock, ``anon_vma`` for anon_vma->rwsem.
++
++Batch-awareness: ``yes`` uses ``folio_pte_batch`` or equivalent;
++``partial`` recognizes batches in some sub-paths only; ``no`` walks
++PTE-by-PTE.
++
++mm/memory.c (fault, fork, zap)
++------------------------------
++
++============================================ ============================ ================ ========= =============== ====
++Function:line                                Scope                        Lock state       Batch    Touches rmap?   Risk
++============================================ ============================ ================ ========= =============== ====
++``copy_present_ptes`` (1142)                 fork: copy parent PTEs       mmap_W + PTL     yes      yes (modify)    M
++``copy_pte_range`` (1294)                    fork: PMD-level driver       mmap_W + PTL     yes      yes (modify)    M
++``zap_present_ptes`` (1757)                  unmap: dispatch              mmap_R + PTL     yes      yes (modify)    H
++``zap_present_folio_ptes`` (1710)            unmap: per-folio batch       mmap_R + PTL     yes      yes (modify)    H
++``zap_pte_range`` (1999)                     unmap: PMD-level driver      mmap_R + PTL     yes      yes (modify)    H
++``do_anonymous_page`` (5746)                 fault: fresh anon            mmap_R + PTL     yes      yes (modify)    M
++``wp_page_copy`` (4022)                      fault: COW                   mmap_R + PTL     no       yes (modify)    H
++``finish_fault`` (6219)                      fault: complete file/anon    mmap_R + PTL     yes      yes (modify)    M
++``do_swap_page`` (varies)                    fault: swap-in               mmap_R + PTL     partial  yes (modify)    M
++``set_pte_range`` (6138)                     fault helper: write PTEs     mmap_R + PTL     yes      yes (modify)    M
++============================================ ============================ ================ ========= =============== ====
++
++mm/mremap.c
++-----------
++
++============================================ ============================ ================ ========= =============== ====
++Function:line                                Scope                        Lock state       Batch    Touches rmap?   Risk
++============================================ ============================ ================ ========= =============== ====
++``move_ptes`` (203)                          mremap: relocate PTEs        mmap_W + PTL × 2 yes      no              M
++``move_normal_pmd`` (373)                    mremap: PMD move             mmap_W + PMD     n/a      no              L
++============================================ ============================ ================ ========= =============== ====
++
++mm/rmap.c (rmap walks)
++----------------------
++
++============================================ ============================ ================ ========= =============== ====
++Function:line                                Scope                        Lock state       Batch    Touches rmap?   Risk
++============================================ ============================ ================ ========= =============== ====
++``try_to_unmap_one`` (varies)                rmap: unmap callback         folio_L+anon+PTL no       yes (modify)    **H**
++``try_to_migrate_one`` (varies)              rmap: migrate callback       folio_L+anon+PTL no       yes (modify)    **H**
++``page_vma_mapped_walk`` (mm/page_vma_mapped.c) rmap: PTE-finding helper   PTL              no       no (read)       M
++``__folio_remove_rmap`` (1804)               rmap: actual remove          PTL              n/a      yes (modify)    M
++``__folio_add_rmap`` (1361)                  rmap: actual add             PTL              n/a      yes (modify)    M
++============================================ ============================ ================ ========= =============== ====
++
++mm/migrate.c
++------------
++
++============================================ ============================ ================ ========= =============== ====
++Function:line                                Scope                        Lock state       Batch    Touches rmap?   Risk
++============================================ ============================ ================ ========= =============== ====
++``remove_migration_pte`` (346)               migrate: restore PTE         folio_L+anon+PTL no       yes (modify)    **H**
++``remove_migration_ptes`` (455)              migrate: rmap-walk driver    folio_L+anon+PTL no       yes (modify)    H
++``try_to_map_unused_to_zeropage`` (298)      migrate: zero-substitution   folio_L+anon+PTL no       yes (modify)    M
++============================================ ============================ ================ ========= =============== ====
++
++mm/madvise.c (the cow.c bug-reproduction path)
++----------------------------------------------
++
++============================================ ============================ ================ ========= =============== ====
++Function:line                                Scope                        Lock state       Batch    Touches rmap?   Risk
++============================================ ============================ ================ ========= =============== ====
++``madvise_cold_or_pageout_pte_range`` (353)  MADV_COLD / MADV_PAGEOUT     mmap_R + PTL     partial  yes (modify)    **H**
++``madvise_dontneed_free_pte_range`` (varies) MADV_DONTNEED / MADV_FREE    mmap_R + PTL     partial  yes (modify)    **H**
++``madvise_pageout_pmd`` (varies)             MADV_PAGEOUT for THP         mmap_R + PMD     n/a      yes (modify)    M
++============================================ ============================ ================ ========= =============== ====
++
++mm/mprotect.c
++-------------
++
++============================================ ============================ ================ ========= =============== ====
++Function:line                                Scope                        Lock state       Batch    Touches rmap?   Risk
++============================================ ============================ ================ ========= =============== ====
++``change_pte_range`` (varies)                mprotect: change perms       mmap_W + PTL     no       no              M
++============================================ ============================ ================ ========= =============== ====
++
++mm/huge_memory.c (THP)
++----------------------
++
++============================================ ============================ ================ ========= =============== ====
++Function:line                                Scope                        Lock state       Batch    Touches rmap?   Risk
++============================================ ============================ ================ ========= =============== ====
++``__split_huge_pmd_locked`` (3090)           split: PMD→PTEs              folio_L+PMD+PTL  yes      yes (modify)    M
++``__folio_split`` (4078)                     split: order N→M             folio_L+anon     n/a      yes (modify)    **H**
++``unmap_folio`` (3466)                       split helper: unmap all      folio_L+anon     n/a      yes (modify)    H
++``remap_page`` (3564)                        split helper: restore        folio_L+anon     no       yes (modify)    H
++``deferred_split_scan`` (varies)             shrinker: drain split queue  folio_L+anon     n/a      yes (modify)    M
++============================================ ============================ ================ ========= =============== ====
++
++mm/khugepaged.c (collapse)
++--------------------------
++
++============================================ ============================ ================ ========= =============== ====
++Function:line                                Scope                        Lock state       Batch    Touches rmap?   Risk
++============================================ ============================ ================ ========= =============== ====
++``collapse_huge_page`` (varies)              collapse: scan + replace     mmap_W + folio_L no       yes (modify)    M
++``hpage_collapse_scan_pmd`` (varies)         collapse: scan candidates    mmap_R + PTL     no       no (read)       L
++============================================ ============================ ================ ========= =============== ====
++
++mm/userfaultfd.c
++----------------
++
++============================================ ============================ ================ ========= =============== ====
++Function:line                                Scope                        Lock state       Batch    Touches rmap?   Risk
++============================================ ============================ ================ ========= =============== ====
++``mfill_atomic_pte`` (varies)                uffd: install PTE            mmap_R + PTL     no       yes (modify)    M
++``move_pages_pte`` (varies)                  uffd_move: move PTEs         mmap_W + PTL × 2 partial  yes (modify)    M
++============================================ ============================ ================ ========= =============== ====
++
++mm/swap_state.c, mm/swapfile.c
++------------------------------
++
++============================================ ============================ ================ ========= =============== ====
++Function:line                                Scope                        Lock state       Batch    Touches rmap?   Risk
++============================================ ============================ ================ ========= =============== ====
++``unuse_pte_range`` (mm/swapfile.c)          swapoff: replace swap PTEs   mmap_W + PTL     no       yes (modify)    M
++============================================ ============================ ================ ========= =============== ====
++
++fs/proc/task_mmu.c (read-only observers)
++----------------------------------------
++
++============================================ ============================ ================ ========= =============== ====
++Function:line                                Scope                        Lock state       Batch    Touches rmap?   Risk
++============================================ ============================ ================ ========= =============== ====
++``smaps_pte_range`` (varies)                 /proc/PID/smaps              mmap_R + PTL     no       no (read)       L
++``pagemap_scan_pmd_entry`` (varies)          /proc/PID/pagemap            mmap_R + PTL     no       no (read)       L
++``clear_refs_pte_range`` (varies)            /proc/PID/clear_refs         mmap_R + PTL     no       no (modify)     L
++============================================ ============================ ================ ========= =============== ====
++
++Other (NUMA, GUP, KSM)
++----------------------
++
++============================================ ============================ ================ ========= =============== ====
++Function:line                                Scope                        Lock state       Batch    Touches rmap?   Risk
++============================================ ============================ ================ ========= =============== ====
++``queue_pages_pte_range`` (mm/mempolicy.c)   migrate: NUMA balancing      mmap_R + PTL     no       no              L
++``follow_page_mask`` (mm/gup.c)              GUP: lookup                  mmap_R + PTL     no       yes (read)      L
++``replace_page`` (mm/ksm.c)                  KSM: merge identical pages   folio_L+PTL      no       yes (modify)    M
++============================================ ============================ ================ ========= =============== ====
++
++Summary by Risk
++===============
++
++High-risk (Phase 2c targets — convert first)
++--------------------------------------------
++
++These walkers either modify rmap/refcount AND lack batch awareness, OR
++are central to the bug-reproducing path:
++
++* ``zap_present_ptes`` / ``zap_present_folio_ptes`` — high frequency,
++  central to munmap/exit
++* ``wp_page_copy`` — central to COW; failure-path race already
++  documented in Phase 1
++* ``try_to_unmap_one`` — invoked by ``unmap_folio`` during split; the
++  split-side of the bug
++* ``try_to_migrate_one`` — invoked by anon ``unmap_folio`` paths
++* ``remove_migration_pte`` — invoked by ``remap_page``; lack of batch
++  awareness causes orphan-PTE residuals
++* ``madvise_cold_or_pageout_pte_range`` — the Phase 1 captured site
++* ``madvise_dontneed_free_pte_range`` — analogous risk
++* ``__folio_split`` — coordinator of the entire split; race-prone
++
++Medium-risk (Phase 2d targets — convert after high-risk)
++--------------------------------------------------------
++
++* ``copy_present_ptes`` (fork)
++* ``move_ptes`` (mremap)
++* ``finish_fault`` and friends
++* ``do_swap_page``
++* ``change_pte_range`` (mprotect)
++* ``__split_huge_pmd_locked``
++* ``mfill_atomic_pte`` (uffd)
++* ``unuse_pte_range`` (swapoff)
++* ``replace_page`` (KSM)
++
++Low-risk (Phase 2e+ — verify and optionally convert)
++----------------------------------------------------
++
++Read-only or non-rmap-modifying walkers:
++
++* ``smaps_pte_range``, ``pagemap_scan_pmd_entry`` (procfs observers)
++* ``hpage_collapse_scan_pmd`` (read-only scan)
++* ``follow_page_mask`` (GUP read)
++* ``queue_pages_pte_range`` (NUMA scanning)
++
++Phase 2c Conversion Priority
++============================
++
++The recommended conversion order, balancing impact and dependency:
++
++1. **``page_vma_mapped_walk``** — refactor to support multi-PTE
++   advance.  This is a prerequisite for ``try_to_unmap_one`` and
++   ``try_to_migrate_one`` batch awareness.
++2. **``try_to_unmap_one``** — primary rmap-walk operation called by
++   ``unmap_folio``.  Closes the central split-side race.
++3. **``try_to_migrate_one``** — analogous to (2) for anon migration
++   paths.
++4. **``remove_migration_pte``** — paired with (2) and (3): if
++   migration entries are batched on the unmap side, restoration must
++   batch on the remap side.
++5. **``madvise_cold_or_pageout_pte_range``** — the Phase 1 captured
++   site.  Direct fix once (2) and (3) are in place.
++6. **``madvise_dontneed_free_pte_range``** — analogous to (5).
++7. **``__folio_split``** itself — re-audit after (2)–(6) are in place;
++   contract assertions at entry and exit (Phase 2e).
++
++Phase 2d converts the medium-risk list once 2c is stable.
++
++Test Vectors
++============
++
++For each Phase 2c conversion, the following tests must pass:
++
++* ``cow.c`` selftest on aarch64 PGCL=0/2/4 with
++  ``transparent_hugepage=always`` (the original failure scenario)
++* ``cow.c`` selftest on aarch64 PGCL=0/2/4 with
++  ``transparent_hugepage=never`` (regression check)
++* LTP ``mremap`` and ``madvise`` test families
++* New focused selftests (Phase 2g): ``mthp_mremap_wp.c``,
++  ``mthp_partial_share.c``
++* Stress tests: parallel cow.c instances under SMP=4 to exercise
++  inter-mm races
++
++References
++==========
++
++* ``Documentation/mm/sub-pmd-superpages.rst`` — main framing document
++* ``mm/internal.h`` — ``folio_pte_batch_flags`` API
++* ``mm/page_vma_mapped.c`` — rmap walk infrastructure
+diff --git a/Documentation/mm/sub-pmd-superpages.rst b/Documentation/mm/sub-pmd-superpages.rst
+new file mode 100644
+index 000000000000..4e74a393eedc
+--- /dev/null
++++ b/Documentation/mm/sub-pmd-superpages.rst
+@@ -0,0 +1,278 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++==============================
++Sub-PMD Superpages and PGCL
++==============================
++
++This document describes the architectural framing, contracts, and locking
++discipline for handling **sub-PMD superpages** in Linux: folios whose order
++is greater than zero but smaller than ``HPAGE_PMD_ORDER``, mapped at PTE
++granularity rather than via PMD-level THP entries.  These are commonly
++known as **mTHP** (multi-size transparent huge pages).
++
++When the **page clustering** infrastructure (PGCL) is enabled, sub-PMD
++superpages interact with kernel-page granularity in subtle ways.  PGCL
++allows the kernel allocation unit (``PAGE_SIZE``) to be larger than the
++hardware MMU page size (``MMUPAGE_SIZE``); mTHP folios are larger still,
++mapped by N consecutive PTEs of MMUPAGE granularity.  The combination
++creates a layered structure (``mTHP folio`` → ``kernel pages`` → ``hardware
++PTEs``) that requires careful contract design.
++
++This document is the foundation for the PTE-walker correctness work
++described in the `Phase 2 plan
++<https://lore.kernel.org/...>`_ (RFC pending).
++
++.. contents:: :local:
++
++Concepts
++========
++
++mTHP and order
++--------------
++
++An mTHP folio is a compound folio of order ``N`` where
++``0 < N < HPAGE_PMD_ORDER``.  On aarch64 with ``PAGE_SIZE=4KB``,
++``HPAGE_PMD_ORDER`` is 9 (2MB); mTHP sizes range from order-1 (8KB) to
++order-8 (1MB).  Each mTHP folio is mapped by ``2^N`` consecutive PTEs.
++
++Sub-PMD superpages are *PTE-mapped*: there is no single PMD entry
++covering the folio.  This contrasts with PMD-mapped THPs, which the
++kernel handles via dedicated PMD-level entries.
++
++PGCL clustering
++---------------
++
++PGCL configures the kernel allocation unit to be ``PAGE_MMUCOUNT``
++(typically 1, 4, or 16) hardware pages.  Each ``struct page`` represents
++one allocation unit; each PTE represents one hardware page.  The mTHP
++layer sits above PGCL clustering: an mTHP folio of order N covers
++``2^N`` kernel pages, which is ``2^N * PAGE_MMUCOUNT`` hardware PTEs.
++
++The Layered Structure
++---------------------
++
++For an mTHP folio of order N at PGCL=K (``PAGE_MMUCOUNT=2^K``)::
++
++  mTHP folio
++    ├─ struct page #0 (kernel page 0)
++    │    ├─ PTE 0 (sub-page 0)
++    │    ├─ PTE 1 (sub-page 1)
++    │    └─ ... (PAGE_MMUCOUNT total)
++    ├─ struct page #1 (kernel page 1)
++    │    └─ PAGE_MMUCOUNT PTEs
++    └─ ... (2^N kernel pages total)
++
++Total: ``2^N * 2^K = 2^(N+K)`` PTEs covering one mTHP folio.
++
++PTE-Walker Contract
++===================
++
++Standard PTE-walker conventions
++-------------------------------
++
++All PTE walkers share these expectations:
++
++1. The PMD's PTL is held during the walk.
++2. ``mmap_lock`` is held (read or write, depending on intent).
++3. PTE-walker functions return the number of PTEs consumed (``nr``);
++   callers advance ``pte += nr`` and continue.
++
++Batch awareness
++---------------
++
++A walker is **batch-aware** if it uses ``folio_pte_batch_flags()``
++(``mm/internal.h``) to detect consecutive PTEs that map consecutive
++sub-pages of the same large folio, and processes the entire batch as
++one transaction.
++
++Walkers that are *not* batch-aware iterate PTE-by-PTE.  This is
++correct for operations that genuinely need per-PTE granularity
++(e.g., checking individual access bits) but wrong for operations
++that should act atomically on a logical mapping unit (e.g., rmap
++removal, refcount accounting).
++
++The full inventory of PTE walkers and their batch-awareness
++classification is maintained in :doc:`sub-pmd-superpages-walkers`.
++
++Refcount Accounting Contract
++============================
++
++PTE-ref convention
++------------------
++
++Each PTE that maps a folio holds an implicit reference: refcount
++includes ``+1`` per mapped PTE.  When a PTE is added (via
++``folio_add_*_rmap_pte()``), the corresponding ``folio_get()`` is
++done by the caller.  When a PTE is removed (via
++``folio_remove_rmap_pte()`` or ``folio_remove_rmap_ptes()``), the
++corresponding ``folio_put()`` is queued via ``__tlb_remove_folio_pages()``
++or done immediately, depending on context.
++
++Caller-ref convention
++---------------------
++
++Operations that need to keep the folio alive across a possible
++transition (e.g., wp_page_copy holding the folio while the PTL is
++released) take a *caller-ref* via ``folio_get()`` at function entry
++and release via ``folio_put()`` at function exit.  This is *separate*
++from the PTE-ref.
++
++Conflating these two refcount sources is a common bug class; see
++*Known race classes* below.
++
++split_folio ref-transfer contract
++----------------------------------
++
++``split_folio()`` (``mm/huge_memory.c``) consumes the caller's *single*
++reference and **transfers it to the post-split sub-folio containing
++the @page argument**.  Documented at
++``__split_huge_page_to_list_to_order()``.  The standard caller pattern
++is::
++
++    folio_get(folio);                  /* +1 caller-ref */
++    folio_lock(folio);
++    err = split_folio(folio);          /* transfers caller-ref to head */
++    folio_unlock(folio);
++    folio_put(folio);                  /* releases the transferred ref */
++
++After this sequence, head sub-folio's refcount = (head's PTE-mappings).
++
++Lock Discipline
++===============
++
++Per-folio locks
++---------------
++
++* ``folio_lock`` (``PG_locked``): exclusive folio-level lock.  Protects
++  against concurrent operations that need an atomic snapshot of the
++  folio's mapping/state.  Required during ``__folio_split``,
++  ``add_to_swap``, and other atomic-folio transitions.
++
++* ``folio_lock_large_mapcount``: protects atomic updates of
++  ``_large_mapcount``.  Narrow scope; not a general-purpose folio lock.
++
++Per-mapping locks
++-----------------
++
++* ``anon_vma->rwsem``: protects the anon_vma chain that lists all VMAs
++  mapping a given anon folio.  Taken by rmap-walk operations
++  (``try_to_unmap``, ``try_to_migrate``, ``rmap_walk``).
++
++* ``i_mmap_rwsem``: file-mapping equivalent of anon_vma->rwsem.
++
++Per-page-table locks
++--------------------
++
++* ``PTL`` (page table lock, one per PMD via ``pte_lockptr()``): protects
++  PTE entries within one PMD's range.  Required for any PTE
++  modification.
++
++* ``mmap_lock`` (``mmap_read_lock`` / ``mmap_write_lock``): protects the
++  VMA list and high-level mm structure.  Read-locked during faults,
++  write-locked during structural changes (mmap, munmap, mremap, fork's
++  ``dup_mmap``).
++
++Lock ordering
++-------------
++
++When multiple locks are held simultaneously::
++
++  mmap_lock → anon_vma_lock → folio_lock → PTL
++
++Departures from this ordering are bugs.  See the lockdep annotations
++in ``mm/internal.h`` and ``include/linux/rmap.h``.
++
++Known Race Classes (Phase 1 findings)
++=====================================
++
++The following race classes were identified during the Phase 1
++investigation of ``cow.c`` selftest failures on aarch64 PGCL=0/2 with
++``transparent_hugepage=always``.  Each is a target for Phase 2
++remediation.
++
++1. wp_page_copy ↔ try_to_migrate
++--------------------------------
++
++When ``wp_page_copy`` is in progress and ``try_to_migrate`` (called from
++``unmap_folio`` during ``__folio_split``) replaces the same PTE with a
++migration entry, the PTE-ref accounting double-decrements: ``try_to_migrate``
++does ``folio_put`` per replaced PTE, and ``wp_page_copy``'s failure-path
++also does ``folio_put`` for the (now stale) PTE-ref.  Net: ``-1`` ref.
++
++This race is *not* fixable by adding the obvious "skip put if PTE
++changed" check in ``wp_page_copy`` failure path, because that breaks the
++caller-ref accounting at THP=never.  Phase 2's batch-aware
++``try_to_migrate_one`` plus contract-precise wp_page_copy revisions
++together must address this.
++
++2. madvise_pageout ↔ deferred_split
++-----------------------------------
++
++``madvise_cold_or_pageout_pte_range`` calls ``split_folio`` on a
++partially-mapped mTHP, releases PTL, then calls ``folio_put``.  During
++the PTL-released window, concurrent operations can race.  Captured
++data shows the post-split head folio with ``refc=1, _mapcount=0,
++folio_mapped=true`` — the caller's ``folio_put`` then brings refc to 0
++while ``folio_mapped`` reports the folio as mapped, triggering the
++``rss-counter BUG`` at process teardown.
++
++3. Head-folio ``_mapcount`` post-split semantics
++-------------------------------------------------
++
++``__split_unmapped_folio`` does not explicitly initialize the head
++folio's ``_mapcount`` after compound clearing.  Tail folios are
++validated via ``VM_BUG_ON_PAGE`` to have ``_mapcount=-1``; head bypasses
++this validation.  Direct initialization to ``-1`` breaks file-folio
++cases where head IS still mapped post-split.  The correct semantics
++require deeper investigation (Phase 2f).
++
++4. PTE-batch boundary observations
++----------------------------------
++
++Walkers using ``folio_pte_batch`` may observe a batch of N PTEs at one
++moment but, by the time they process the N-th PTE, an mTHP split or
++deferred split may have occurred.  Without folio_lock held across the
++batch, observers see torn state.  Phase 2c's batch-aware
++``try_to_unmap_one`` includes folio_lock annotations to close this.
++
++Phase 2 Roadmap
++===============
++
++The remediation roadmap is tracked in
++``Documentation/mm/sub-pmd-superpages-roadmap.rst`` (forthcoming).
++High-level phases:
++
++* **2a**: This document plus walker inventory.
++* **2b**: Unified ``folio_pte_batch_flags`` API extension (BATCH_KIND
++  return) with backward-compat shim.
++* **2c**: ``try_to_unmap_one`` and ``try_to_migrate_one`` batch-aware
++  conversions; ``page_vma_mapped_walk`` multi-PTE advance support.
++* **2d**: madvise/mprotect/swap walker conversions.
++* **2e**: Contract assertions and lockdep annotations.
++* **2f**: Head-folio post-split semantics resolution.
++* **2g**: Test infrastructure (mTHP-focused selftests).
++* **2h**: Performance validation.
++* **2i**: Upstream patch series preparation.
++
++Test Coverage
++=============
++
++The following selftests exercise sub-PMD superpage scenarios:
++
++* ``tools/testing/selftests/mm/cow.c``: comprehensive COW-on-mTHP
++  tests including PARTIAL_MREMAP and PARTIAL_SHARED variants.
++* ``tools/testing/selftests/mm/split_huge_page_test.c``: explicit
++  split tests.
++
++Phase 2g adds:
++
++* ``mthp_mremap_wp.c``: focused mTHP+mremap+wp+fork race exerciser.
++* ``mthp_partial_share.c``: madvise DONTFORK + fork patterns.
++
++References
++==========
++
++* `THP discussion (lkml) <https://lore.kernel.org/...>`_
++* `PGCL design rationale <Documentation/mm/page-clustering.rst>`_
++  (forthcoming)
++* The original "larpage" patch by Hugh Dickins (2001)
+diff --git a/tools/include/nolibc/arch-csky.h b/tools/include/nolibc/arch-csky.h
+new file mode 100644
+index 000000000000..748e11eab989
+--- /dev/null
++++ b/tools/include/nolibc/arch-csky.h
+@@ -0,0 +1,156 @@
++/* SPDX-License-Identifier: LGPL-2.1 OR MIT */
++/*
++ * C-SKY (abiv2) specific definitions for NOLIBC
++ */
++
++#ifndef _NOLIBC_ARCH_CSKY_H
++#define _NOLIBC_ARCH_CSKY_H
++
++#include "compiler.h"
++#include "crt.h"
++
++/*
++ * Syscalls for C-SKY (abiv2):
++ *   - registers are 32bit wide
++ *   - syscall number is passed in r7
++ *   - arguments are in r0, r1, r2, r3, r4, r5
++ *   - the system call is performed by executing "trap 0"
++ *   - syscall return value is in r0 (a0)
++ *
++ * r0 is both the first argument and the return value, so it is bound with a
++ * "+r" (read-write) constraint and the macro evaluates to it.
++ */
++
++#define __nolibc_syscall0(num)                                                \
++({                                                                            \
++	register long _scno __asm__ ("r7") = (num);                           \
++	register long _ret  __asm__ ("r0");                                   \
++										      \
++	__asm__ volatile (                                                    \
++		"trap 0"                                                      \
++		: "=r"(_ret)                                                  \
++		: "r"(_scno)                                                  \
++		: "memory", "cc"                                              \
++	);                                                                    \
++	_ret;                                                                 \
++})
++
++#define __nolibc_syscall1(num, arg1)                                          \
++({                                                                            \
++	register long _scno __asm__ ("r7") = (num);                           \
++	register long _arg1 __asm__ ("r0") = (long)(arg1);                    \
++										      \
++	__asm__ volatile (                                                    \
++		"trap 0"                                                      \
++		: "+r"(_arg1)                                                 \
++		: "r"(_scno)                                                  \
++		: "memory", "cc"                                              \
++	);                                                                    \
++	_arg1;                                                                \
++})
++
++#define __nolibc_syscall2(num, arg1, arg2)                                    \
++({                                                                            \
++	register long _scno __asm__ ("r7") = (num);                           \
++	register long _arg1 __asm__ ("r0") = (long)(arg1);                    \
++	register long _arg2 __asm__ ("r1") = (long)(arg2);                    \
++										      \
++	__asm__ volatile (                                                    \
++		"trap 0"                                                      \
++		: "+r"(_arg1)                                                 \
++		: "r"(_scno), "r"(_arg2)                                      \
++		: "memory", "cc"                                              \
++	);                                                                    \
++	_arg1;                                                                \
++})
++
++#define __nolibc_syscall3(num, arg1, arg2, arg3)                              \
++({                                                                            \
++	register long _scno __asm__ ("r7") = (num);                           \
++	register long _arg1 __asm__ ("r0") = (long)(arg1);                    \
++	register long _arg2 __asm__ ("r1") = (long)(arg2);                    \
++	register long _arg3 __asm__ ("r2") = (long)(arg3);                    \
++										      \
++	__asm__ volatile (                                                    \
++		"trap 0"                                                      \
++		: "+r"(_arg1)                                                 \
++		: "r"(_scno), "r"(_arg2), "r"(_arg3)                          \
++		: "memory", "cc"                                              \
++	);                                                                    \
++	_arg1;                                                                \
++})
++
++#define __nolibc_syscall4(num, arg1, arg2, arg3, arg4)                        \
++({                                                                            \
++	register long _scno __asm__ ("r7") = (num);                           \
++	register long _arg1 __asm__ ("r0") = (long)(arg1);                    \
++	register long _arg2 __asm__ ("r1") = (long)(arg2);                    \
++	register long _arg3 __asm__ ("r2") = (long)(arg3);                    \
++	register long _arg4 __asm__ ("r3") = (long)(arg4);                    \
++										      \
++	__asm__ volatile (                                                    \
++		"trap 0"                                                      \
++		: "+r"(_arg1)                                                 \
++		: "r"(_scno), "r"(_arg2), "r"(_arg3), "r"(_arg4)             \
++		: "memory", "cc"                                              \
++	);                                                                    \
++	_arg1;                                                                \
++})
++
++#define __nolibc_syscall5(num, arg1, arg2, arg3, arg4, arg5)                  \
++({                                                                            \
++	register long _scno __asm__ ("r7") = (num);                           \
++	register long _arg1 __asm__ ("r0") = (long)(arg1);                    \
++	register long _arg2 __asm__ ("r1") = (long)(arg2);                    \
++	register long _arg3 __asm__ ("r2") = (long)(arg3);                    \
++	register long _arg4 __asm__ ("r3") = (long)(arg4);                    \
++	register long _arg5 __asm__ ("r4") = (long)(arg5);                    \
++										      \
++	__asm__ volatile (                                                    \
++		"trap 0"                                                      \
++		: "+r"(_arg1)                                                 \
++		: "r"(_scno), "r"(_arg2), "r"(_arg3), "r"(_arg4), "r"(_arg5) \
++		: "memory", "cc"                                              \
++	);                                                                    \
++	_arg1;                                                                \
++})
++
++#define __nolibc_syscall6(num, arg1, arg2, arg3, arg4, arg5, arg6)            \
++({                                                                            \
++	register long _scno __asm__ ("r7") = (num);                           \
++	register long _arg1 __asm__ ("r0") = (long)(arg1);                    \
++	register long _arg2 __asm__ ("r1") = (long)(arg2);                    \
++	register long _arg3 __asm__ ("r2") = (long)(arg3);                    \
++	register long _arg4 __asm__ ("r3") = (long)(arg4);                    \
++	register long _arg5 __asm__ ("r4") = (long)(arg5);                    \
++	register long _arg6 __asm__ ("r5") = (long)(arg6);                    \
++										      \
++	__asm__ volatile (                                                    \
++		"trap 0"                                                      \
++		: "+r"(_arg1)                                                 \
++		: "r"(_scno), "r"(_arg2), "r"(_arg3), "r"(_arg4), "r"(_arg5),\
++		  "r"(_arg6)                                                  \
++		: "memory", "cc"                                              \
++	);                                                                    \
++	_arg1;                                                                \
++})
++
++#ifndef NOLIBC_NO_RUNTIME
++/* startup code */
++void _start_wrapper(void);
++void __attribute__((weak,noreturn)) __nolibc_entrypoint __no_stack_protector _start_wrapper(void)
++{
++	__asm__ volatile (
++		".global _start\n"
++		".type _start, @function\n"
++		".weak _start\n"
++		"_start:\n"
++		"mov a0, sp\n"               /* arg1 of _start_c = pointer to argc */
++		"jbsr _start_c\n"            /* transfer to c runtime (does not return) */
++		".size _start, .-_start\n"
++	);
++	__nolibc_entrypoint_epilogue();
++}
++#endif /* NOLIBC_NO_RUNTIME */
++
++#endif /* _NOLIBC_ARCH_CSKY_H */
+diff --git a/tools/include/nolibc/arch.h b/tools/include/nolibc/arch.h
+index a3adaf433f2c..5103a8439c32 100644
+--- a/tools/include/nolibc/arch.h
++++ b/tools/include/nolibc/arch.h
+@@ -28,6 +28,8 @@
+ #include "arch-m68k.h"
+ #elif defined(__sh__)
+ #include "arch-sh.h"
++#elif defined(__csky__)
++#include "arch-csky.h"
+ #else
+ #error Unsupported Architecture
+ #endif
+diff --git a/tools/testing/selftests/mm/cow.c b/tools/testing/selftests/mm/cow.c
+index d9c69c04b67d..aa7b9f015a69 100644
+--- a/tools/testing/selftests/mm/cow.c
++++ b/tools/testing/selftests/mm/cow.c
+@@ -375,17 +375,38 @@ static void do_test_vmsplice_in_parent(char *mem, size_t size,
+ 
+ 	if (!memcmp(old, new, transferred)) {
+ 		log_test_result(KSFT_PASS);
+-	} else if (xfail) {
+-		/*
+-		 * With hugetlb, some vmsplice() tests are currently expected to
+-		 * fail because (a) harder to fix and (b) nobody really cares.
+-		 * Flag them as expected failure for now.
+-		 */
+-		ksft_print_msg("Leak from child into parent\n");
+-		log_test_result(KSFT_XFAIL);
+ 	} else {
+-		ksft_print_msg("Leak from child into parent\n");
+-		log_test_result(KSFT_FAIL);
++		ssize_t i;
++		int count_ff = 0, count_00 = 0, count_other = 0;
++		ssize_t first_off = -1;
++
++		for (i = 0; i < transferred; i++) {
++			if (old[i] != new[i]) {
++				if (first_off < 0)
++					first_off = i;
++				if ((unsigned char)new[i] == 0xff)
++					count_ff++;
++				else if ((unsigned char)new[i] == 0x00)
++					count_00++;
++				else
++					count_other++;
++			}
++		}
++		ksft_print_msg("DIAG: first_mismatch=%zd/%zd old=0x%02x new=0x%02x "
++			       "ff_count=%d zero_count=%d other_count=%d "
++			       "transferred=%zd size=%zu\n",
++			       first_off, transferred,
++			       first_off >= 0 ? (unsigned char)old[first_off] : 0,
++			       first_off >= 0 ? (unsigned char)new[first_off] : 0,
++			       count_ff, count_00, count_other,
++			       transferred, size);
++		if (xfail) {
++			ksft_print_msg("Leak from child into parent\n");
++			log_test_result(KSFT_XFAIL);
++		} else {
++			ksft_print_msg("Leak from child into parent\n");
++			log_test_result(KSFT_FAIL);
++		}
+ 	}
+ close_pipe:
+ 	close(fds[0]);
+diff --git a/tools/testing/selftests/mm/mlock2-tests.c b/tools/testing/selftests/mm/mlock2-tests.c
+index b474f2b20def..fe270b67ca80 100644
+--- a/tools/testing/selftests/mm/mlock2-tests.c
++++ b/tools/testing/selftests/mm/mlock2-tests.c
+@@ -202,6 +202,15 @@ static void test_mlock_lock(void)
+ 
+ static int onfault_check(char *map)
+ {
++	unsigned long page_size = getpagesize();
++
++	/*
++	 * Suppress sub-page clustering so that faulting one page
++	 * doesn't prefault the adjacent page within the same kernel
++	 * allocation unit.  Without this, RSS == Size and the
++	 * "only one page faulted" assertion fails on PGCL kernels.
++	 */
++	madvise(map, 2 * page_size, MADV_RANDOM);
+ 	*map = 'a';
+ 	if (!is_vma_lock_on_fault((unsigned long)map)) {
+ 		ksft_print_msg("VMA is not marked for lock on fault\n");
+@@ -261,6 +270,8 @@ static void test_lock_onfault_of_present(void)
+ 	if (map == MAP_FAILED)
+ 		ksft_exit_fail_msg("mmap error: %s", strerror(errno));
+ 
++	/* Suppress clustering so only the touched page is resident */
++	madvise(map, 2 * page_size, MADV_RANDOM);
+ 	*map = 'a';
+ 
+ 	if (mlock2_(map, 2 * page_size, MLOCK_ONFAULT)) {
+diff --git a/tools/testing/selftests/mm/vm_util.c b/tools/testing/selftests/mm/vm_util.c
+index db94564f4431..7946c761fcfb 100644
+--- a/tools/testing/selftests/mm/vm_util.c
++++ b/tools/testing/selftests/mm/vm_util.c
+@@ -197,21 +197,26 @@ unsigned long rss_anon(void)
+ 
+ char *__get_smap_entry(void *addr, const char *pattern, char *buf, size_t len)
+ {
+-	int ret;
+ 	FILE *fp;
+ 	char *entry = NULL;
+-	char addr_pattern[MAX_LINE_LENGTH];
+-
+-	ret = snprintf(addr_pattern, MAX_LINE_LENGTH, "%08lx-",
+-		       (unsigned long) addr);
+-	if (ret >= MAX_LINE_LENGTH)
+-		ksft_exit_fail_msg("%s: Pattern is too long\n", __func__);
++	unsigned long target = (unsigned long)addr;
+ 
+ 	fp = fopen(SMAP_FILE_PATH, "r");
+ 	if (!fp)
+ 		ksft_exit_fail_msg("%s: Failed to open file %s\n", __func__, SMAP_FILE_PATH);
+ 
+-	if (!check_for_pattern(fp, addr_pattern, buf, len))
++	/*
++	 * Find the VMA containing addr. Adjacent anonymous mappings with
++	 * the same flags get merged, so addr may not be the VMA start.
++	 */
++	while (fgets(buf, len, fp)) {
++		unsigned long vma_start, vma_end;
++
++		if (sscanf(buf, "%lx-%lx", &vma_start, &vma_end) == 2 &&
++		    target >= vma_start && target < vma_end)
++			break;
++	}
++	if (feof(fp))
+ 		goto err_out;
+ 
+ 	/* Fetch the pattern in the same block */
+-- 
+2.54.0
+

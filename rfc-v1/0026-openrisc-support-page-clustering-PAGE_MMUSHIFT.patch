@@ -1,0 +1,184 @@
+From b98d364d99c1d192e11c45f44e657f728c0cdb04 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:42 +0200
+Subject: [RFC PATCH 26/28] openrisc: support page clustering (PAGE_MMUSHIFT)
+
+---
+ arch/openrisc/include/asm/pgtable.h | 30 ++++++++++++++++++++++++----
+ arch/openrisc/kernel/head.S         | 10 +++++++++-
+ arch/openrisc/mm/init.c             | 31 ++++++++++++++++++++++++++---
+ arch/openrisc/mm/tlb.c              | 17 +++++++++++++---
+ 4 files changed, 77 insertions(+), 11 deletions(-)
+
+diff --git a/arch/openrisc/include/asm/pgtable.h b/arch/openrisc/include/asm/pgtable.h
+index 6b89996d0b62..4da96a954800 100644
+--- a/arch/openrisc/include/asm/pgtable.h
++++ b/arch/openrisc/include/asm/pgtable.h
+@@ -53,7 +53,15 @@ extern void paging_init(void);
+  */
+ #define set_pmd(pmdptr, pmdval) (*(pmdptr) = pmdval)
+ 
+-#define PGDIR_SHIFT	(PAGE_SHIFT + (PAGE_SHIFT-2))
++/*
++ * Page-table geometry tracks the HARDWARE page (MMUPAGE), not the clustered
++ * PAGE: the folded 2-level walk and the software TLB refill are MMUPAGE
++ * (8 KiB)-granular.  Using PAGE_SHIFT here overflows on 32-bit under page
++ * clustering -- at PAGE_MMUSHIFT=4 PGDIR_SHIFT would be 32, so PGDIR_SIZE
++ * (1<<32) wraps to 0 and USER_PTRS_PER_PGD divides by zero.  MMUPAGE_SHIFT
++ * == PAGE_SHIFT at PGCL=0, so this is identity for the non-clustered build.
++ */
++#define PGDIR_SHIFT	(MMUPAGE_SHIFT + (MMUPAGE_SHIFT-2))
+ #define PGDIR_SIZE	(1UL << PGDIR_SHIFT)
+ #define PGDIR_MASK	(~(PGDIR_SIZE-1))
+ 
+@@ -63,7 +71,9 @@ extern void paging_init(void);
+  * pointers are 4 bytes so we can use the page size and
+  * divide it by 4 (shift by 2).
+  */
+-#define PTRS_PER_PTE	(1UL << (PAGE_SHIFT-2))
++/* one PTE per HW (MMUPAGE) page; 4-byte entries -> shift by 2. MMUPAGE-granular
++ * so the 8 KiB PTE table layout matches the asm TLB walker. Identity at PGCL=0. */
++#define PTRS_PER_PTE	(1UL << (MMUPAGE_SHIFT-2))
+ 
+ #define PTRS_PER_PGD	(1UL << (32-PGDIR_SHIFT))
+ 
+@@ -148,7 +158,16 @@ extern void paging_init(void);
+ #define _PAGE_SHARED   _PAGE_U_SHARED
+ #define _PAGE_READ     (_PAGE_URE | _PAGE_SRE)
+ 
+-#define _PAGE_CHG_MASK	(PAGE_MASK | _PAGE_ACCESSED | _PAGE_DIRTY)
++/*
++ * Bits preserved across a protection change (pte_modify(), e.g. mprotect()).
++ * The physical-frame bits are MMUPAGE (hardware page) granular, not PAGE
++ * granular: under page clustering a PAGE spans PAGE_MMUCOUNT MMUPAGEs and a
++ * sub-PTE's frame number carries its sub-page offset in bits
++ * [PAGE_SHIFT-1 : MMUPAGE_SHIFT].  PAGE_MASK would clear exactly those bits
++ * and collapse every sub-PTE in a cluster onto the cluster base, so use
++ * MMUPAGE_MASK.  Identity at PAGE_MMUSHIFT==0 (MMUPAGE_MASK == PAGE_MASK).
++ */
++#define _PAGE_CHG_MASK	(MMUPAGE_MASK | _PAGE_ACCESSED | _PAGE_DIRTY)
+ #define _PAGE_BASE     (_PAGE_PRESENT | _PAGE_ACCESSED)
+ #define _PAGE_ALL      (_PAGE_PRESENT | _PAGE_ACCESSED)
+ #define _KERNPG_TABLE \
+@@ -334,7 +353,10 @@ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
+ #define __pmd_offset(address) \
+ 	(((address) >> PMD_SHIFT) & (PTRS_PER_PMD-1))
+ 
+-#define PFN_PTE_SHIFT		PAGE_SHIFT
++/* set_ptes() advances one HW (MMUPAGE) page per sub-PTE within a cluster, so
++ * the inter-PTE stride is MMUPAGE_SHIFT; pte_pfn/pfn_pte below stay PAGE_SHIFT
++ * (they convert the cluster-base pfn). MMUPAGE_SHIFT==PAGE_SHIFT at PGCL=0. */
++#define PFN_PTE_SHIFT		MMUPAGE_SHIFT
+ #define pte_pfn(x)		((unsigned long)(((x).pte)) >> PAGE_SHIFT)
+ #define pfn_pte(pfn, prot)  __pte((((pfn) << PAGE_SHIFT)) | pgprot_val(prot))
+ 
+diff --git a/arch/openrisc/kernel/head.S b/arch/openrisc/kernel/head.S
+index 45890393947d..d67fbe28165a 100644
+--- a/arch/openrisc/kernel/head.S
++++ b/arch/openrisc/kernel/head.S
+@@ -779,7 +779,15 @@ secondary_init:
+ 	LOAD_SYMBOL_2_GPR(r10, secondary_thread_info)
+ 	tophys	(r30,r10)
+ 	l.lwz	r10,0(r30)
+-	l.addi	r1,r10,THREAD_SIZE
++	/*
++	 * THREAD_SIZE == PAGE_SIZE here; under page clustering
++	 * (PAGE_MMUSHIFT > 0) that exceeds the l.addi 16-bit immediate
++	 * range, so materialise it with movhi/ori then add.  r30 is dead
++	 * here (the next tophys overwrites it).  Identity at PGCL=0.
++	 */
++	l.movhi	r30,hi(THREAD_SIZE)
++	l.ori	r30,r30,lo(THREAD_SIZE)
++	l.add	r1,r10,r30
+ 	tophys	(r30,r10)
+ 	l.sw	TI_KSP(r30),r1
+ 
+diff --git a/arch/openrisc/mm/init.c b/arch/openrisc/mm/init.c
+index 89d8c6df8855..cff4175bc78f 100644
+--- a/arch/openrisc/mm/init.c
++++ b/arch/openrisc/mm/init.c
+@@ -98,9 +98,21 @@ static void __init map_ram(void)
+ 				      __func__);
+ 			set_pmd(pme, __pmd(_KERNPG_TABLE + __pa(pte)));
+ 
+-			/* Fill the newly allocated page with PTE'S */
++			/*
++			 * Fill the newly allocated page with PTEs.  Each PTE
++			 * slot maps one HARDWARE page (MMUPAGE, 8 KiB): the
++			 * software TLB walker indexes the table by
++			 * (EA >> MMUPAGE_SHIFT) & (PTRS_PER_PTE-1), so step the
++			 * virtual/physical cursors by MMUPAGE_SIZE, not the
++			 * (clustered) PAGE_SIZE.  Under page clustering one
++			 * clustered PAGE is PAGE_MMUCOUNT such slots; using
++			 * PAGE_SIZE here would map only every PAGE_MMUCOUNTth
++			 * hardware page and run the cursor PAGE_MMUCOUNT times
++			 * too far per PGD entry.  Identity at PAGE_MMUSHIFT==0
++			 * (MMUPAGE_SIZE == PAGE_SIZE).
++			 */
+ 			for (j = 0; p < e && j < PTRS_PER_PTE;
+-			     v += PAGE_SIZE, p += PAGE_SIZE, j++, pte++) {
++			     v += MMUPAGE_SIZE, p += MMUPAGE_SIZE, j++, pte++) {
+ 				if (v >= (u32) _e_kernel_ro ||
+ 				    v < (u32) _s_kernel_ro)
+ 					prot = PAGE_KERNEL;
+@@ -208,8 +220,21 @@ static int __init map_page(unsigned long va, phys_addr_t pa, pgprot_t prot)
+ 	if (pte == NULL)
+ 		return -ENOMEM;
+ 
++	/*
++	 * A fixmap slot is exactly one HARDWARE page (MMUPAGE), not a
++	 * clustered PAGE: the generic fixmap is MMUPAGE-granular under page
++	 * clustering (asm-generic/fixmap.h spaces slots by MMUPAGE_SIZE and
++	 * __set_fixmap callers add the in-MMUPAGE offset).  So install a
++	 * single PTE for the MMUPAGE containing @pa, masking the physical
++	 * address with MMUPAGE_MASK (pfn_pte()/PAGE_SHIFT would drop the
++	 * sub-cluster offset and map the cluster base -- wrong for a
++	 * non-cluster-aligned fixmap target such as TEXT_POKE).  Mapping more
++	 * than one PTE here would overrun the adjacent (8 KiB-spaced) fixmap
++	 * slot.  Identity at PAGE_MMUSHIFT==0 (MMUPAGE_MASK == PAGE_MASK).
++	 */
+ 	if (pgprot_val(prot))
+-		set_pte_at(&init_mm, va, pte, pfn_pte(pa >> PAGE_SHIFT, prot));
++		set_pte_at(&init_mm, va, pte,
++			   __pte(((pa & MMUPAGE_MASK)) | pgprot_val(prot)));
+ 	else
+ 		pte_clear(&init_mm, va, pte);
+ 
+diff --git a/arch/openrisc/mm/tlb.c b/arch/openrisc/mm/tlb.c
+index 3115f2e4f864..2e593e722844 100644
+--- a/arch/openrisc/mm/tlb.c
++++ b/arch/openrisc/mm/tlb.c
+@@ -32,8 +32,14 @@
+ 			    SPR_DMMUCFGR_NTS_OFF))
+ #define NUM_ITLB_SETS (1 << ((mfspr(SPR_IMMUCFGR) & SPR_IMMUCFGR_NTS) >> \
+ 			    SPR_IMMUCFGR_NTS_OFF))
+-#define DTLB_OFFSET(addr) (((addr) >> PAGE_SHIFT) & (NUM_DTLB_SETS-1))
+-#define ITLB_OFFSET(addr) (((addr) >> PAGE_SHIFT) & (NUM_ITLB_SETS-1))
++/*
++ * The TLB set is selected per HARDWARE page (MMUPAGE, 8 KiB) -- the asm
++ * miss handlers index it with EA >> MMUPAGE_SHIFT (the 0xd shifts).  Under
++ * page clustering a clustered PAGE spans PAGE_MMUCOUNT sets, so use
++ * MMUPAGE_SHIFT here too.  Identity at PAGE_MMUSHIFT==0.
++ */
++#define DTLB_OFFSET(addr) (((addr) >> MMUPAGE_SHIFT) & (NUM_DTLB_SETS-1))
++#define ITLB_OFFSET(addr) (((addr) >> MMUPAGE_SHIFT) & (NUM_ITLB_SETS-1))
+ /*
+  * Invalidate all TLB entries.
+  *
+@@ -103,7 +109,12 @@ void local_flush_tlb_range(struct vm_area_struct *vma,
+ 	dtlbeir = have_dtlbeir;
+ 	itlbeir = have_itlbeir;
+ 
+-	for (addr = start; addr < end; addr += PAGE_SIZE) {
++	/*
++	 * Step by MMUPAGE_SIZE: each hardware TLB entry covers one MMUPAGE,
++	 * so a clustered PAGE needs PAGE_MMUCOUNT invalidations.  Identity at
++	 * PAGE_MMUSHIFT==0 (MMUPAGE_SIZE == PAGE_SIZE).
++	 */
++	for (addr = start; addr < end; addr += MMUPAGE_SIZE) {
+ 		if (dtlbeir)
+ 			flush_dtlb_page_eir(addr);
+ 		else
+-- 
+2.54.0
+

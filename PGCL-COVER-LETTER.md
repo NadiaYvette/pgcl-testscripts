@@ -1,4 +1,4 @@
-# [RFC PATCH 00/NN] mm: page clustering (PAGE_MMUSHIFT)
+# [RFC PATCH 00/28] mm: page clustering (PAGE_MMUSHIFT)
 
 *Draft cover letter for the linux-mm posting. Patch count, shortlog and diffstat
 are filled in mechanically from the final `pgcl-series` branch at assembly time
@@ -6,7 +6,7 @@ are filled in mechanically from the final `pgcl-series` branch at assembly time
 
 ---
 
-Subject: [RFC PATCH 00/NN] mm: page clustering — decouple kernel allocation
+Subject: [RFC PATCH 00/28] mm: page clustering — decouple kernel allocation
 granularity from MMU page size
 
 This series forward-ports and modernises *page clustering* ("larpage"),
@@ -159,6 +159,14 @@ fixes surfaced during the port — riscv ptrace CFI regset, microblaze/alpha
 entry.S save-area, parisc PDC result buffer) lead the series and stand on their
 own.
 
+The series as posted, and the full development tree it was distilled from (all
+architectures, complete history, and the `PAGE_MMUSHIFT` matrix configuration),
+are browsable at:
+
+- posted series — https://github.com/NadiaYvette/linux branch `pgcl-rfc-v1`
+- full development tree — https://github.com/NadiaYvette/linux branch `nadia.chambers/page-clustering-001`
+- SourceHut mirror — https://git.sr.ht/~nadiayvette/linux-pgcl
+
 ## Testing
 
 Validated with a per-arch QEMU matrix (`PAGE_MMUSHIFT` ∈ {0, 2, 4, 6}) running,
@@ -169,6 +177,13 @@ per arch: a clustering unit test, a clustering stress test, the kernel
   on a 4 KiB MMU; 16 hardware PTEs per cluster), with full LTP mm runs and zero
   clustering-specific failures: x86_64, arm64, arm(+lpae), riscv(32/64), s390x,
   ppc64, sparc64, mips64, loongarch64, alpha, parisc(32/64), m68k, microblaze.
+- **Four further architectures boot and pass the clustering smoke test at
+  `PAGE_MMUSHIFT = 4`** (anonymous mmap + per-MMUPAGE touch over a cluster,
+  fork + COW; userspace page size confirmed unchanged at the 4–8 KiB hardware
+  page): **sh4, csky, openrisc (or1k), and xtensa** (the last verified with
+  highmem both disabled and active). Full LTP for these four awaits libc
+  cross-toolchains; they are exercised today with a nolibc clustering smoke test.
+  **arc** is build-tested only — no system emulator (`qemu-system-arc`) exists.
 - **`PAGE_MMUSHIFT = 6`** (256 KiB kernel page; 1 MiB on 16 KiB-MMU loongarch)
   additionally verified on x86_64, aarch64, parisc(32/64), s390x, arm-lpae,
   mips64, m68k, loongarch64, alpha — including full PTE-table sub-page packing
@@ -183,6 +198,23 @@ The few residual selftest/LTP deltas are architecture-specific and reproduce at
 `PAGE_MMUSHIFT == 0` / on mainline (HW SHMLBA, musl libc stubs, missing optional
 Kconfig); they are not introduced by clustering. (Per-arch result tables to be
 appended.)
+
+The complete test harness — the per-architecture QEMU matrix driver, the
+boot/run configurations, the clustering unit and stress tests, the nolibc smoke
+test, and the result logs — is maintained in a companion repository:
+
+- https://github.com/NadiaYvette/pgcl-testscripts
+- https://git.sr.ht/~nadiayvette/pgcl-testscripts (mirror)
+
+Separately, an early formal-verification effort — *tessera* — is under way: a
+Lean 4 formalisation of the core clustering algorithms (the cluster/MMUPAGE
+coordinate model and the sharing and atomicity properties that the rmap and
+refcount accounting rely on), accompanied by concurrency litmus tests, and
+intended in time to span elements of the Linux C API surface for clustering. It
+is work in progress and not a dependency of this series.
+
+- https://github.com/NadiaYvette/tessera
+- https://git.sr.ht/~nadiayvette/tessera (mirror)
 
 ## Known issues / RFC questions
 
@@ -222,7 +254,11 @@ times, including in the last two years. The through-line, for the record:
 - **The 2.4/2.5 forward-port.** I forward-ported and extended Hugh's larpage
   through the 2.4/2.5 era, including booting Linux on a 64 GiB NUMA-Q on 32-bit
   x86 (PAE) in 2003 — feasible precisely because clustering shrinks the `struct page`
-  array enough to fit a 64 GiB memmap in 32-bit lowmem. The signed patch series
+  array enough to fit a 64 GiB memmap in 32-bit lowmem. Clustering was chosen there
+over full kernel/user address-space switching — the XKVA approach, from the
+DYNIX/ptx and AIX lineage I came from — precisely because address-space switching
+is a terminal 32-bit expedient, whereas raising the allocation unit carries
+forward to 64-bit, and, as it turned out, to superpages. The signed patch series
   and the boot logs themselves are still archived [2]. (That work was published
   under my former byline; it is cited here as historical attribution.)
 - **Software PAGE_SIZE, 2007.** Andrea Arcangeli's "CONFIG_PAGE_SHIFT (aka
@@ -262,6 +298,31 @@ would be welcome.
     32 KiB clustered page, Linux 2.5.66; dmesg.64G.4K the stock-4 KiB baseline on
     the same NUMA-Q)
 [3] https://lore.kernel.org/all/20070717193308.GD25301@v2.random/ (CONFIG_PAGE_SHIFT thread)
+
+## A note on AI assistance
+
+This series was prepared with substantial assistance from an AI coding assistant
+(Anthropic's Claude). I take responsibility for the patches and have reviewed
+them; I disclose this both because kernel practice increasingly expects it and
+because the connection is, here, substantive rather than incidental. The central
+move of this work — drawing a new distinction between the kernel's allocation unit
+and the hardware's minimum TLB/MMU mapping granularity — is a conceptual cut not
+present in the existing vocabulary, and I had long assumed it was exactly the kind
+of thing a language model would handle poorly: such a model's notion of meaning is
+something like a set of nearby directions in a vector space, inferred rather than
+anchored to a referent, and a genuinely new distinction has no such neighbourhood
+to inherit. For some months I cited this very problem as an example of what these
+models would find hard. Then I tried it, and it held — well enough that a project
+I had shelved as one I never secured the team-lead role or the headcount to
+finish became, instead, this submission.
+
+That assistance extended to the writing itself, this cover letter included. The
+prose began from the assistant's preliminary draft — which I judged a better
+armature than my own first attempt — and I worked my own voice into it, rather
+than the reverse, hand-writing the bulk and correcting toward it. I note it
+because the disclosure should cover the words as much as the code: the choices of
+what to claim, what to cite, and what to stand behind are mine, but the
+composition is substantially collaborative.
 
 ---
 

@@ -1,0 +1,1398 @@
+From ed876906b13f775ffa521cb4d86575a99748f4cb Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:34 +0200
+Subject: [RFC PATCH 15/28] mips: support page clustering (PAGE_MMUSHIFT)
+
+---
+ arch/mips/Kconfig                    |  13 +++
+ arch/mips/include/asm/elf.h          |   2 +-
+ arch/mips/include/asm/mipsregs.h     |  28 +++--
+ arch/mips/include/asm/page.h         |  31 ++++-
+ arch/mips/include/asm/pgalloc.h      |  67 +++++++++--
+ arch/mips/include/asm/pgtable-32.h   |  27 +++--
+ arch/mips/include/asm/pgtable-64.h   |  56 ++++++---
+ arch/mips/include/asm/pgtable-bits.h |  24 +++-
+ arch/mips/include/asm/pgtable.h      |  33 +++++-
+ arch/mips/include/asm/stackframe.h   |   5 +
+ arch/mips/include/asm/vdso/vdso.h    |   2 +-
+ arch/mips/kernel/asm-offsets.c       |   2 +
+ arch/mips/kernel/genex.S             |  14 ++-
+ arch/mips/kernel/process.c           |  23 +++-
+ arch/mips/kernel/setup.c             |   4 +-
+ arch/mips/kernel/syscall.c           |   8 +-
+ arch/mips/kernel/vdso.c              |  19 ++-
+ arch/mips/kernel/vmlinux.lds.S       |   1 +
+ arch/mips/mm/Makefile                |   1 +
+ arch/mips/mm/c-octeon.c              |   2 +-
+ arch/mips/mm/c-r4k.c                 |  10 +-
+ arch/mips/mm/mmap.c                  |  20 ++--
+ arch/mips/mm/pgtable.c               |  18 +--
+ arch/mips/mm/pgtable_pte.c           | 169 +++++++++++++++++++++++++++
+ arch/mips/mm/tlb-r4k.c               |  26 ++---
+ arch/mips/mm/tlbex.c                 |  30 ++---
+ 26 files changed, 510 insertions(+), 125 deletions(-)
+ create mode 100644 arch/mips/mm/pgtable_pte.c
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index 4364f3dba688..36b94ba50629 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -25,6 +25,10 @@ config MIPS
+ 	select ARCH_USE_MEMTEST
+ 	select ARCH_USE_QUEUED_RWLOCKS
+ 	select ARCH_USE_QUEUED_SPINLOCKS
++	# PGCL packs PAGE_MMUCOUNT MMUPAGE-sized PTE tables into one
++	# PAGE_SIZE ptdesc; ask for one ptlock per sub-table so that
++	# SPLIT_PTE_PTLOCKS keeps working under PGCL.
++	select PACK_PTE_PTLOCKS if PAGE_MMUSHIFT > 0
+ 	select ARCH_SUPPORTS_HUGETLBFS if CPU_SUPPORTS_HUGEPAGES
+ 	select ARCH_WANT_DEFAULT_TOPDOWN_MMAP_LAYOUT if MMU
+ 	select ARCH_WANT_IPC_PARSE_VERSION
+@@ -2126,6 +2130,15 @@ config ZBOOT_LOAD_ADDRESS
+ 
+ config ARCH_FORCE_MAX_ORDER
+ 	int "Maximum zone order"
++	# PGCL widens PAGE_SIZE by 2^PAGE_MMUSHIFT; cap MAX_PAGE_ORDER so
++	# PAGE_SHIFT + MAX_PAGE_ORDER stays under SECTION_SIZE_BITS (=28-29).
++	# `range` clauses force `make olddefconfig` to clamp a stale value.
++	range 1 5 if PAGE_MMUSHIFT >= 6
++	range 1 8 if PAGE_MMUSHIFT >= 4
++	range 1 10 if PAGE_MMUSHIFT >= 2
++	default "5" if PAGE_MMUSHIFT >= 6
++	default "8" if PAGE_MMUSHIFT >= 4
++	default "10" if PAGE_MMUSHIFT >= 2
+ 	default "13" if MIPS_HUGE_TLB_SUPPORT && PAGE_SIZE_64KB
+ 	default "12" if MIPS_HUGE_TLB_SUPPORT && PAGE_SIZE_32KB
+ 	default "11" if MIPS_HUGE_TLB_SUPPORT && PAGE_SIZE_16KB
+diff --git a/arch/mips/include/asm/elf.h b/arch/mips/include/asm/elf.h
+index aaef0eaa68d5..ed639e7f96be 100644
+--- a/arch/mips/include/asm/elf.h
++++ b/arch/mips/include/asm/elf.h
+@@ -413,7 +413,7 @@ do {									\
+ #endif /* CONFIG_64BIT */
+ 
+ #define CORE_DUMP_USE_REGSET
+-#define ELF_EXEC_PAGESIZE	PAGE_SIZE
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ 
+ /* This yields a mask that user programs can use to figure out what
+    instruction set this cpu supports.  This could be done in userspace,
+diff --git a/arch/mips/include/asm/mipsregs.h b/arch/mips/include/asm/mipsregs.h
+index 12a095dbf9e2..4a502723bbf4 100644
+--- a/arch/mips/include/asm/mipsregs.h
++++ b/arch/mips/include/asm/mipsregs.h
+@@ -322,34 +322,38 @@
+ #define PM_1G		0x7fffe000
+ 
+ /*
+- * Default page size for a given kernel configuration
++ * Default page size for a given kernel configuration.
++ * With PGCL (PAGE_MMUSHIFT > 0), CONFIG_PAGE_SIZE_* reflects the kernel
++ * allocation granularity, not the hardware MMU page size.  PM_DEFAULT_MASK
++ * must match the hardware page size (MMUPAGE_SIZE = 1 << CONFIG_PAGE_SHIFT).
+  */
+-#ifdef CONFIG_PAGE_SIZE_4KB
++#if CONFIG_PAGE_SHIFT == 12
+ #define PM_DEFAULT_MASK PM_4K
+-#elif defined(CONFIG_PAGE_SIZE_8KB)
++#elif CONFIG_PAGE_SHIFT == 13
+ #define PM_DEFAULT_MASK PM_8K
+-#elif defined(CONFIG_PAGE_SIZE_16KB)
++#elif CONFIG_PAGE_SHIFT == 14
+ #define PM_DEFAULT_MASK PM_16K
+-#elif defined(CONFIG_PAGE_SIZE_32KB)
++#elif CONFIG_PAGE_SHIFT == 15
+ #define PM_DEFAULT_MASK PM_32K
+-#elif defined(CONFIG_PAGE_SIZE_64KB)
++#elif CONFIG_PAGE_SHIFT == 16
+ #define PM_DEFAULT_MASK PM_64K
+ #else
+ #error Bad page size configuration!
+ #endif
+ 
+ /*
+- * Default huge tlb size for a given kernel configuration
++ * Default huge tlb size for a given kernel configuration.
++ * Must match hardware page size (CONFIG_PAGE_SHIFT), not kernel page size.
+  */
+-#ifdef CONFIG_PAGE_SIZE_4KB
++#if CONFIG_PAGE_SHIFT == 12
+ #define PM_HUGE_MASK	PM_1M
+-#elif defined(CONFIG_PAGE_SIZE_8KB)
++#elif CONFIG_PAGE_SHIFT == 13
+ #define PM_HUGE_MASK	PM_4M
+-#elif defined(CONFIG_PAGE_SIZE_16KB)
++#elif CONFIG_PAGE_SHIFT == 14
+ #define PM_HUGE_MASK	PM_16M
+-#elif defined(CONFIG_PAGE_SIZE_32KB)
++#elif CONFIG_PAGE_SHIFT == 15
+ #define PM_HUGE_MASK	PM_64M
+-#elif defined(CONFIG_PAGE_SIZE_64KB)
++#elif CONFIG_PAGE_SHIFT == 16
+ #define PM_HUGE_MASK	PM_256M
+ #elif defined(CONFIG_MIPS_HUGE_TLB_SUPPORT)
+ #error Bad page size configuration for hugetlbfs!
+diff --git a/arch/mips/include/asm/page.h b/arch/mips/include/asm/page.h
+index 50a382a0d8f6..f7870e268b4d 100644
+--- a/arch/mips/include/asm/page.h
++++ b/arch/mips/include/asm/page.h
+@@ -16,6 +16,17 @@
+ 
+ #include <vdso/page.h>
+ 
++#ifdef CONFIG_PACK_PTE_PTLOCKS
++/*
++ * mips packs PAGE_MMUCOUNT MMUPAGE-sized PTE tables into one PAGE_SIZE
++ * ptdesc; tell the generic ptlock allocator to size the per-ptdesc lock
++ * array accordingly so each sub-table has its own spinlock and
++ * copy_page_range() doesn't deadlock when src and dst share a ptdesc.
++ * See arch/mips/mm/pgtable_pte.c.
++ */
++#define PTE_PACK_ORDER	PAGE_MMUSHIFT
++#endif
++
+ /*
+  * This is used for calculating the real page sizes
+  * for FTLB or VTLB + FTLB configurations.
+@@ -24,15 +35,15 @@ static inline unsigned int page_size_ftlb(unsigned int mmuextdef)
+ {
+ 	switch (mmuextdef) {
+ 	case MIPS_CONF4_MMUEXTDEF_FTLBSIZEEXT:
+-		if (PAGE_SIZE == (1 << 30))
++		if (MMUPAGE_SIZE == (1 << 30))
+ 			return 5;
+-		if (PAGE_SIZE == (1llu << 32))
++		if (MMUPAGE_SIZE == (1llu << 32))
+ 			return 6;
+-		if (PAGE_SIZE > (256 << 10))
++		if (MMUPAGE_SIZE > (256 << 10))
+ 			return 7; /* reserved */
+ 		fallthrough;
+ 	case MIPS_CONF4_MMUEXTDEF_VTLBSIZEEXT:
+-		return (PAGE_SHIFT - 10) / 2;
++		return (MMUPAGE_SHIFT - 10) / 2;
+ 	default:
+ 		panic("Invalid FTLB configuration with Conf4_mmuextdef=%d value\n",
+ 		      mmuextdef >> 14);
+@@ -40,7 +51,7 @@ static inline unsigned int page_size_ftlb(unsigned int mmuextdef)
+ }
+ 
+ #ifdef CONFIG_MIPS_HUGE_TLB_SUPPORT
+-#define HPAGE_SHIFT	(PAGE_SHIFT + PAGE_SHIFT - 3)
++#define HPAGE_SHIFT	(2 * MMUPAGE_SHIFT - 3)
+ #define HPAGE_SIZE	(_AC(1,UL) << HPAGE_SHIFT)
+ #define HPAGE_MASK	(~(HPAGE_SIZE - 1))
+ #define HUGETLB_PAGE_ORDER	(HPAGE_SHIFT - PAGE_SHIFT)
+@@ -116,7 +127,15 @@ typedef struct { unsigned long pte; } pte_t;
+ #define pte_val(x)	((x).pte)
+ #define __pte(x)	((pte_t) { (x) } )
+ #endif
+-typedef struct page *pgtable_t;
++/*
++ * pgtable_t is the type passed to pmd_populate() / pte_free() and stored in
++ * the deposited-pgtable list for THP.  Use pte_t * directly (the address of
++ * the actual hardware PTE table) rather than struct page * so that PGCL can
++ * pack multiple MMUPAGE-sized PTE tables into one kernel PAGE_SIZE chunk:
++ * each sub-table has its own pte_t * but maps to the same struct page.
++ * Modeled after sparc64 / m68k-coldfire.
++ */
++typedef pte_t *pgtable_t;
+ 
+ /*
+  * Right now we don't support 4-level pagetables, so all pud-related
+diff --git a/arch/mips/include/asm/pgalloc.h b/arch/mips/include/asm/pgalloc.h
+index 9ec9cf01e92e..239eb66ab5a8 100644
+--- a/arch/mips/include/asm/pgalloc.h
++++ b/arch/mips/include/asm/pgalloc.h
+@@ -13,9 +13,16 @@
+ #include <linux/mm.h>
+ #include <linux/sched.h>
+ 
+-#define __HAVE_ARCH_PMD_ALLOC_ONE
+-#define __HAVE_ARCH_PUD_ALLOC_ONE
+-#include <asm-generic/pgalloc.h>
++/*
++ * Don't pull in asm-generic/pgalloc.h: pgtable_t is pte_t * on mips
++ * (so PGCL can pack many MMUPAGE-sized PTE tables into one PAGE_SIZE
++ * chunk), which is incompatible with the generic helpers that return
++ * struct page *.  Provide every entry point explicitly here, mirroring
++ * sparc64's approach.
++ */
++
++#define GFP_PGTABLE_KERNEL	(GFP_KERNEL | __GFP_ZERO)
++#define GFP_PGTABLE_USER	(GFP_PGTABLE_KERNEL | __GFP_ACCOUNT)
+ 
+ static inline void pmd_populate_kernel(struct mm_struct *mm, pmd_t *pmd,
+ 	pte_t *pte)
+@@ -23,12 +30,25 @@ static inline void pmd_populate_kernel(struct mm_struct *mm, pmd_t *pmd,
+ 	set_pmd(pmd, __pmd((unsigned long)pte));
+ }
+ 
++/*
++ * pgtable_t is pte_t * on mips (see asm/page.h), so pmd_populate is
++ * identical to pmd_populate_kernel: install the PTE-table virtual
++ * address directly, no struct page round-trip.
++ */
+ static inline void pmd_populate(struct mm_struct *mm, pmd_t *pmd,
+ 	pgtable_t pte)
+ {
+-	set_pmd(pmd, __pmd((unsigned long)page_address(pte)));
++	set_pmd(pmd, __pmd((unsigned long)pte));
+ }
+ 
++/*
++ * Override the asm-generic pmd_pgtable (defined in include/linux/pgtable.h
++ * as pmd_page(pmd) — i.e. struct page *) with the pte_t * form, since
++ * pgtable_t is pte_t * on mips.  Pre-empt the generic definition.
++ */
++#undef pmd_pgtable
++#define pmd_pgtable(pmd)	((pte_t *)pmd_page_vaddr(pmd))
++
+ /*
+  * Initialize a new pmd table with invalid pointers.
+  */
+@@ -48,7 +68,26 @@ static inline void pud_populate(struct mm_struct *mm, pud_t *pud, pmd_t *pmd)
+ extern void pgd_init(void *addr);
+ extern pgd_t *pgd_alloc(struct mm_struct *mm);
+ 
+-#define __pte_free_tlb(tlb, pte, address)	tlb_remove_ptdesc((tlb), page_ptdesc(pte))
++static inline void pgd_free(struct mm_struct *mm, pgd_t *pgd)
++{
++	pagetable_dtor_free(virt_to_ptdesc(pgd));
++}
++
++/* PTE allocator (PGCL sub-page packed) — see arch/mips/mm/pgtable_pte.c */
++extern pte_t *pte_alloc_one_kernel(struct mm_struct *mm);
++extern pgtable_t pte_alloc_one(struct mm_struct *mm);
++extern void pte_free_kernel(struct mm_struct *mm, pte_t *pte);
++extern void pte_free(struct mm_struct *mm, pgtable_t pte);
++
++/*
++ * The TLB-gather PTE-table free path can't batch sub-table frees through
++ * tlb_remove_ptdesc (which would prematurely release the kernel page that
++ * still hosts other live sub-tables).  Just call our packed pte_free
++ * directly here; the eventual tlb_finish_mmu() flushes the TLB before
++ * the freed sub-table can be observed by user mode.
++ */
++#define __pte_free_tlb(tlb, pte, address)			\
++	pte_free((tlb)->mm, (pte))
+ 
+ #ifndef __PAGETABLE_PMD_FOLDED
+ 
+@@ -57,7 +96,8 @@ static inline pmd_t *pmd_alloc_one(struct mm_struct *mm, unsigned long address)
+ 	pmd_t *pmd;
+ 	struct ptdesc *ptdesc;
+ 
+-	ptdesc = pagetable_alloc(GFP_KERNEL_ACCOUNT, PMD_TABLE_ORDER);
++	ptdesc = pagetable_alloc(GFP_KERNEL_ACCOUNT | __GFP_ZERO,
++				 PMD_TABLE_ORDER);
+ 	if (!ptdesc)
+ 		return NULL;
+ 
+@@ -71,6 +111,12 @@ static inline pmd_t *pmd_alloc_one(struct mm_struct *mm, unsigned long address)
+ 	return pmd;
+ }
+ 
++static inline void pmd_free(struct mm_struct *mm, pmd_t *pmd)
++{
++	BUG_ON((unsigned long)pmd & (MMUPAGE_SIZE - 1));
++	pagetable_dtor_free(virt_to_ptdesc(pmd));
++}
++
+ #define __pmd_free_tlb(tlb, x, addr)	tlb_remove_ptdesc((tlb), virt_to_ptdesc(x))
+ 
+ #endif
+@@ -80,7 +126,8 @@ static inline pmd_t *pmd_alloc_one(struct mm_struct *mm, unsigned long address)
+ static inline pud_t *pud_alloc_one(struct mm_struct *mm, unsigned long address)
+ {
+ 	pud_t *pud;
+-	struct ptdesc *ptdesc = pagetable_alloc(GFP_KERNEL, PUD_TABLE_ORDER);
++	struct ptdesc *ptdesc = pagetable_alloc(GFP_KERNEL | __GFP_ZERO,
++						PUD_TABLE_ORDER);
+ 
+ 	if (!ptdesc)
+ 		return NULL;
+@@ -91,6 +138,12 @@ static inline pud_t *pud_alloc_one(struct mm_struct *mm, unsigned long address)
+ 	return pud;
+ }
+ 
++static inline void pud_free(struct mm_struct *mm, pud_t *pud)
++{
++	BUG_ON((unsigned long)pud & (MMUPAGE_SIZE - 1));
++	pagetable_dtor_free(virt_to_ptdesc(pud));
++}
++
+ static inline void p4d_populate(struct mm_struct *mm, p4d_t *p4d, pud_t *pud)
+ {
+ 	set_p4d(p4d, __p4d((unsigned long)pud));
+diff --git a/arch/mips/include/asm/pgtable-32.h b/arch/mips/include/asm/pgtable-32.h
+index 92b7591aac2a..263b0f6c8d81 100644
+--- a/arch/mips/include/asm/pgtable-32.h
++++ b/arch/mips/include/asm/pgtable-32.h
+@@ -60,11 +60,15 @@ extern int add_temporary_entry(unsigned long entrylo0, unsigned long entrylo1,
+  * works even with the cache aliasing problem the R4k and above have.
+  */
+ 
+-/* PGDIR_SHIFT determines what a third-level page table entry can map */
++/*
++ * PGDIR_SHIFT determines what a third-level page table entry can map.
++ * Page table pages are MMUPAGE-sized, so use MMUPAGE_SHIFT for
++ * entries-per-table-page calculation.
++ */
+ #if defined(CONFIG_MIPS_HUGE_TLB_SUPPORT) && !defined(CONFIG_PHYS_ADDR_T_64BIT)
+-# define PGDIR_SHIFT	(2 * PAGE_SHIFT - PTE_T_LOG2 - 1)
++# define PGDIR_SHIFT	(2 * MMUPAGE_SHIFT - PTE_T_LOG2 - 1)
+ #else
+-# define PGDIR_SHIFT	(2 * PAGE_SHIFT - PTE_T_LOG2)
++# define PGDIR_SHIFT	(2 * MMUPAGE_SHIFT - PTE_T_LOG2)
+ #endif
+ 
+ #define PGDIR_SIZE	(1UL << PGDIR_SHIFT)
+@@ -75,9 +79,9 @@ extern int add_temporary_entry(unsigned long entrylo0, unsigned long entrylo1,
+  * we don't really have any PUD/PMD directory physically.
+  */
+ #if defined(CONFIG_MIPS_HUGE_TLB_SUPPORT) && !defined(CONFIG_PHYS_ADDR_T_64BIT)
+-# define __PGD_TABLE_ORDER (32 - 3 * PAGE_SHIFT + PGD_T_LOG2 + PTE_T_LOG2 + 1)
++# define __PGD_TABLE_ORDER (32 - 3 * MMUPAGE_SHIFT + PGD_T_LOG2 + PTE_T_LOG2 + 1)
+ #else
+-# define __PGD_TABLE_ORDER (32 - 3 * PAGE_SHIFT + PGD_T_LOG2 + PTE_T_LOG2)
++# define __PGD_TABLE_ORDER (32 - 3 * MMUPAGE_SHIFT + PGD_T_LOG2 + PTE_T_LOG2)
+ #endif
+ 
+ #define PGD_TABLE_ORDER	(__PGD_TABLE_ORDER >= 0 ? __PGD_TABLE_ORDER : 0)
+@@ -86,9 +90,9 @@ extern int add_temporary_entry(unsigned long entrylo0, unsigned long entrylo1,
+ 
+ #define PTRS_PER_PGD	(USER_PTRS_PER_PGD * 2)
+ #if defined(CONFIG_MIPS_HUGE_TLB_SUPPORT) && !defined(CONFIG_PHYS_ADDR_T_64BIT)
+-# define PTRS_PER_PTE	(PAGE_SIZE / sizeof(pte_t) / 2)
++# define PTRS_PER_PTE	(MMUPAGE_SIZE / sizeof(pte_t) / 2)
+ #else
+-# define PTRS_PER_PTE	(PAGE_SIZE / sizeof(pte_t))
++# define PTRS_PER_PTE	(MMUPAGE_SIZE / sizeof(pte_t))
+ #endif
+ 
+ #define USER_PTRS_PER_PGD	(0x80000000UL/PGDIR_SIZE)
+@@ -134,7 +138,8 @@ static inline int pmd_bad(pmd_t pmd)
+ 		return 0;
+ #endif
+ 
+-	if (unlikely(pmd_val(pmd) & ~PAGE_MASK))
++	/* See pgtable-64.h pmd_bad() comment: PTE sub-tables are MMUPAGE-aligned. */
++	if (unlikely(pmd_val(pmd) & ~MMUPAGE_MASK))
+ 		return 1;
+ 
+ 	return 0;
+@@ -184,9 +189,9 @@ static inline pte_t pfn_pte(unsigned long pfn, pgprot_t prot)
+ #else
+ 
+ #define MAX_POSSIBLE_PHYSMEM_BITS 32
+-#define pte_pfn(x)		((unsigned long)((x).pte >> PFN_PTE_SHIFT))
+-#define pfn_pte(pfn, prot)	__pte(((unsigned long long)(pfn) << PFN_PTE_SHIFT) | pgprot_val(prot))
+-#define pfn_pmd(pfn, prot)	__pmd(((unsigned long long)(pfn) << PFN_PTE_SHIFT) | pgprot_val(prot))
++#define pte_pfn(x)		((unsigned long)((x).pte >> (PFN_PTE_SHIFT + PAGE_MMUSHIFT)))
++#define pfn_pte(pfn, prot)	__pte(((unsigned long long)(pfn) << (PFN_PTE_SHIFT + PAGE_MMUSHIFT)) | pgprot_val(prot))
++#define pfn_pmd(pfn, prot)	__pmd(((unsigned long long)(pfn) << (PFN_PTE_SHIFT + PAGE_MMUSHIFT)) | pgprot_val(prot))
+ #endif /* defined(CONFIG_PHYS_ADDR_T_64BIT) && defined(CONFIG_CPU_MIPS32) */
+ 
+ #define pte_page(x)		pfn_to_page(pte_pfn(x))
+diff --git a/arch/mips/include/asm/pgtable-64.h b/arch/mips/include/asm/pgtable-64.h
+index 6e854bb11f37..b1688a6b6f8f 100644
+--- a/arch/mips/include/asm/pgtable-64.h
++++ b/arch/mips/include/asm/pgtable-64.h
+@@ -40,26 +40,30 @@
+  */
+ 
+ 
+-/* PGDIR_SHIFT determines what a third-level page table entry can map */
++/*
++ * PGDIR_SHIFT determines what a third-level page table entry can map.
++ * Page table pages are MMUPAGE-sized (hardware page), so all shift
++ * calculations use MMUPAGE_SHIFT for entries-per-table-page (log2(MMUPAGE_SIZE/8)).
++ */
+ #ifdef __PAGETABLE_PMD_FOLDED
+-#define PGDIR_SHIFT	(PAGE_SHIFT + PAGE_SHIFT - 3)
++#define PGDIR_SHIFT	(2 * MMUPAGE_SHIFT - 3)
+ #else
+ 
+ /* PMD_SHIFT determines the size of the area a second-level page table can map */
+-#define PMD_SHIFT	(PAGE_SHIFT + (PAGE_SHIFT - 3))
++#define PMD_SHIFT	(2 * MMUPAGE_SHIFT - 3)
+ #define PMD_SIZE	(1UL << PMD_SHIFT)
+ #define PMD_MASK	(~(PMD_SIZE-1))
+ 
+ # ifdef __PAGETABLE_PUD_FOLDED
+-# define PGDIR_SHIFT	(PMD_SHIFT + (PAGE_SHIFT + PMD_TABLE_ORDER - 3))
++# define PGDIR_SHIFT	(PMD_SHIFT + (MMUPAGE_SHIFT + PMD_TABLE_ORDER - 3))
+ # endif
+ #endif
+ 
+ #ifndef __PAGETABLE_PUD_FOLDED
+-#define PUD_SHIFT	(PMD_SHIFT + (PAGE_SHIFT + PMD_TABLE_ORDER - 3))
++#define PUD_SHIFT	(PMD_SHIFT + (MMUPAGE_SHIFT + PMD_TABLE_ORDER - 3))
+ #define PUD_SIZE	(1UL << PUD_SHIFT)
+ #define PUD_MASK	(~(PUD_SIZE-1))
+-#define PGDIR_SHIFT	(PUD_SHIFT + (PAGE_SHIFT + PUD_TABLE_ORDER - 3))
++#define PGDIR_SHIFT	(PUD_SHIFT + (MMUPAGE_SHIFT + PUD_TABLE_ORDER - 3))
+ #endif
+ 
+ #define PGDIR_SIZE	(1UL << PGDIR_SHIFT)
+@@ -122,14 +126,18 @@
+ #endif
+ #endif
+ 
+-#define PTRS_PER_PGD	((PAGE_SIZE << PGD_TABLE_ORDER) / sizeof(pgd_t))
++/*
++ * Page table pages are MMUPAGE-sized.  Use MMUPAGE_SIZE for entry counts
++ * so TLB refill andi masks fit in 16-bit immediates.
++ */
++#define PTRS_PER_PGD	((MMUPAGE_SIZE << PGD_TABLE_ORDER) / sizeof(pgd_t))
+ #ifndef __PAGETABLE_PUD_FOLDED
+-#define PTRS_PER_PUD	((PAGE_SIZE << PUD_TABLE_ORDER) / sizeof(pud_t))
++#define PTRS_PER_PUD	((MMUPAGE_SIZE << PUD_TABLE_ORDER) / sizeof(pud_t))
+ #endif
+ #ifndef __PAGETABLE_PMD_FOLDED
+-#define PTRS_PER_PMD	((PAGE_SIZE << PMD_TABLE_ORDER) / sizeof(pmd_t))
++#define PTRS_PER_PMD	((MMUPAGE_SIZE << PMD_TABLE_ORDER) / sizeof(pmd_t))
+ #endif
+-#define PTRS_PER_PTE	(PAGE_SIZE / sizeof(pte_t))
++#define PTRS_PER_PTE	(MMUPAGE_SIZE / sizeof(pte_t))
+ 
+ #define USER_PTRS_PER_PGD       ((TASK_SIZE64 / PGDIR_SIZE)?(TASK_SIZE64 / PGDIR_SIZE):1)
+ 
+@@ -141,7 +149,7 @@
+ #define VMALLOC_START		(MAP_BASE + (2 * PAGE_SIZE))
+ #define VMALLOC_END	\
+ 	(MAP_BASE + \
+-	 min(PTRS_PER_PGD * PTRS_PER_PUD * PTRS_PER_PMD * PTRS_PER_PTE * PAGE_SIZE, \
++	 min(PTRS_PER_PGD * PTRS_PER_PUD * PTRS_PER_PMD * PTRS_PER_PTE * MMUPAGE_SIZE, \
+ 	     (1UL << cpu_vmbits)) - (1UL << 32))
+ 
+ #if defined(CONFIG_MODULES) && defined(KBUILD_64BIT_SYM32) && \
+@@ -188,7 +196,8 @@ static inline int p4d_none(p4d_t p4d)
+ 
+ static inline int p4d_bad(p4d_t p4d)
+ {
+-	if (unlikely(p4d_val(p4d) & ~PAGE_MASK))
++	/* See pmd_bad() comment: page tables are MMUPAGE-aligned. */
++	if (unlikely(p4d_val(p4d) & ~MMUPAGE_MASK))
+ 		return 1;
+ 
+ 	return 0;
+@@ -250,7 +259,13 @@ static inline int pmd_bad(pmd_t pmd)
+ 		return 0;
+ #endif
+ 
+-	if (unlikely(pmd_val(pmd) & ~PAGE_MASK))
++	/*
++	 * Page tables are MMUPAGE-sized.  Under PGCL the kernel page can
++	 * host multiple MMUPAGE-aligned PTE sub-tables (see arch/mips/mm/
++	 * pgtable_pte.c), so checking against ~PAGE_MASK would falsely
++	 * reject every sub-table at non-zero sub-page offset.
++	 */
++	if (unlikely(pmd_val(pmd) & ~MMUPAGE_MASK))
+ 		return 1;
+ 
+ 	return 0;
+@@ -282,7 +297,8 @@ static inline int pud_none(pud_t pud)
+ 
+ static inline int pud_bad(pud_t pud)
+ {
+-	return pud_val(pud) & ~PAGE_MASK;
++	/* See pmd_bad() comment: page tables are MMUPAGE-aligned. */
++	return pud_val(pud) & ~MMUPAGE_MASK;
+ }
+ 
+ static inline int pud_present(pud_t pud)
+@@ -298,9 +314,15 @@ static inline void pud_clear(pud_t *pudp)
+ 
+ #define pte_page(x)		pfn_to_page(pte_pfn(x))
+ 
+-#define pte_pfn(x)		((unsigned long)((x).pte >> PFN_PTE_SHIFT))
+-#define pfn_pte(pfn, prot)	__pte(((pfn) << PFN_PTE_SHIFT) | pgprot_val(prot))
+-#define pfn_pmd(pfn, prot)	__pmd(((pfn) << PFN_PTE_SHIFT) | pgprot_val(prot))
++/*
++ * pte_pfn returns a PAGE-granular PFN (phys >> PAGE_SHIFT).
++ * pfn_pte accepts a PAGE-granular PFN.
++ * With PGCL, PFN_PTE_SHIFT is MMUPAGE-based, so we shift by an extra
++ * PAGE_MMUSHIFT to get/set PAGE-granular PFNs.
++ */
++#define pte_pfn(x)		((unsigned long)((x).pte >> (PFN_PTE_SHIFT + PAGE_MMUSHIFT)))
++#define pfn_pte(pfn, prot)	__pte(((unsigned long)(pfn) << (PFN_PTE_SHIFT + PAGE_MMUSHIFT)) | pgprot_val(prot))
++#define pfn_pmd(pfn, prot)	__pmd(((unsigned long)(pfn) << (PFN_PTE_SHIFT + PAGE_MMUSHIFT)) | pgprot_val(prot))
+ 
+ #ifndef __PAGETABLE_PMD_FOLDED
+ static inline pmd_t *pud_pgtable(pud_t pud)
+diff --git a/arch/mips/include/asm/pgtable-bits.h b/arch/mips/include/asm/pgtable-bits.h
+index 088623ba7b8b..03da4a2f0e22 100644
+--- a/arch/mips/include/asm/pgtable-bits.h
++++ b/arch/mips/include/asm/pgtable-bits.h
+@@ -182,10 +182,16 @@ enum pgtable_bits {
+ #if defined(CONFIG_CPU_R3K_TLB)
+ # define _CACHE_UNCACHED	(1 << _CACHE_UNCACHED_SHIFT)
+ # define _CACHE_MASK		_CACHE_UNCACHED
+-# define PFN_PTE_SHIFT		PAGE_SHIFT
++# define PFN_PTE_SHIFT		MMUPAGE_SHIFT
+ #else
+ # define _CACHE_MASK		(7 << _CACHE_SHIFT)
+-# define PFN_PTE_SHIFT		(PAGE_SHIFT - 12 + _CACHE_SHIFT + 3)
++/*
++ * PFN_PTE_SHIFT: bit position where the PFN field starts in a Linux PTE.
++ * Uses MMUPAGE_SHIFT (hardware page size) so sub-page bits within a kernel
++ * page are preserved below PFN_PTE_SHIFT+PAGE_MMUSHIFT, which _PFN_MASK
++ * can then cover for pte_modify().
++ */
++# define PFN_PTE_SHIFT		(MMUPAGE_SHIFT - 12 + _CACHE_SHIFT + 3)
+ #endif
+ 
+ #ifndef _PAGE_NO_EXEC
+@@ -197,6 +203,20 @@ enum pgtable_bits {
+ 
+ #define _PFN_MASK		(~((1 << (PFN_PTE_SHIFT)) - 1))
+ 
++/*
++ * Physical-address to PTE-value conversion.  On MIPS, the PFN field in the
++ * Linux PTE starts at PFN_PTE_SHIFT, which can be greater than, equal to,
++ * or less than MMUPAGE_SHIFT depending on how many software/hardware bits
++ * precede the PFN field (controlled by _CACHE_SHIFT, which is an enum
++ * value varying with CONFIG options like RIXI, HUGE_TLB, PTE_SPECIAL).
++ *
++ * Use a two-step extract-then-place approach to avoid negative shifts:
++ *   phys → PTE: extract MMUPAGE PFN (>> MMUPAGE_SHIFT), place in PTE (<< PFN_PTE_SHIFT)
++ *   PTE → phys: extract PTE PFN (>> PFN_PTE_SHIFT), convert to address (<< MMUPAGE_SHIFT)
++ */
++#define __phys_to_pte_val(phys)	(((phys) >> MMUPAGE_SHIFT) << PFN_PTE_SHIFT)
++#define __pte_val_to_phys(val)	((((val) & _PFN_MASK) >> PFN_PTE_SHIFT) << MMUPAGE_SHIFT)
++
+ /*
+  * The final layouts of the PTE bits are:
+  *
+diff --git a/arch/mips/include/asm/pgtable.h b/arch/mips/include/asm/pgtable.h
+index fa7b935f947c..444b3a6247e4 100644
+--- a/arch/mips/include/asm/pgtable.h
++++ b/arch/mips/include/asm/pgtable.h
+@@ -66,9 +66,20 @@ extern void pagetable_init(void);
+ 
+ static inline unsigned long pmd_pfn(pmd_t pmd)
+ {
+-	return pmd_val(pmd) >> PFN_PTE_SHIFT;
++	return pmd_val(pmd) >> (PFN_PTE_SHIFT + PAGE_MMUSHIFT);
+ }
+ 
++/*
++ * pte_advance_pfn: advance PTE by nr PAGE-granular PFNs.
++ * With PGCL, PFN_PTE_SHIFT is MMUPAGE-based, so we shift by
++ * PFN_PTE_SHIFT + PAGE_MMUSHIFT to advance by PAGE-sized steps.
++ */
++static inline pte_t pte_advance_pfn(pte_t pte, unsigned long nr)
++{
++	return __pte(pte_val(pte) + (nr << (PFN_PTE_SHIFT + PAGE_MMUSHIFT)));
++}
++#define pte_advance_pfn pte_advance_pfn
++
+ #ifndef CONFIG_MIPS_HUGE_TLB_SUPPORT
+ #define pmd_page(pmd)		(pfn_to_page(pmd_phys(pmd) >> PAGE_SHIFT))
+ #endif /* CONFIG_MIPS_HUGE_TLB_SUPPORT */
+@@ -219,6 +230,23 @@ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 	if (do_sync)
+ 		__update_cache(addr, pte);
+ 
++#if PAGE_MMUSHIFT > 0
++	if (nr == 1) {
++		/* Single PTE: caller already set up sub-page offset */
++		set_pte(ptep, pte);
++	} else {
++		/*
++		 * With PGCL, nr is the number of PTEs (MMUPAGE-granular)
++		 * to write.  Advance by one MMUPAGE per PTE.
++		 */
++		for (i = 0; i < nr; i++) {
++			set_pte(ptep, pte);
++			ptep++;
++			pte = __pte(pte_val(pte) +
++				    __phys_to_pte_val(MMUPAGE_SIZE));
++		}
++	}
++#else
+ 	for (;;) {
+ 		set_pte(ptep, pte);
+ 		if (--nr == 0)
+@@ -226,6 +254,7 @@ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 		ptep++;
+ 		pte = __pte(pte_val(pte) + (1UL << PFN_PTE_SHIFT));
+ 	}
++#endif
+ }
+ #define set_ptes set_ptes
+ 
+@@ -582,7 +611,7 @@ static inline void update_mmu_cache_range(struct vm_fault *vmf,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		address += PAGE_SIZE;
++		address += MMUPAGE_SIZE;
+ 	}
+ }
+ #define update_mmu_cache(vma, address, ptep) \
+diff --git a/arch/mips/include/asm/stackframe.h b/arch/mips/include/asm/stackframe.h
+index a13431379073..0f94ea9d9c4a 100644
+--- a/arch/mips/include/asm/stackframe.h
++++ b/arch/mips/include/asm/stackframe.h
+@@ -278,8 +278,13 @@
+ 		sll	k0, 3		/* extract cu0 bit */
+ 		bltz	k0, 9f
+ 
++#if _THREAD_MASK < 0x10000
+ 		ori	$28, sp, _THREAD_MASK
+ 		xori	$28, _THREAD_MASK
++#else
++		PTR_LI	$28, ~_THREAD_MASK
++		and	$28, sp, $28
++#endif
+ #ifdef CONFIG_CPU_CAVIUM_OCTEON
+ 		.set    mips64
+ 		pref    0, 0($28)       /* Prefetch the current pointer */
+diff --git a/arch/mips/include/asm/vdso/vdso.h b/arch/mips/include/asm/vdso/vdso.h
+index ef50d33f3439..cb5ec0efec87 100644
+--- a/arch/mips/include/asm/vdso/vdso.h
++++ b/arch/mips/include/asm/vdso/vdso.h
+@@ -67,7 +67,7 @@ static inline const struct vdso_time_data *get_vdso_time_data(void)
+ 
+ static inline void __iomem *get_gic(const struct vdso_time_data *data)
+ {
+-	return (void __iomem *)((unsigned long)data & PAGE_MASK) - PAGE_SIZE;
++	return (void __iomem *)((unsigned long)data & MMUPAGE_MASK) - MMUPAGE_SIZE;
+ }
+ 
+ #endif /* CONFIG_CLKSRC_MIPS_GIC */
+diff --git a/arch/mips/kernel/asm-offsets.c b/arch/mips/kernel/asm-offsets.c
+index 5debd9a3854a..59afef3d4f42 100644
+--- a/arch/mips/kernel/asm-offsets.c
++++ b/arch/mips/kernel/asm-offsets.c
+@@ -221,6 +221,8 @@ void output_mm_defines(void)
+ 	BLANK();
+ 	DEFINE(_PAGE_SHIFT, PAGE_SHIFT);
+ 	DEFINE(_PAGE_SIZE, PAGE_SIZE);
++	DEFINE(_MMUPAGE_SHIFT, MMUPAGE_SHIFT);
++	DEFINE(_MMUPAGE_SIZE, MMUPAGE_SIZE);
+ 	BLANK();
+ }
+ 
+diff --git a/arch/mips/kernel/genex.S b/arch/mips/kernel/genex.S
+index be1b049d856f..2306499308fd 100644
+--- a/arch/mips/kernel/genex.S
++++ b/arch/mips/kernel/genex.S
+@@ -605,8 +605,8 @@ NESTED(nmi_handler, PT_SIZE, sp)
+ 	MFC0	k1, CP0_ENTRYHI
+ 	andi	k1, MIPS_ENTRYHI_ASID | MIPS_ENTRYHI_ASIDX
+ 	MFC0	k0, CP0_EPC
+-	PTR_SRL	k0, _PAGE_SHIFT + 1
+-	PTR_SLL	k0, _PAGE_SHIFT + 1
++	PTR_SRL	k0, _MMUPAGE_SHIFT + 1
++	PTR_SLL	k0, _MMUPAGE_SHIFT + 1
+ 	or	k1, k0
+ 	MTC0	k1, CP0_ENTRYHI
+ 	mtc0_tlbw_hazard
+@@ -656,8 +656,13 @@ isrdhwr:
+ 	.set	noreorder
+ 	MFC0	k0, CP0_EPC
+ #if defined(CONFIG_CPU_R3000)
++#if _THREAD_MASK < 0x10000
+ 	ori	k1, _THREAD_MASK
+ 	xori	k1, _THREAD_MASK
++#else
++	PTR_LI	v1, ~_THREAD_MASK
++	and	k1, k1, v1
++#endif
+ 	LONG_L	v1, TI_TP_VALUE(k1)
+ 	LONG_ADDIU	k0, 4
+ 	jr	k0
+@@ -672,8 +677,13 @@ isrdhwr:
+ #endif
+ 	MTC0	k0, CP0_EPC
+ 	/* I hope three instructions between MTC0 and ERET are enough... */
++#if _THREAD_MASK < 0x10000
+ 	ori	k1, _THREAD_MASK
+ 	xori	k1, _THREAD_MASK
++#else
++	PTR_LI	k0, ~_THREAD_MASK
++	and	k1, k1, k0
++#endif
+ 	LONG_L	v1, TI_TP_VALUE(k1)
+ 	.set	push
+ 	.set	arch=r4000
+diff --git a/arch/mips/kernel/process.c b/arch/mips/kernel/process.c
+index a3101f2268c6..95bf9de89f02 100644
+--- a/arch/mips/kernel/process.c
++++ b/arch/mips/kernel/process.c
+@@ -685,15 +685,20 @@ unsigned long mips_stack_top(void)
+ 	unsigned long top = TASK_SIZE & PAGE_MASK;
+ 
+ 	if (IS_ENABLED(CONFIG_MIPS_FP_SUPPORT)) {
+-		/* One page for branch delay slot "emulation" */
+-		top -= PAGE_SIZE;
++		/*
++		 * One hardware page for branch delay slot "emulation".
++		 * Reserve MMUPAGE_SIZE to match vdso_base()'s skip and the
++		 * actual mapping in arch_setup_additional_pages().  Identity
++		 * at PAGE_MMUSHIFT==0.
++		 */
++		top -= MMUPAGE_SIZE;
+ 	}
+ 
+ 	/* Space for the VDSO, data page & GIC user page */
+ 	if (current->thread.abi) {
+ 		top -= PAGE_ALIGN(current->thread.abi->vdso->size);
+-		top -= VDSO_NR_PAGES * PAGE_SIZE;
+-		top -= mips_gic_present() ? PAGE_SIZE : 0;
++		top -= VDSO_NR_PAGES * MMUPAGE_SIZE;
++		top -= mips_gic_present() ? MMUPAGE_SIZE : 0;
+ 
+ 		/* Space to randomize the VDSO base */
+ 		if (current->flags & PF_RANDOMIZE)
+@@ -704,6 +709,16 @@ unsigned long mips_stack_top(void)
+ 	if (cpu_has_dc_aliases)
+ 		top -= shm_align_mask + 1;
+ 
++	/*
++	 * STACK_TOP is MMUPAGE-granular: every subtraction above is an
++	 * MMUPAGE multiple, and arch_setup_additional_pages() maps the
++	 * FP-emu delay-slot page at MMUPAGE_SIZE, so no MAP_FIXED mapping
++	 * overlaps the user stack's top kernel-page.  (Previously this was
++	 * rounded down with `& PAGE_MASK` to work around a PAGE_SIZE-length
++	 * delay-slot mapping that clobbered argv/env; that root cause is now
++	 * fixed, so the coarser rounding — which wasted up to PAGE_SIZE -
++	 * MMUPAGE_SIZE of VA per mm — is no longer needed.)
++	 */
+ 	return top;
+ }
+ 
+diff --git a/arch/mips/kernel/setup.c b/arch/mips/kernel/setup.c
+index 1ae6d0c0e1d6..b9cbc0ed0267 100644
+--- a/arch/mips/kernel/setup.c
++++ b/arch/mips/kernel/setup.c
+@@ -154,7 +154,7 @@ static unsigned long __init init_initrd(void)
+ 	if (!initrd_start || initrd_end <= initrd_start)
+ 		goto disable;
+ 
+-	if (initrd_start & ~PAGE_MASK) {
++	if (initrd_start & ~MMUPAGE_MASK) {
+ 		pr_err("initrd start must be page aligned\n");
+ 		goto disable;
+ 	}
+@@ -220,7 +220,7 @@ static void __init finalize_initrd(void)
+ 		printk(KERN_INFO "Initrd not found or empty");
+ 		goto disable;
+ 	}
+-	if (__pa(initrd_end) > PFN_PHYS(max_low_pfn)) {
++	if (__pa(initrd_end) > memblock_end_of_DRAM()) {
+ 		printk(KERN_ERR "Initrd extends beyond end of memory");
+ 		goto disable;
+ 	}
+diff --git a/arch/mips/kernel/syscall.c b/arch/mips/kernel/syscall.c
+index 1bfc34a2e5b3..b588c861916f 100644
+--- a/arch/mips/kernel/syscall.c
++++ b/arch/mips/kernel/syscall.c
+@@ -63,21 +63,21 @@ SYSCALL_DEFINE6(mips_mmap, unsigned long, addr, unsigned long, len,
+ 	unsigned long, prot, unsigned long, flags, unsigned long,
+ 	fd, off_t, offset)
+ {
+-	if (offset & ~PAGE_MASK)
++	if (offset & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 	return ksys_mmap_pgoff(addr, len, prot, flags, fd,
+-			       offset >> PAGE_SHIFT);
++			       offset >> MMUPAGE_SHIFT);
+ }
+ 
+ SYSCALL_DEFINE6(mips_mmap2, unsigned long, addr, unsigned long, len,
+ 	unsigned long, prot, unsigned long, flags, unsigned long, fd,
+ 	unsigned long, pgoff)
+ {
+-	if (pgoff & (~PAGE_MASK >> 12))
++	if (pgoff & (~MMUPAGE_MASK >> 12))
+ 		return -EINVAL;
+ 
+ 	return ksys_mmap_pgoff(addr, len, prot, flags, fd,
+-			       pgoff >> (PAGE_SHIFT - 12));
++			       pgoff >> (MMUPAGE_SHIFT - 12));
+ }
+ 
+ save_static_function(sys_fork);
+diff --git a/arch/mips/kernel/vdso.c b/arch/mips/kernel/vdso.c
+index 2fa4df3e46e4..e2d8c99ef440 100644
+--- a/arch/mips/kernel/vdso.c
++++ b/arch/mips/kernel/vdso.c
+@@ -64,7 +64,7 @@ static unsigned long vdso_base(void)
+ 
+ 	if (IS_ENABLED(CONFIG_MIPS_FP_SUPPORT)) {
+ 		/* Skip the delay slot emulation page */
+-		base += PAGE_SIZE;
++		base += MMUPAGE_SIZE;
+ 	}
+ 
+ 	if (current->flags & PF_RANDOMIZE) {
+@@ -89,8 +89,15 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+ 	if (IS_ENABLED(CONFIG_MIPS_FP_SUPPORT)) {
+ 		unsigned long unused;
+ 
+-		/* Map delay slot emulation page */
+-		base = do_mmap(NULL, STACK_TOP, PAGE_SIZE, PROT_READ | PROT_EXEC,
++		/*
++		 * Map delay slot emulation page.  Only one hardware page is
++		 * needed (the gap reserved in vdso_base() above is MMUPAGE_SIZE);
++		 * map exactly that.  Mapping PAGE_SIZE here would, under PGCL
++		 * (PAGE_SIZE > MMUPAGE_SIZE), MAP_FIXED-clobber the kernel-page
++		 * holding the top of the user stack where copy_strings() just
++		 * placed argv/env.  Identity at PAGE_MMUSHIFT==0.
++		 */
++		base = do_mmap(NULL, STACK_TOP, MMUPAGE_SIZE, PROT_READ | PROT_EXEC,
+ 			       MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, 0, 0, &unused,
+ 			       NULL);
+ 		if (IS_ERR_VALUE(base)) {
+@@ -107,8 +114,8 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+ 	 * only map a page even though the total area is 64K, as we only need
+ 	 * the counter registers at the start.
+ 	 */
+-	gic_size = mips_gic_present() ? PAGE_SIZE : 0;
+-	size = gic_size + VDSO_NR_PAGES * PAGE_SIZE + image->size;
++	gic_size = mips_gic_present() ? MMUPAGE_SIZE : 0;
++	size = gic_size + VDSO_NR_PAGES * MMUPAGE_SIZE + image->size;
+ 
+ 	/*
+ 	 * Find a region that's large enough for us to perform the
+@@ -135,7 +142,7 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+ 	}
+ 
+ 	data_addr = base + gic_size;
+-	vdso_addr = data_addr + VDSO_NR_PAGES * PAGE_SIZE;
++	vdso_addr = data_addr + VDSO_NR_PAGES * MMUPAGE_SIZE;
+ 
+ 	vma = vdso_install_vvar_mapping(mm, data_addr);
+ 	if (IS_ERR(vma)) {
+diff --git a/arch/mips/kernel/vmlinux.lds.S b/arch/mips/kernel/vmlinux.lds.S
+index 579b2cc1995a..db257d7d8a23 100644
+--- a/arch/mips/kernel/vmlinux.lds.S
++++ b/arch/mips/kernel/vmlinux.lds.S
+@@ -3,6 +3,7 @@
+ #include <asm/thread_info.h>
+ 
+ #define PAGE_SIZE _PAGE_SIZE
++#define MMUPAGE_SIZE _MMUPAGE_SIZE
+ 
+ /*
+  * Put .bss..swapper_pg_dir as the first thing in .bss. This will
+diff --git a/arch/mips/mm/Makefile b/arch/mips/mm/Makefile
+index 304692391519..067d4e83bb30 100644
+--- a/arch/mips/mm/Makefile
++++ b/arch/mips/mm/Makefile
+@@ -12,6 +12,7 @@ obj-y				+= mmap.o
+ obj-y				+= page.o
+ obj-y				+= page-funcs.o
+ obj-y				+= pgtable.o
++obj-y				+= pgtable_pte.o
+ obj-y				+= tlbex.o
+ obj-y				+= tlbex-fault.o
+ obj-y				+= tlb-funcs.o
+diff --git a/arch/mips/mm/c-octeon.c b/arch/mips/mm/c-octeon.c
+index b7393b61cfa7..52ad59397e08 100644
+--- a/arch/mips/mm/c-octeon.c
++++ b/arch/mips/mm/c-octeon.c
+@@ -267,7 +267,7 @@ void octeon_cache_init(void)
+ {
+ 	probe_octeon();
+ 
+-	shm_align_mask = PAGE_SIZE - 1;
++	shm_align_mask = MMUPAGE_SIZE - 1;
+ 
+ 	flush_cache_all			= octeon_flush_icache_all;
+ 	__flush_cache_all		= octeon_flush_icache_all;
+diff --git a/arch/mips/mm/c-r4k.c b/arch/mips/mm/c-r4k.c
+index 10413b6f6662..838124ac11b6 100644
+--- a/arch/mips/mm/c-r4k.c
++++ b/arch/mips/mm/c-r4k.c
+@@ -554,7 +554,7 @@ static inline void local_r4k_flush_cache_page(void *args)
+ 	if (!has_valid_asid(mm, R4K_HIT))
+ 		return;
+ 
+-	addr &= PAGE_MASK;
++	addr &= MMUPAGE_MASK;
+ 	pmdp = pmd_off(mm, addr);
+ 	ptep = pte_offset_kernel(pmdp, addr);
+ 
+@@ -1724,11 +1724,11 @@ void r4k_cache_init(void)
+ 	 * unnecessarily inefficient on physically indexed processors.
+ 	 */
+ 	if (c->dcache.linesz && cpu_has_dc_aliases)
+-		shm_align_mask = max_t( unsigned long,
+-					c->dcache.sets * c->dcache.linesz - 1,
+-					PAGE_SIZE - 1);
++		shm_align_mask = max_t(unsigned long,
++				       c->dcache.sets * c->dcache.linesz - 1,
++				       MMUPAGE_SIZE - 1);
+ 	else
+-		shm_align_mask = PAGE_SIZE-1;
++		shm_align_mask = MMUPAGE_SIZE - 1;
+ 
+ 	__flush_cache_vmap	= r4k__flush_cache_vmap;
+ 	__flush_cache_vunmap	= r4k__flush_cache_vunmap;
+diff --git a/arch/mips/mm/mmap.c b/arch/mips/mm/mmap.c
+index 5d2a1225785b..0b39d71edb91 100644
+--- a/arch/mips/mm/mmap.c
++++ b/arch/mips/mm/mmap.c
+@@ -17,12 +17,18 @@
+ #include <linux/sched/signal.h>
+ #include <linux/sched/mm.h>
+ 
+-unsigned long shm_align_mask = PAGE_SIZE - 1;	/* Sane caches */
++/*
++ * Cache-aliasing constraint mask.  Reflects hardware dcache way size, not
++ * the kernel PAGE_SIZE (which under PGCL may be many times larger than the
++ * MMU page).  Initialised to MMUPAGE_SIZE-1 ("sane caches"); c-r4k.c and
++ * c-octeon.c bump it to max(dcache.waybit, MMUPAGE_SIZE-1) on init.
++ */
++unsigned long shm_align_mask = MMUPAGE_SIZE - 1;	/* Sane caches */
+ EXPORT_SYMBOL(shm_align_mask);
+ 
+ #define COLOUR_ALIGN(addr, pgoff)				\
+ 	((((addr) + shm_align_mask) & ~shm_align_mask) +	\
+-	 (((pgoff) << PAGE_SHIFT) & shm_align_mask))
++	 (((pgoff) << MMUPAGE_SHIFT) & shm_align_mask))
+ 
+ enum mmap_allocation_direction {UP, DOWN};
+ 
+@@ -49,7 +55,7 @@ static unsigned long arch_get_unmapped_area_common(struct file *filp,
+ 		 * cache aliasing constraints.
+ 		 */
+ 		if ((flags & MAP_SHARED) &&
+-		    ((addr - (pgoff << PAGE_SHIFT)) & shm_align_mask))
++		    ((addr - (pgoff << MMUPAGE_SHIFT)) & shm_align_mask))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -72,16 +78,16 @@ static unsigned long arch_get_unmapped_area_common(struct file *filp,
+ 	}
+ 
+ 	info.length = len;
+-	info.align_mask = do_color_align ? (PAGE_MASK & shm_align_mask) : 0;
+-	info.align_offset = pgoff << PAGE_SHIFT;
++	info.align_mask = do_color_align ? (MMUPAGE_MASK & shm_align_mask) : 0;
++	info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 
+ 	if (dir == DOWN) {
+ 		info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+-		info.low_limit = PAGE_SIZE;
++		info.low_limit = MMUPAGE_SIZE;
+ 		info.high_limit = mm->mmap_base;
+ 		addr = vm_unmapped_area(&info);
+ 
+-		if (!(addr & ~PAGE_MASK))
++		if (!(addr & ~MMUPAGE_MASK))
+ 			return addr;
+ 
+ 		/*
+diff --git a/arch/mips/mm/pgtable.c b/arch/mips/mm/pgtable.c
+index 10835414819f..4547827a86e7 100644
+--- a/arch/mips/mm/pgtable.c
++++ b/arch/mips/mm/pgtable.c
+@@ -11,14 +11,18 @@
+ pgd_t *pgd_alloc(struct mm_struct *mm)
+ {
+ 	pgd_t *init, *ret;
++	struct ptdesc *ptdesc;
+ 
+-	ret = __pgd_alloc(mm, PGD_TABLE_ORDER);
+-	if (ret) {
+-		init = pgd_offset(&init_mm, 0UL);
+-		pgd_init(ret);
+-		memcpy(ret + USER_PTRS_PER_PGD, init + USER_PTRS_PER_PGD,
+-		       (PTRS_PER_PGD - USER_PTRS_PER_PGD) * sizeof(pgd_t));
+-	}
++	ptdesc = pagetable_alloc(GFP_PGTABLE_USER, PGD_TABLE_ORDER);
++	if (!ptdesc)
++		return NULL;
++	pagetable_pgd_ctor(ptdesc);
++
++	ret = ptdesc_address(ptdesc);
++	init = pgd_offset(&init_mm, 0UL);
++	pgd_init(ret);
++	memcpy(ret + USER_PTRS_PER_PGD, init + USER_PTRS_PER_PGD,
++	       (PTRS_PER_PGD - USER_PTRS_PER_PGD) * sizeof(pgd_t));
+ 
+ 	return ret;
+ }
+diff --git a/arch/mips/mm/pgtable_pte.c b/arch/mips/mm/pgtable_pte.c
+new file mode 100644
+index 000000000000..6cd9301a10d0
+--- /dev/null
++++ b/arch/mips/mm/pgtable_pte.c
+@@ -0,0 +1,169 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * PGCL sub-page packing of user/kernel PTE tables.
++ *
++ * Under PGCL the kernel allocator hands out PAGE_SIZE chunks while a
++ * hardware PTE table is only MMUPAGE_SIZE.  At PAGE_MMUSHIFT=6 a
++ * naive pte_alloc_one() wastes 252KB of every 256KB allocation, so a
++ * fork-heavy workload trivially eats hundreds of megabytes of pgtables
++ * (the OOM dump on mips64 malta -m2G shows pagetables:739MB, ~35% of
++ * total RAM).
++ *
++ * This file packs PAGE_MMUCOUNT (1<<PAGE_MMUSHIFT) MMUPAGE-sized PTE
++ * sub-tables into each ptdesc, mirroring m68k's get_pointer_table /
++ * free_pointer_table pattern.  All sub-tables in one ptdesc share the
++ * single ptl_lock allocated by pagetable_pte_ctor() — a controlled loss
++ * of locking granularity in exchange for a PAGE_MMUCOUNT-x reduction in
++ * pgtable footprint.
++ *
++ * pgtable_t is pte_t * on mips (see asm/page.h), so a sub-table
++ * pte_t * is a first-class pgtable_t — pmd_populate() installs it
++ * directly without any struct page round-trip.
++ *
++ * NR_PAGETABLE accounting (set by pagetable_pte_ctor / cleared by
++ * pagetable_dtor_free) is per-ptdesc, so it correctly reflects the
++ * underlying kernel-page footprint, not sub-table count.
++ */
++
++#include <linux/mm.h>
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <linux/sched.h>
++#include <linux/gfp.h>
++#include <linux/bug.h>
++#include <linux/bitops.h>
++
++#include <asm/page.h>
++#include <asm/pgtable.h>
++#include <asm/pgalloc.h>
++
++#define PTE_TABLE_SIZE	MMUPAGE_SIZE
++#define PTE_PER_PAGE	PAGE_MMUCOUNT
++#define PTE_MARK_FREE	(PTE_PER_PAGE == BITS_PER_LONG ? ~0UL :		\
++			 (1UL << PTE_PER_PAGE) - 1UL)
++
++/*
++ * Free list of ptdescs that still have at least one free sub-table.
++ * pt_index holds a bitmap: bit N set ⇒ sub-table N (at offset
++ * N*MMUPAGE_SIZE within the ptdesc's kernel page) is free.
++ *
++ * Separate lists for user and kernel ptes: kernel ptes never need a
++ * ptlock and live in init_mm so we want to keep their accounting and
++ * their lifetimes apart from user ptes.
++ */
++static DEFINE_SPINLOCK(pte_pack_lock);
++static LIST_HEAD(pte_user_free_list);
++static LIST_HEAD(pte_kernel_free_list);
++
++static inline int ptdesc_sub_index(unsigned long pte_addr)
++{
++	return (pte_addr & ~PAGE_MASK) >> MMUPAGE_SHIFT;
++}
++
++static pte_t *pte_alloc_packed(struct mm_struct *mm,
++			       struct list_head *free_list,
++			       gfp_t gfp,
++			       bool kernel)
++{
++	struct ptdesc *ptdesc;
++	unsigned long mask, slot, addr;
++
++	spin_lock(&pte_pack_lock);
++	if (!list_empty(free_list)) {
++		ptdesc = list_first_entry(free_list, struct ptdesc, pt_list);
++		mask = ptdesc->pt_index;
++		slot = __ffs(mask);
++		mask &= ~(1UL << slot);
++		ptdesc->pt_index = mask;
++		if (mask == 0)
++			list_del_init(&ptdesc->pt_list);
++		spin_unlock(&pte_pack_lock);
++
++		addr = (unsigned long)ptdesc_address(ptdesc) +
++		       slot * PTE_TABLE_SIZE;
++		memset((void *)addr, 0, PTE_TABLE_SIZE);
++		return (pte_t *)addr;
++	}
++	spin_unlock(&pte_pack_lock);
++
++	/* Need a fresh kernel page; allocate without holding the lock. */
++	ptdesc = pagetable_alloc(gfp, 0);
++	if (!ptdesc)
++		return NULL;
++	if (!kernel) {
++		if (!pagetable_pte_ctor(mm, ptdesc)) {
++			pagetable_free(ptdesc);
++			return NULL;
++		}
++	} else {
++		ptdesc_set_kernel(ptdesc);
++	}
++
++	spin_lock(&pte_pack_lock);
++	/* Slot 0 returned to caller; remaining slots go on the free list. */
++	mask = PTE_MARK_FREE & ~1UL;
++	ptdesc->pt_index = mask;
++	if (mask)
++		list_add(&ptdesc->pt_list, free_list);
++	spin_unlock(&pte_pack_lock);
++
++	addr = (unsigned long)ptdesc_address(ptdesc);
++	memset((void *)addr, 0, PTE_TABLE_SIZE);
++	return (pte_t *)addr;
++}
++
++static void pte_free_packed(struct mm_struct *mm, pte_t *pte,
++			    struct list_head *free_list,
++			    bool kernel)
++{
++	struct ptdesc *ptdesc = virt_to_ptdesc(pte);
++	unsigned long pte_addr = (unsigned long)pte;
++	unsigned long bit = 1UL << ptdesc_sub_index(pte_addr);
++	unsigned long mask;
++	bool was_full, all_free;
++
++	spin_lock(&pte_pack_lock);
++	mask = ptdesc->pt_index;
++	WARN_ON_ONCE(mask & bit); /* double free of a sub-table */
++	was_full = (mask == 0);
++	mask |= bit;
++	ptdesc->pt_index = mask;
++	all_free = (mask == PTE_MARK_FREE);
++
++	if (all_free) {
++		if (!was_full)
++			list_del_init(&ptdesc->pt_list);
++		spin_unlock(&pte_pack_lock);
++		if (kernel)
++			pagetable_free(ptdesc);
++		else
++			pagetable_dtor_free(ptdesc);
++		return;
++	}
++
++	if (was_full)
++		list_add(&ptdesc->pt_list, free_list);
++	spin_unlock(&pte_pack_lock);
++}
++
++pte_t *pte_alloc_one_kernel(struct mm_struct *mm)
++{
++	return pte_alloc_packed(mm, &pte_kernel_free_list,
++				GFP_PGTABLE_KERNEL, true);
++}
++
++pgtable_t pte_alloc_one(struct mm_struct *mm)
++{
++	return pte_alloc_packed(mm, &pte_user_free_list,
++				GFP_PGTABLE_USER, false);
++}
++
++void pte_free_kernel(struct mm_struct *mm, pte_t *pte)
++{
++	pte_free_packed(mm, pte, &pte_kernel_free_list, true);
++}
++
++void pte_free(struct mm_struct *mm, pgtable_t pte)
++{
++	pte_free_packed(mm, pte, &pte_user_free_list, false);
++}
+diff --git a/arch/mips/mm/tlb-r4k.c b/arch/mips/mm/tlb-r4k.c
+index 24fe85fa169d..47134e2d4198 100644
+--- a/arch/mips/mm/tlb-r4k.c
++++ b/arch/mips/mm/tlb-r4k.c
+@@ -117,9 +117,9 @@ void local_flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 		unsigned long size, flags;
+ 
+ 		local_irq_save(flags);
+-		start = round_down(start, PAGE_SIZE << 1);
+-		end = round_up(end, PAGE_SIZE << 1);
+-		size = (end - start) >> (PAGE_SHIFT + 1);
++		start = round_down(start, MMUPAGE_SIZE << 1);
++		end = round_up(end, MMUPAGE_SIZE << 1);
++		size = (end - start) >> (MMUPAGE_SHIFT + 1);
+ 		if (size <= (current_cpu_data.tlbsizeftlbsets ?
+ 			     current_cpu_data.tlbsize / 8 :
+ 			     current_cpu_data.tlbsize / 2)) {
+@@ -140,7 +140,7 @@ void local_flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 					write_c0_entryhi(start);
+ 				else
+ 					write_c0_entryhi(start | newpid);
+-				start += (PAGE_SIZE << 1);
++				start += (MMUPAGE_SIZE << 1);
+ 				mtc0_tlbw_hazard();
+ 				tlb_probe();
+ 				tlb_probe_hazard();
+@@ -172,23 +172,23 @@ void local_flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ 	unsigned long size, flags;
+ 
+ 	local_irq_save(flags);
+-	size = (end - start + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
++	size = (end - start + (MMUPAGE_SIZE - 1)) >> MMUPAGE_SHIFT;
+ 	size = (size + 1) >> 1;
+ 	if (size <= (current_cpu_data.tlbsizeftlbsets ?
+ 		     current_cpu_data.tlbsize / 8 :
+ 		     current_cpu_data.tlbsize / 2)) {
+ 		int pid = read_c0_entryhi();
+ 
+-		start &= (PAGE_MASK << 1);
+-		end += ((PAGE_SIZE << 1) - 1);
+-		end &= (PAGE_MASK << 1);
++		start &= (MMUPAGE_MASK << 1);
++		end += ((MMUPAGE_SIZE << 1) - 1);
++		end &= (MMUPAGE_MASK << 1);
+ 		htw_stop();
+ 
+ 		while (start < end) {
+ 			int idx;
+ 
+ 			write_c0_entryhi(start);
+-			start += (PAGE_SIZE << 1);
++			start += (MMUPAGE_SIZE << 1);
+ 			mtc0_tlbw_hazard();
+ 			tlb_probe();
+ 			tlb_probe_hazard();
+@@ -221,7 +221,7 @@ void local_flush_tlb_page(struct vm_area_struct *vma, unsigned long page)
+ 		unsigned long flags, old_entryhi;
+ 		int idx;
+ 
+-		page &= (PAGE_MASK << 1);
++		page &= (MMUPAGE_MASK << 1);
+ 		local_irq_save(flags);
+ 		old_entryhi = read_c0_entryhi();
+ 		htw_stop();
+@@ -268,7 +268,7 @@ void local_flush_tlb_one(unsigned long page)
+ 	local_irq_save(flags);
+ 	oldpid = read_c0_entryhi();
+ 	htw_stop();
+-	page &= (PAGE_MASK << 1);
++	page &= (MMUPAGE_MASK << 1);
+ 	write_c0_entryhi(page);
+ 	mtc0_tlbw_hazard();
+ 	tlb_probe();
+@@ -313,7 +313,7 @@ void __update_tlb(struct vm_area_struct * vma, unsigned long address, pte_t pte)
+ 	local_irq_save(flags);
+ 
+ 	htw_stop();
+-	address &= (PAGE_MASK << 1);
++	address &= (MMUPAGE_MASK << 1);
+ 	if (cpu_has_mmid) {
+ 		write_c0_entryhi(address);
+ 	} else {
+@@ -790,7 +790,7 @@ static void r4k_tlb_configure(void)
+ 	write_c0_pagemask(PM_DEFAULT_MASK);
+ 	back_to_back_c0_hazard();
+ 	if (read_c0_pagemask() != PM_DEFAULT_MASK)
+-		panic("MMU doesn't support PAGE_SIZE=0x%lx", PAGE_SIZE);
++		panic("MMU doesn't support MMUPAGE_SIZE=0x%lx", MMUPAGE_SIZE);
+ 
+ 	write_c0_wired(0);
+ 	if (current_cpu_type() == CPU_R10000 ||
+diff --git a/arch/mips/mm/tlbex.c b/arch/mips/mm/tlbex.c
+index 69ea54bdc0c3..da064a8be84c 100644
+--- a/arch/mips/mm/tlbex.c
++++ b/arch/mips/mm/tlbex.c
+@@ -780,7 +780,7 @@ void build_get_pmde64(u32 **p, struct uasm_label **l, struct uasm_reloc **r,
+ 		 * everything but the lower xuseg addresses goes down
+ 		 * the module_alloc/vmalloc path.
+ 		 */
+-		uasm_i_dsrl_safe(p, ptr, tmp, PGDIR_SHIFT + PGD_TABLE_ORDER + PAGE_SHIFT - 3);
++		uasm_i_dsrl_safe(p, ptr, tmp, PGDIR_SHIFT + PGD_TABLE_ORDER + MMUPAGE_SHIFT - 3);
+ 		uasm_il_bnez(p, r, ptr, label_vmalloc);
+ 	} else {
+ 		uasm_il_bltz(p, r, tmp, label_vmalloc);
+@@ -954,8 +954,8 @@ EXPORT_SYMBOL_GPL(build_get_pgde32);
+ 
+ static void build_adjust_context(u32 **p, unsigned int ctx)
+ {
+-	unsigned int shift = 4 - (PTE_T_LOG2 + 1) + PAGE_SHIFT - 12;
+-	unsigned int mask = (PTRS_PER_PTE / 2 - 1) << (PTE_T_LOG2 + 1);
++	unsigned int shift = 4 - (PTE_T_LOG2 + 1) + MMUPAGE_SHIFT - 12;
++	unsigned int mask = (MMUPAGE_SIZE / sizeof(pte_t) / 2 - 1) << (PTE_T_LOG2 + 1);
+ 
+ 	if (shift)
+ 		UASM_i_SRL(p, ctx, ctx, shift);
+@@ -1073,7 +1073,7 @@ build_fast_tlb_refill_handler (u32 **p, struct uasm_label **l,
+ 			UASM_i_SW(p, scratch, scratchpad_offset(0), 0);
+ 
+ 		uasm_i_dsrl_safe(p, scratch, tmp,
+-				 PGDIR_SHIFT + PGD_TABLE_ORDER + PAGE_SHIFT - 3);
++				 PGDIR_SHIFT + PGD_TABLE_ORDER + MMUPAGE_SHIFT - 3);
+ 		uasm_il_bnez(p, r, scratch, label_vmalloc);
+ 
+ 		if (pgd_reg == -1) {
+@@ -1217,7 +1217,7 @@ build_fast_tlb_refill_handler (u32 **p, struct uasm_label **l,
+ 		build_tlb_write_entry(p, l, r, tlb_random);
+ 		uasm_l_leave(l, *p);
+ 		rv.restore_scratch = 1;
+-	} else if (PAGE_SHIFT == 14 || PAGE_SHIFT == 13)  {
++	} else if (MMUPAGE_SHIFT == 14 || MMUPAGE_SHIFT == 13)  {
+ 		build_tlb_write_entry(p, l, r, tlb_random);
+ 		uasm_l_leave(l, *p);
+ 		UASM_i_LW(p, scratch, scratchpad_offset(0), 0);
+@@ -1442,13 +1442,13 @@ static void setup_pw(void)
+ 	pgd_w = PGDIR_SHIFT - PMD_SHIFT + PGD_TABLE_ORDER;
+ 
+ 	pmd_i = PMD_SHIFT;    /* 2nd level PMD */
+-	pmd_w = PMD_SHIFT - PAGE_SHIFT;
++	pmd_w = PMD_SHIFT - MMUPAGE_SHIFT;
+ #else
+-	pgd_w = PGDIR_SHIFT - PAGE_SHIFT + PGD_TABLE_ORDER;
++	pgd_w = PGDIR_SHIFT - MMUPAGE_SHIFT + PGD_TABLE_ORDER;
+ #endif
+ 
+-	pt_i  = PAGE_SHIFT;    /* 3rd level PTE */
+-	pt_w  = PAGE_SHIFT - 3;
++	pt_i  = MMUPAGE_SHIFT;    /* 3rd level PTE */
++	pt_w  = MMUPAGE_SHIFT - 3;
+ 
+ 	pte_i = ilog2(_PAGE_GLOBAL);
+ 	pte_w = 0;
+@@ -1483,7 +1483,7 @@ static void build_loongson3_tlb_refill_handler(void)
+ 	if (check_for_high_segbits) {
+ 		uasm_i_dmfc0(&p, GPR_K0, C0_BADVADDR);
+ 		uasm_i_dsrl_safe(&p, GPR_K1, GPR_K0,
+-				PGDIR_SHIFT + PGD_TABLE_ORDER + PAGE_SHIFT - 3);
++				PGDIR_SHIFT + PGD_TABLE_ORDER + MMUPAGE_SHIFT - 3);
+ 		uasm_il_beqz(&p, &r, GPR_K1, label_vmalloc);
+ 		uasm_i_nop(&p);
+ 
+@@ -2012,8 +2012,8 @@ build_r4000_tlbchange_handler_head(u32 **p, struct uasm_label **l,
+ 
+ 	UASM_i_MFC0(p, wr.r1, C0_BADVADDR);
+ 	UASM_i_LW(p, wr.r2, 0, wr.r2);
+-	UASM_i_SRL(p, wr.r1, wr.r1, PAGE_SHIFT - PTE_T_LOG2);
+-	uasm_i_andi(p, wr.r1, wr.r1, (PTRS_PER_PTE - 1) << PTE_T_LOG2);
++	UASM_i_SRL(p, wr.r1, wr.r1, MMUPAGE_SHIFT - PTE_T_LOG2);
++	uasm_i_andi(p, wr.r1, wr.r1, (MMUPAGE_SIZE / sizeof(pte_t) - 1) << PTE_T_LOG2);
+ 	UASM_i_ADDU(p, wr.r2, wr.r2, wr.r1);
+ 
+ #ifdef CONFIG_SMP
+@@ -2415,7 +2415,7 @@ static void config_htw_params(void)
+ 	pwfield |= PGDIR_SHIFT << MIPS_PWFIELD_GDI_SHIFT;
+ 	/* re-initialize the PTI field including the even/odd bit */
+ 	pwfield &= ~MIPS_PWFIELD_PTI_MASK;
+-	pwfield |= PAGE_SHIFT << MIPS_PWFIELD_PTI_SHIFT;
++	pwfield |= MMUPAGE_SHIFT << MIPS_PWFIELD_PTI_SHIFT;
+ 	if (CONFIG_PGTABLE_LEVELS >= 3) {
+ 		pwfield &= ~MIPS_PWFIELD_MDI_MASK;
+ 		pwfield |= PMD_SHIFT << MIPS_PWFIELD_MDI_SHIFT;
+@@ -2440,7 +2440,7 @@ static void config_htw_params(void)
+ 	}
+ 
+ 	pwsize = ilog2(PTRS_PER_PGD) << MIPS_PWSIZE_GDW_SHIFT;
+-	pwsize |= ilog2(PTRS_PER_PTE) << MIPS_PWSIZE_PTW_SHIFT;
++	pwsize |= ilog2(MMUPAGE_SIZE / sizeof(pte_t)) << MIPS_PWSIZE_PTW_SHIFT;
+ 	if (CONFIG_PGTABLE_LEVELS >= 3)
+ 		pwsize |= ilog2(PTRS_PER_PMD) << MIPS_PWSIZE_MDW_SHIFT;
+ 
+@@ -2542,7 +2542,7 @@ void build_tlb_refill_handler(void)
+ 	check_pabits();
+ 
+ #ifdef CONFIG_64BIT
+-	check_for_high_segbits = current_cpu_data.vmbits > (PGDIR_SHIFT + PGD_TABLE_ORDER + PAGE_SHIFT - 3);
++	check_for_high_segbits = current_cpu_data.vmbits > (PGDIR_SHIFT + PGD_TABLE_ORDER + MMUPAGE_SHIFT - 3);
+ #endif
+ 
+ 	if (cpu_has_3kex) {
+-- 
+2.54.0
+

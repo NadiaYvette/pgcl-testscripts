@@ -1,0 +1,517 @@
+From 915aa1b676ca81d25a36239eebbcc01ee49c2c7b Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:26 +0200
+Subject: [RFC PATCH 06/28] kernel, lib, block: page clustering plumbing
+
+---
+ block/blk-settings.c         |  6 ++---
+ init/initramfs.c             |  9 ++++++--
+ init/main.c                  |  8 ++-----
+ ipc/shm.c                    | 10 ++++----
+ kernel/bpf/stackmap.c        |  2 +-
+ kernel/events/core.c         |  6 ++---
+ kernel/events/ring_buffer.c  | 10 ++++----
+ kernel/events/uprobes.c      |  8 +++----
+ kernel/fork.c                | 13 +++++------
+ kernel/futex/core.c          |  7 +++++-
+ kernel/relay.c               |  2 +-
+ lib/iov_iter.c               | 44 ++++++++++++++++++++++++------------
+ lib/vdso/datastore.c         |  4 ++--
+ lib/zlib_inflate/infutil.h   |  2 +-
+ security/selinux/selinuxfs.c | 12 ++++++++--
+ virt/kvm/guest_memfd.c       |  2 +-
+ 16 files changed, 86 insertions(+), 59 deletions(-)
+
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index 78c83817b9d3..cc006fb4dd28 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -381,12 +381,12 @@ int blk_validate_limits(struct queue_limits *lim)
+ 	 * value.
+ 	 *
+ 	 * The block layer relies on the fact that every driver can
+-	 * handle at lest a page worth of data per I/O, and needs the value
+-	 * aligned to the logical block size.
++	 * handle at least an MMU page worth of data per I/O, and needs
++	 * the value aligned to the logical block size.
+ 	 */
+ 	if (!lim->max_hw_sectors)
+ 		lim->max_hw_sectors = BLK_SAFE_MAX_SECTORS;
+-	if (WARN_ON_ONCE(lim->max_hw_sectors < PAGE_SECTORS))
++	if (WARN_ON_ONCE(lim->max_hw_sectors < MMUPAGE_SECTORS))
+ 		return -EINVAL;
+ 	logical_block_sectors = lim->logical_block_size >> SECTOR_SHIFT;
+ 	if (WARN_ON_ONCE(logical_block_sectors > lim->max_hw_sectors))
+diff --git a/init/initramfs.c b/init/initramfs.c
+index 58db15fb18fd..b31d55a8f8ca 100644
+--- a/init/initramfs.c
++++ b/init/initramfs.c
+@@ -620,10 +620,12 @@ void __init reserve_initrd_mem(void)
+ 	 * This allows us to detect whether the pages overlapping the initrd
+ 	 * are in use, but more importantly, reserves the entire set of pages
+ 	 * as we don't want these pages allocated for other purposes.
++	 * Use MMUPAGE_SIZE for alignment — with PGCL, PAGE_SIZE can be much
++	 * larger and cause false overlaps with adjacent reservations (e.g. FDT).
+ 	 */
+-	start = round_down(phys_initrd_start, PAGE_SIZE);
++	start = round_down(phys_initrd_start, MMUPAGE_SIZE);
+ 	size = phys_initrd_size + (phys_initrd_start - start);
+-	size = round_up(size, PAGE_SIZE);
++	size = round_up(size, MMUPAGE_SIZE);
+ 
+ 	if (!memblock_is_region_memory(start, size)) {
+ 		pr_err("INITRD: 0x%08llx+0x%08lx is not a memory region",
+@@ -634,6 +636,9 @@ void __init reserve_initrd_mem(void)
+ 	if (memblock_is_region_reserved(start, size)) {
+ 		pr_err("INITRD: 0x%08llx+0x%08lx overlaps in-use memory region\n",
+ 		       (u64)start, size);
++		pr_err("INITRD: phys_initrd_start=0x%08llx phys_initrd_size=0x%08lx PAGE_SIZE=0x%lx\n",
++		       (u64)phys_initrd_start, (unsigned long)phys_initrd_size, PAGE_SIZE);
++		memblock_dump_all();
+ 		goto disable;
+ 	}
+ 
+diff --git a/init/main.c b/init/main.c
+index 96f93bb06c49..335a0055a208 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -13,6 +13,7 @@
+ #define DEBUG		/* Enable initcall_debug */
+ 
+ #include <linux/types.h>
++#include <linux/namei.h>
+ #include <linux/export.h>
+ #include <linux/extable.h>
+ #include <linux/module.h>
+@@ -719,11 +720,6 @@ static noinline void __ref __noreturn rest_init(void)
+ 	int pid;
+ 
+ 	rcu_scheduler_starting();
+-	/*
+-	 * We need to spawn init first so that it obtains pid 1, however
+-	 * the init task will end up wanting to create kthreads, which, if
+-	 * we schedule it before we create kthreadd, will OOPS.
+-	 */
+ 	pid = user_mode_thread(kernel_init, NULL, CLONE_FS);
+ 	/*
+ 	 * Pin init on the boot CPU. Task migration is not properly working
+@@ -809,7 +805,7 @@ void __init __weak smp_prepare_boot_cpu(void)
+ {
+ }
+ 
+-# if THREAD_SIZE >= PAGE_SIZE
++# if THREAD_SIZE >= MMUPAGE_SIZE
+ void __init __weak thread_stack_cache_init(void)
+ {
+ }
+diff --git a/ipc/shm.c b/ipc/shm.c
+index b3e8a58e177d..8d0dc37fbfaf 100644
+--- a/ipc/shm.c
++++ b/ipc/shm.c
+@@ -1552,7 +1552,7 @@ long do_shmat(int shmid, char __user *shmaddr, int shmflg,
+ 					goto out;
+ 			} else
+ #ifndef __ARCH_FORCE_SHMLBA
+-				if (addr & ~PAGE_MASK)
++				if (addr & ~MMUPAGE_MASK)
+ #endif
+ 					goto out;
+ 		}
+@@ -1739,7 +1739,7 @@ long ksys_shmdt(char __user *shmaddr)
+ 	VMA_ITERATOR(vmi, mm, addr);
+ #endif
+ 
+-	if (addr & ~PAGE_MASK)
++	if (addr & ~MMUPAGE_MASK)
+ 		return retval;
+ 
+ 	if (mmap_write_lock_killable(mm))
+@@ -1775,7 +1775,7 @@ long ksys_shmdt(char __user *shmaddr)
+ 		 * otherwise it starts at this address with no hassles.
+ 		 */
+ 		if ((vma->vm_ops == &shm_vm_ops) &&
+-			(vma->vm_start - addr)/PAGE_SIZE == vma->vm_pgoff) {
++			(vma->vm_start - addr)/MMUPAGE_SIZE == vma->vm_pgoff) {
+ 
+ 			/*
+ 			 * Record the file of the shm segment being
+@@ -1804,11 +1804,11 @@ long ksys_shmdt(char __user *shmaddr)
+ 	 * could possibly have landed at. Also cast things to loff_t to
+ 	 * prevent overflows and make comparisons vs. equal-width types.
+ 	 */
+-	size = PAGE_ALIGN(size);
++	size = MMUPAGE_ALIGN(size);
+ 	while (vma && (loff_t)(vma->vm_end - addr) <= size) {
+ 		/* finding a matching vma now does not alter retval */
+ 		if ((vma->vm_ops == &shm_vm_ops) &&
+-		    ((vma->vm_start - addr)/PAGE_SIZE == vma->vm_pgoff) &&
++		    ((vma->vm_start - addr)/MMUPAGE_SIZE == vma->vm_pgoff) &&
+ 		    (vma->vm_file == file)) {
+ 			do_vmi_align_munmap(&vmi, vma, mm, vma->vm_start,
+ 					    vma->vm_end, NULL, false);
+diff --git a/kernel/bpf/stackmap.c b/kernel/bpf/stackmap.c
+index da3d328f5c15..2b7887f83cba 100644
+--- a/kernel/bpf/stackmap.c
++++ b/kernel/bpf/stackmap.c
+@@ -201,7 +201,7 @@ static void stack_map_get_build_id_offset(struct bpf_stack_build_id *id_offs,
+ 			continue;
+ 		}
+ build_id_valid:
+-		id_offs[i].offset = (vma->vm_pgoff << PAGE_SHIFT) + ip - vma->vm_start;
++		id_offs[i].offset = (vma->vm_pgoff << MMUPAGE_SHIFT) + ip - vma->vm_start;
+ 		id_offs[i].status = BPF_STACK_BUILD_ID_VALID;
+ 		prev_vma = vma;
+ 		prev_build_id = id_offs[i].build_id;
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 7935d5663944..6a8b9d3cbe1f 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -7366,7 +7366,7 @@ static int perf_mmap_aux(struct vm_area_struct *vma, struct perf_event *event,
+ 	if (aux_offset < perf_data_size(rb) + PAGE_SIZE)
+ 		return -EINVAL;
+ 
+-	if (aux_offset != vma->vm_pgoff << PAGE_SHIFT)
++	if (aux_offset != vma->vm_pgoff << MMUPAGE_SHIFT)
+ 		return -EINVAL;
+ 
+ 	/* already mapped with a different offset */
+@@ -9856,7 +9856,7 @@ static bool perf_addr_filter_vma_adjust(struct perf_addr_filter *filter,
+ 					struct perf_addr_filter_range *fr)
+ {
+ 	unsigned long vma_size = vma->vm_end - vma->vm_start;
+-	unsigned long off = vma->vm_pgoff << PAGE_SHIFT;
++	unsigned long off = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	struct file *file = vma->vm_file;
+ 
+ 	if (!perf_addr_filter_match(filter, file, off, vma_size))
+@@ -9946,7 +9946,7 @@ void perf_event_mmap(struct vm_area_struct *vma)
+ 			/* .tid */
+ 			.start  = vma->vm_start,
+ 			.len    = vma->vm_end - vma->vm_start,
+-			.pgoff  = (u64)vma->vm_pgoff << PAGE_SHIFT,
++			.pgoff  = (u64)vma->vm_pgoff << MMUPAGE_SHIFT,
+ 		},
+ 		/* .maj (attr_mmap2 only) */
+ 		/* .min (attr_mmap2 only) */
+diff --git a/kernel/events/ring_buffer.c b/kernel/events/ring_buffer.c
+index 9fe92161715e..e53359f06000 100644
+--- a/kernel/events/ring_buffer.c
++++ b/kernel/events/ring_buffer.c
+@@ -806,13 +806,13 @@ void rb_free_aux(struct perf_buffer *rb)
+ static struct page *
+ __perf_mmap_to_page(struct perf_buffer *rb, unsigned long pgoff)
+ {
+-	if (pgoff > rb->nr_pages)
++	if (pgoff > (unsigned long)rb->nr_pages << PAGE_MMUSHIFT)
+ 		return NULL;
+ 
+-	if (pgoff == 0)
++	if (pgoff < PAGE_MMUCOUNT)
+ 		return virt_to_page(rb->user_page);
+ 
+-	return virt_to_page(rb->data_pages[pgoff - 1]);
++	return virt_to_page(rb->data_pages[(pgoff >> PAGE_MMUSHIFT) - 1]);
+ }
+ 
+ static void *perf_mmap_alloc_page(int cpu)
+@@ -896,10 +896,10 @@ static struct page *
+ __perf_mmap_to_page(struct perf_buffer *rb, unsigned long pgoff)
+ {
+ 	/* The '>' counts in the user page. */
+-	if (pgoff > data_page_nr(rb))
++	if (pgoff > (unsigned long)data_page_nr(rb) << PAGE_MMUSHIFT)
+ 		return NULL;
+ 
+-	return vmalloc_to_page((void *)rb->user_page + pgoff * PAGE_SIZE);
++	return vmalloc_to_page((void *)rb->user_page + pgoff * MMUPAGE_SIZE);
+ }
+ 
+ static void rb_free_work(struct work_struct *work)
+diff --git a/kernel/events/uprobes.c b/kernel/events/uprobes.c
+index 4084e926e284..a63256171a36 100644
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@ -144,12 +144,12 @@ static bool valid_vma(struct vm_area_struct *vma, bool is_register)
+ 
+ static unsigned long offset_to_vaddr(struct vm_area_struct *vma, loff_t offset)
+ {
+-	return vma->vm_start + offset - ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
++	return vma->vm_start + offset - ((loff_t)vma->vm_pgoff << MMUPAGE_SHIFT);
+ }
+ 
+ static loff_t vaddr_to_offset(struct vm_area_struct *vma, unsigned long vaddr)
+ {
+-	return ((loff_t)vma->vm_pgoff << PAGE_SHIFT) + (vaddr - vma->vm_start);
++	return ((loff_t)vma->vm_pgoff << MMUPAGE_SHIFT) + (vaddr - vma->vm_start);
+ }
+ 
+ /**
+@@ -1482,7 +1482,7 @@ static int unapply_uprobe(struct uprobe *uprobe, struct mm_struct *mm)
+ 		    file_inode(vma->vm_file) != uprobe->inode)
+ 			continue;
+ 
+-		offset = (loff_t)vma->vm_pgoff << PAGE_SHIFT;
++		offset = (loff_t)vma->vm_pgoff << MMUPAGE_SHIFT;
+ 		if (uprobe->offset <  offset ||
+ 		    uprobe->offset >= offset + vma->vm_end - vma->vm_start)
+ 			continue;
+@@ -2453,7 +2453,7 @@ static struct uprobe *find_active_uprobe_speculative(unsigned long bp_vaddr)
+ 	if (!vm_file)
+ 		return NULL;
+ 
+-	offset = (loff_t)(vma->vm_pgoff << PAGE_SHIFT) + (bp_vaddr - vma->vm_start);
++	offset = (loff_t)(vma->vm_pgoff << MMUPAGE_SHIFT) + (bp_vaddr - vma->vm_start);
+ 	uprobe = find_uprobe_rcu(vm_file->f_inode, offset);
+ 	if (!uprobe)
+ 		return NULL;
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 8ac38beae360..cfa61579090b 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -314,9 +314,9 @@ static int memcg_charge_kernel_stack(struct vm_struct *vm_area)
+ 	int ret;
+ 	int nr_charged = 0;
+ 
+-	BUG_ON(vm_area->nr_pages != THREAD_SIZE / PAGE_SIZE);
++	BUG_ON(vm_area->nr_pages != DIV_ROUND_UP(THREAD_SIZE, PAGE_SIZE));
+ 
+-	for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++) {
++	for (i = 0; i < vm_area->nr_pages; i++) {
+ 		ret = memcg_kmem_charge_page(vm_area->pages[i], GFP_KERNEL, 0);
+ 		if (ret)
+ 			goto err;
+@@ -484,11 +484,10 @@ static void account_kernel_stack(struct task_struct *tsk, int account)
+ {
+ 	if (IS_ENABLED(CONFIG_VMAP_STACK)) {
+ 		struct vm_struct *vm_area = task_stack_vm_area(tsk);
+-		int i;
+ 
+-		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++)
+-			mod_lruvec_page_state(vm_area->pages[i], NR_KERNEL_STACK_KB,
+-					      account * (PAGE_SIZE / 1024));
++		/* Account actual THREAD_SIZE, not the rounded-up page size */
++		mod_lruvec_page_state(vm_area->pages[0], NR_KERNEL_STACK_KB,
++				      account * (THREAD_SIZE / 1024));
+ 	} else {
+ 		void *stack = task_stack_page(tsk);
+ 
+@@ -507,7 +506,7 @@ void exit_task_stack_account(struct task_struct *tsk)
+ 		int i;
+ 
+ 		vm_area = task_stack_vm_area(tsk);
+-		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++)
++		for (i = 0; i < DIV_ROUND_UP(THREAD_SIZE, PAGE_SIZE); i++)
+ 			memcg_kmem_uncharge_page(vm_area->pages[i], 0);
+ 	}
+ }
+diff --git a/kernel/futex/core.c b/kernel/futex/core.c
+index ff2a4fb2993f..3e4a5d406c25 100644
+--- a/kernel/futex/core.c
++++ b/kernel/futex/core.c
+@@ -564,11 +564,16 @@ int get_futex_key(u32 __user *uaddr, unsigned int flags, union futex_key *key,
+ 
+ 	/*
+ 	 * The futex address must be "naturally" aligned.
++	 *
++	 * The offset records the position within a kernel page for key
++	 * discrimination, but we round the address down to MMUPAGE_SIZE
++	 * for the GUP lookup because VMAs are MMUPAGE-aligned — the
++	 * PAGE-aligned address may fall below the VMA start.
+ 	 */
+ 	key->both.offset = address % PAGE_SIZE;
+ 	if (unlikely((address % size) != 0))
+ 		return -EINVAL;
+-	address -= key->both.offset;
++	address -= address % MMUPAGE_SIZE;
+ 
+ 	if (unlikely(!access_ok(uaddr, size)))
+ 		return -EFAULT;
+diff --git a/kernel/relay.c b/kernel/relay.c
+index 62b059ff2759..4b415f682b71 100644
+--- a/kernel/relay.c
++++ b/kernel/relay.c
+@@ -38,7 +38,7 @@ static vm_fault_t relay_buf_fault(struct vm_fault *vmf)
+ 	if (!buf)
+ 		return VM_FAULT_OOM;
+ 
+-	page = vmalloc_to_page(buf->start + (pgoff << PAGE_SHIFT));
++	page = vmalloc_to_page(buf->start + (pgoff << MMUPAGE_SHIFT));
+ 	if (!page)
+ 		return VM_FAULT_SIGBUS;
+ 	get_page(page);
+diff --git a/lib/iov_iter.c b/lib/iov_iter.c
+index 243662af1af7..b0d00db7906a 100644
+--- a/lib/iov_iter.c
++++ b/lib/iov_iter.c
+@@ -1075,6 +1075,7 @@ static ssize_t __iov_iter_get_pages_alloc(struct iov_iter *i,
+ 
+ 	if (likely(user_backed_iter(i))) {
+ 		unsigned long addr;
++		size_t mmu_off;
+ 		int res;
+ 
+ 		if (iov_iter_rw(i) != WRITE)
+@@ -1083,15 +1084,22 @@ static ssize_t __iov_iter_get_pages_alloc(struct iov_iter *i,
+ 			gup_flags |= FOLL_NOFAULT;
+ 
+ 		addr = first_iovec_segment(i, &maxsize);
+-		*start = addr % PAGE_SIZE;
+-		addr &= PAGE_MASK;
+-		n = want_pages_array(pages, maxsize, *start, maxpages);
+-		if (!n)
+-			return -ENOMEM;
++		*start = addr % PAGE_SIZE; /* kernel-page offset for bvec */
++		mmu_off = addr & ~MMUPAGE_MASK; /* sub-MMUPAGE offset */
++		addr &= MMUPAGE_MASK;
++		n = DIV_ROUND_UP(maxsize + mmu_off, MMUPAGE_SIZE);
++		if (n > maxpages)
++			n = maxpages;
++		WARN_ON(!n);
++		if (!*pages) {
++			*pages = kvmalloc_objs(struct page *, n);
++			if (!*pages)
++				return -ENOMEM;
++		}
+ 		res = get_user_pages_fast(addr, n, gup_flags, *pages);
+ 		if (unlikely(res <= 0))
+ 			return res;
+-		maxsize = min_t(size_t, maxsize, res * PAGE_SIZE - *start);
++		maxsize = min_t(size_t, maxsize, res * MMUPAGE_SIZE - mmu_off);
+ 		iov_iter_advance(i, maxsize);
+ 		return maxsize;
+ 	}
+@@ -1161,12 +1169,12 @@ static int iov_npages(const struct iov_iter *i, int maxpages)
+ 	int npages = 0;
+ 
+ 	for (p = iter_iov(i); size; skip = 0, p++) {
+-		unsigned offs = offset_in_page(p->iov_base + skip);
++		unsigned offs = (unsigned long)(p->iov_base + skip) & ~MMUPAGE_MASK;
+ 		size_t len = min(p->iov_len - skip, size);
+ 
+ 		if (len) {
+ 			size -= len;
+-			npages += DIV_ROUND_UP(offs + len, PAGE_SIZE);
++			npages += DIV_ROUND_UP(offs + len, MMUPAGE_SIZE);
+ 			if (unlikely(npages > maxpages))
+ 				return maxpages;
+ 		}
+@@ -1197,8 +1205,8 @@ int iov_iter_npages(const struct iov_iter *i, int maxpages)
+ 	if (unlikely(!i->count))
+ 		return 0;
+ 	if (likely(iter_is_ubuf(i))) {
+-		unsigned offs = offset_in_page(i->ubuf + i->iov_offset);
+-		int npages = DIV_ROUND_UP(offs + i->count, PAGE_SIZE);
++		unsigned offs = (unsigned long)(i->ubuf + i->iov_offset) & ~MMUPAGE_MASK;
++		int npages = DIV_ROUND_UP(offs + i->count, MMUPAGE_SIZE);
+ 		return min(npages, maxpages);
+ 	}
+ 	/* iovec and kvec have identical layouts */
+@@ -1744,7 +1752,7 @@ static ssize_t iov_iter_extract_user_pages(struct iov_iter *i,
+ {
+ 	unsigned long addr;
+ 	unsigned int gup_flags = 0;
+-	size_t offset;
++	size_t mmu_off;
+ 	int res;
+ 
+ 	if (i->data_source == ITER_DEST)
+@@ -1755,15 +1763,21 @@ static ssize_t iov_iter_extract_user_pages(struct iov_iter *i,
+ 		gup_flags |= FOLL_NOFAULT;
+ 
+ 	addr = first_iovec_segment(i, &maxsize);
+-	*offset0 = offset = addr % PAGE_SIZE;
+-	addr &= PAGE_MASK;
+-	maxpages = want_pages_array(pages, maxsize, offset, maxpages);
++	*offset0 = addr % PAGE_SIZE; /* kernel-page offset for bvec consumers */
++	mmu_off = addr & ~MMUPAGE_MASK; /* sub-MMUPAGE offset */
++	addr &= MMUPAGE_MASK;
++	maxpages = DIV_ROUND_UP(maxsize + mmu_off, MMUPAGE_SIZE);
+ 	if (!maxpages)
+ 		return -ENOMEM;
++	if (!*pages) {
++		*pages = kvmalloc_objs(struct page *, maxpages);
++		if (!*pages)
++			return -ENOMEM;
++	}
+ 	res = pin_user_pages_fast(addr, maxpages, gup_flags, *pages);
+ 	if (unlikely(res <= 0))
+ 		return res;
+-	maxsize = min_t(size_t, maxsize, res * PAGE_SIZE - offset);
++	maxsize = min_t(size_t, maxsize, res * MMUPAGE_SIZE - mmu_off);
+ 	iov_iter_advance(i, maxsize);
+ 	return maxsize;
+ }
+diff --git a/lib/vdso/datastore.c b/lib/vdso/datastore.c
+index 17d37b82ebc6..a738ffec44c4 100644
+--- a/lib/vdso/datastore.c
++++ b/lib/vdso/datastore.c
+@@ -82,7 +82,7 @@ static vm_fault_t vvar_fault(const struct vm_special_mapping *sm,
+ 			unsigned long addr;
+ 			vm_fault_t err;
+ 
+-			addr = vmf->address + VDSO_TIMENS_PAGE_OFFSET * PAGE_SIZE;
++			addr = vmf->address + VDSO_TIMENS_PAGE_OFFSET * MMUPAGE_SIZE;
+ 			err = vmf_insert_page(vma, addr, page);
+ 			if (unlikely(err & VM_FAULT_ERROR))
+ 				return err;
+@@ -127,7 +127,7 @@ const struct vm_special_mapping vdso_vvar_mapping = {
+ 
+ struct vm_area_struct *vdso_install_vvar_mapping(struct mm_struct *mm, unsigned long addr)
+ {
+-	return _install_special_mapping(mm, addr, VDSO_NR_PAGES * PAGE_SIZE,
++	return _install_special_mapping(mm, addr, VDSO_NR_PAGES * MMUPAGE_SIZE,
+ 					VM_READ | VM_MAYREAD | VM_IO | VM_DONTDUMP |
+ 					VM_MIXEDMAP | VM_SEALED_SYSMAP,
+ 					&vdso_vvar_mapping);
+diff --git a/lib/zlib_inflate/infutil.h b/lib/zlib_inflate/infutil.h
+index 784ab33b7842..f053e213411d 100644
+--- a/lib/zlib_inflate/infutil.h
++++ b/lib/zlib_inflate/infutil.h
+@@ -23,7 +23,7 @@ struct inflate_workspace {
+ 	struct inflate_state inflate_state;
+ #ifdef CONFIG_ZLIB_DFLTCC
+ 	struct dfltcc_state dfltcc_state;
+-	unsigned char working_window[(1 << MAX_WBITS) + PAGE_SIZE];
++	unsigned char working_window[(1 << MAX_WBITS) + MMUPAGE_SIZE];
+ #else
+ 	unsigned char working_window[(1 << MAX_WBITS)];
+ #endif
+diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+index 25ca7d714014..06cc48468695 100644
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -246,8 +246,16 @@ static int sel_mmap_handle_status(struct file *filp,
+ 
+ 	BUG_ON(!status);
+ 
+-	/* only allows one page from the head */
+-	if (vma->vm_pgoff > 0 || size != PAGE_SIZE)
++	/*
++	 * Only allows one page from the head.  Userspace (libselinux
++	 * selinux_status_open()) maps getpagesize() bytes, i.e. one MMU page
++	 * (MMUPAGE_SIZE), which under page clustering is smaller than the
++	 * kernel PAGE_SIZE.  Gate on MMUPAGE_SIZE so the status struct (which
++	 * lives at the head of the page) can be mapped; remap_pfn_range() below
++	 * maps the first MMU page of the cluster.  MMUPAGE_SIZE == PAGE_SIZE
++	 * when PAGE_MMUSHIFT == 0, so non-clustered behaviour is unchanged.
++	 */
++	if (vma->vm_pgoff > 0 || size != MMUPAGE_SIZE)
+ 		return -EIO;
+ 	/* disallow writable mapping */
+ 	if (vma->vm_flags & VM_WRITE)
+diff --git a/virt/kvm/guest_memfd.c b/virt/kvm/guest_memfd.c
+index 69c9d6d546b2..1f282457de5b 100644
+--- a/virt/kvm/guest_memfd.c
++++ b/virt/kvm/guest_memfd.c
+@@ -442,7 +442,7 @@ static struct mempolicy *kvm_gmem_get_policy(struct vm_area_struct *vma,
+ {
+ 	struct inode *inode = file_inode(vma->vm_file);
+ 
+-	*pgoff = vma->vm_pgoff + ((addr - vma->vm_start) >> PAGE_SHIFT);
++	*pgoff = vma->vm_pgoff + ((addr - vma->vm_start) >> MMUPAGE_SHIFT);
+ 
+ 	/*
+ 	 * Return the memory policy for this index, or NULL if none is set.
+-- 
+2.54.0
+

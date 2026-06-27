@@ -1,0 +1,1627 @@
+From c3d15d30f59157f85ef42bb77d67f126d137a1b9 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:24 +0200
+Subject: [RFC PATCH 04/28] mm: page clustering mmap-family syscalls
+ (MMUPAGE-granular)
+
+---
+ mm/gup.c      | 67 +++++++++++++++++++++++++++-----------------------
+ mm/madvise.c  | 43 ++++++++++++++++----------------
+ mm/mincore.c  | 44 +++++++++++++++++++++------------
+ mm/mlock.c    | 41 +++++++++++++++++--------------
+ mm/mmap.c     | 68 +++++++++++++++++++++++++--------------------------
+ mm/mprotect.c | 44 +++++++++++++++++++++++++--------
+ mm/mremap.c   | 67 +++++++++++++++++++++++++++++++++-----------------
+ mm/msync.c    |  6 ++---
+ mm/util.c     | 47 ++++++++++++++++++++---------------
+ mm/vma.c      | 61 +++++++++++++++++++++++----------------------
+ 10 files changed, 284 insertions(+), 204 deletions(-)
+
+diff --git a/mm/gup.c b/mm/gup.c
+index ad9ded39609c..0fc8c2549f17 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -675,7 +675,7 @@ static struct page *follow_huge_pud(struct vm_area_struct *vma,
+ 	if (ret)
+ 		page = ERR_PTR(ret);
+ 	else
+-		*page_mask = HPAGE_PUD_NR - 1;
++		*page_mask = (HPAGE_PUD_SIZE / MMUPAGE_SIZE) - 1;
+ 
+ 	return page;
+ }
+@@ -738,7 +738,7 @@ static struct page *follow_huge_pmd(struct vm_area_struct *vma,
+ #endif	/* CONFIG_TRANSPARENT_HUGEPAGE */
+ 
+ 	page += (addr & ~HPAGE_PMD_MASK) >> PAGE_SHIFT;
+-	*page_mask = HPAGE_PMD_NR - 1;
++	*page_mask = (HPAGE_PMD_SIZE / MMUPAGE_SIZE) - 1;
+ 
+ 	return page;
+ }
+@@ -1395,7 +1395,7 @@ static long __get_user_pages(struct mm_struct *mm,
+ 			}
+ 			vma = gup_vma_lookup(mm, start);
+ 			if (!vma && in_gate_area(mm, start)) {
+-				ret = get_gate_page(mm, start & PAGE_MASK,
++				ret = get_gate_page(mm, start & MMUPAGE_MASK,
+ 						gup_flags, &vma,
+ 						pages ? &page : NULL);
+ 				if (ret)
+@@ -1456,7 +1456,7 @@ static long __get_user_pages(struct mm_struct *mm,
+ 			goto out;
+ 		}
+ next_page:
+-		page_increm = 1 + (~(start >> PAGE_SHIFT) & page_mask);
++		page_increm = 1 + (~(start >> MMUPAGE_SHIFT) & page_mask);
+ 		if (page_increm > nr_pages)
+ 			page_increm = nr_pages;
+ 
+@@ -1494,15 +1494,16 @@ static long __get_user_pages(struct mm_struct *mm,
+ 			}
+ 
+ 			for (j = 0; j < page_increm; j++) {
+-				subpage = page + j;
++				subpage = page + (j >> PAGE_MMUSHIFT);
+ 				pages[i + j] = subpage;
+-				flush_anon_page(vma, subpage, start + j * PAGE_SIZE);
++				flush_anon_page(vma, subpage,
++						start + j * MMUPAGE_SIZE);
+ 				flush_dcache_page(subpage);
+ 			}
+ 		}
+ 
+ 		i += page_increm;
+-		start += page_increm * PAGE_SIZE;
++		start += page_increm * MMUPAGE_SIZE;
+ 		nr_pages -= page_increm;
+ 	} while (nr_pages);
+ out:
+@@ -1721,7 +1722,7 @@ static __always_inline long __get_user_pages_locked(struct mm_struct *mm,
+ 		 */
+ 		if (likely(pages))
+ 			pages += ret;
+-		start += ret << PAGE_SHIFT;
++		start += ret << MMUPAGE_SHIFT;
+ 
+ 		/* The lock was temporarily dropped, so we must unlock later */
+ 		must_unlock = true;
+@@ -1768,7 +1769,7 @@ static __always_inline long __get_user_pages_locked(struct mm_struct *mm,
+ 			break;
+ 		if (likely(pages))
+ 			pages++;
+-		start += PAGE_SIZE;
++		start += MMUPAGE_SIZE;
+ 	}
+ 	if (must_unlock && *locked) {
+ 		/*
+@@ -1814,13 +1815,13 @@ long populate_vma_page_range(struct vm_area_struct *vma,
+ 		unsigned long start, unsigned long end, int *locked)
+ {
+ 	struct mm_struct *mm = vma->vm_mm;
+-	unsigned long nr_pages = (end - start) / PAGE_SIZE;
++	unsigned long nr_pages = (end - start) / MMUPAGE_SIZE;
+ 	int local_locked = 1;
+ 	int gup_flags;
+ 	long ret;
+ 
+-	VM_WARN_ON_ONCE(!PAGE_ALIGNED(start));
+-	VM_WARN_ON_ONCE(!PAGE_ALIGNED(end));
++	VM_WARN_ON_ONCE(!MMUPAGE_ALIGNED(start));
++	VM_WARN_ON_ONCE(!MMUPAGE_ALIGNED(end));
+ 	VM_WARN_ON_ONCE_VMA(start < vma->vm_start, vma);
+ 	VM_WARN_ON_ONCE_VMA(end   > vma->vm_end, vma);
+ 	mmap_assert_locked(mm);
+@@ -1887,12 +1888,12 @@ long populate_vma_page_range(struct vm_area_struct *vma,
+ long faultin_page_range(struct mm_struct *mm, unsigned long start,
+ 			unsigned long end, bool write, int *locked)
+ {
+-	unsigned long nr_pages = (end - start) / PAGE_SIZE;
++	unsigned long nr_pages = (end - start) / MMUPAGE_SIZE;
+ 	int gup_flags;
+ 	long ret;
+ 
+-	VM_WARN_ON_ONCE(!PAGE_ALIGNED(start));
+-	VM_WARN_ON_ONCE(!PAGE_ALIGNED(end));
++	VM_WARN_ON_ONCE(!MMUPAGE_ALIGNED(start));
++	VM_WARN_ON_ONCE(!MMUPAGE_ALIGNED(end));
+ 	mmap_assert_locked(mm);
+ 
+ 	/*
+@@ -1968,7 +1969,7 @@ int __mm_populate(unsigned long start, unsigned long len, int ignore_errors)
+ 			}
+ 			break;
+ 		}
+-		nend = nstart + ret * PAGE_SIZE;
++		nend = nstart + ret * MMUPAGE_SIZE;
+ 		ret = 0;
+ 	}
+ 	if (locked)
+@@ -2023,7 +2024,7 @@ static long __get_user_pages_locked(struct mm_struct *mm, unsigned long start,
+ 				get_page(pages[i]);
+ 		}
+ 
+-		start = (start + PAGE_SIZE) & PAGE_MASK;
++		start = (start + MMUPAGE_SIZE) & MMUPAGE_MASK;
+ 	}
+ 
+ 	if (must_unlock && *locked) {
+@@ -2055,7 +2056,7 @@ size_t fault_in_writeable(char __user *uaddr, size_t size)
+ 		return size;
+ 
+ 	/* Stop once we overflow to 0. */
+-	for (cur = start; cur && cur < end; cur = PAGE_ALIGN_DOWN(cur + PAGE_SIZE))
++	for (cur = start; cur && cur < end; cur = MMUPAGE_ALIGN_DOWN(cur + MMUPAGE_SIZE))
+ 		unsafe_put_user(0, (char __user *)cur, out);
+ out:
+ 	user_write_access_end();
+@@ -2125,7 +2126,7 @@ size_t fault_in_safe_writeable(const char __user *uaddr, size_t size)
+ 
+ 	mmap_read_lock(mm);
+ 	/* Stop once we overflow to 0. */
+-	for (cur = start; cur && cur < end; cur = PAGE_ALIGN_DOWN(cur + PAGE_SIZE))
++	for (cur = start; cur && cur < end; cur = MMUPAGE_ALIGN_DOWN(cur + MMUPAGE_SIZE))
+ 		if (fixup_user_fault(mm, cur, FAULT_FLAG_WRITE, &unlocked))
+ 			break;
+ 	mmap_read_unlock(mm);
+@@ -2157,7 +2158,7 @@ size_t fault_in_readable(const char __user *uaddr, size_t size)
+ 		return size;
+ 
+ 	/* Stop once we overflow to 0. */
+-	for (cur = start; cur && cur < end; cur = PAGE_ALIGN_DOWN(cur + PAGE_SIZE))
++	for (cur = start; cur && cur < end; cur = MMUPAGE_ALIGN_DOWN(cur + MMUPAGE_SIZE))
+ 		unsafe_get_user(c, (const char __user *)cur, out);
+ out:
+ 	user_read_access_end();
+@@ -2894,7 +2895,7 @@ static int gup_fast_pte_range(pmd_t pmd, pmd_t *pmdp, unsigned long addr,
+ 		folio_set_referenced(folio);
+ 		pages[*nr] = page;
+ 		(*nr)++;
+-	} while (ptep++, addr += PAGE_SIZE, addr != end);
++	} while (ptep++, addr += MMUPAGE_SIZE, addr != end);
+ 
+ 	ret = 1;
+ 
+@@ -2935,7 +2936,7 @@ static int gup_fast_pmd_leaf(pmd_t orig, pmd_t *pmdp, unsigned long addr,
+ 	if (pmd_special(orig))
+ 		return 0;
+ 
+-	refs = (end - addr) >> PAGE_SHIFT;
++	refs = (end - addr) >> MMUPAGE_SHIFT;
+ 	page = pmd_page(orig) + ((addr & ~PMD_MASK) >> PAGE_SHIFT);
+ 
+ 	folio = try_grab_folio_fast(page, refs, flags);
+@@ -2958,8 +2959,11 @@ static int gup_fast_pmd_leaf(pmd_t orig, pmd_t *pmdp, unsigned long addr,
+ 
+ 	pages += *nr;
+ 	*nr += refs;
+-	for (; refs; refs--)
+-		*(pages++) = page++;
++	{
++		int i;
++		for (i = 0; i < refs; i++)
++			pages[i] = page + (i >> PAGE_MMUSHIFT);
++	}
+ 	folio_set_referenced(folio);
+ 	return 1;
+ }
+@@ -2978,7 +2982,7 @@ static int gup_fast_pud_leaf(pud_t orig, pud_t *pudp, unsigned long addr,
+ 	if (pud_special(orig))
+ 		return 0;
+ 
+-	refs = (end - addr) >> PAGE_SHIFT;
++	refs = (end - addr) >> MMUPAGE_SHIFT;
+ 	page = pud_page(orig) + ((addr & ~PUD_MASK) >> PAGE_SHIFT);
+ 
+ 	folio = try_grab_folio_fast(page, refs, flags);
+@@ -3002,8 +3006,11 @@ static int gup_fast_pud_leaf(pud_t orig, pud_t *pudp, unsigned long addr,
+ 
+ 	pages += *nr;
+ 	*nr += refs;
+-	for (; refs; refs--)
+-		*(pages++) = page++;
++	{
++		int i;
++		for (i = 0; i < refs; i++)
++			pages[i] = page + (i >> PAGE_MMUSHIFT);
++	}
+ 	folio_set_referenced(folio);
+ 	return 1;
+ }
+@@ -3192,8 +3199,8 @@ static int gup_fast_fallback(unsigned long start, unsigned long nr_pages,
+ 	if (!(gup_flags & FOLL_FAST_ONLY))
+ 		might_lock_read(&current->mm->mmap_lock);
+ 
+-	start = untagged_addr(start) & PAGE_MASK;
+-	len = nr_pages << PAGE_SHIFT;
++	start = untagged_addr(start) & MMUPAGE_MASK;
++	len = nr_pages << MMUPAGE_SHIFT;
+ 	if (check_add_overflow(start, len, &end))
+ 		return -EOVERFLOW;
+ 	if (end > TASK_SIZE_MAX)
+@@ -3204,7 +3211,7 @@ static int gup_fast_fallback(unsigned long start, unsigned long nr_pages,
+ 		return nr_pinned;
+ 
+ 	/* Slow path: try to get the remaining pages with get_user_pages */
+-	start += nr_pinned << PAGE_SHIFT;
++	start += nr_pinned << MMUPAGE_SHIFT;
+ 	pages += nr_pinned;
+ 	ret = __gup_longterm_locked(current->mm, start, nr_pages - nr_pinned,
+ 				    pages, &locked,
+diff --git a/mm/madvise.c b/mm/madvise.c
+index 69708e953cf5..651b942c8156 100644
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@ -193,7 +193,7 @@ static int swapin_walk_pmd_entry(pmd_t *pmd, unsigned long start,
+ 	spinlock_t *ptl;
+ 	unsigned long addr;
+ 
+-	for (addr = start; addr < end; addr += PAGE_SIZE) {
++	for (addr = start; addr < end; addr += MMUPAGE_SIZE) {
+ 		pte_t pte;
+ 		softleaf_t entry;
+ 		struct folio *folio;
+@@ -235,8 +235,8 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
+ 		unsigned long start, unsigned long end,
+ 		struct address_space *mapping)
+ {
+-	XA_STATE(xas, &mapping->i_pages, linear_page_index(vma, start));
+-	pgoff_t end_index = linear_page_index(vma, end) - 1;
++	XA_STATE(xas, &mapping->i_pages, pgoff_mmu_to_page(linear_page_index(vma, start)));
++	pgoff_t end_index = pgoff_mmu_to_page(linear_page_index(vma, end)) - 1;
+ 	struct folio *folio;
+ 	struct swap_iocb *splug = NULL;
+ 
+@@ -252,8 +252,7 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
+ 		if (!softleaf_is_swap(entry))
+ 			continue;
+ 
+-		addr = vma->vm_start +
+-			((xas.xa_index - vma->vm_pgoff) << PAGE_SHIFT);
++		addr = pgoff_to_vma_addr(vma, xas.xa_index);
+ 		xas_pause(&xas);
+ 		rcu_read_unlock();
+ 
+@@ -318,7 +317,7 @@ static long madvise_willneed(struct madvise_behavior *madv_behavior)
+ 	mark_mmap_lock_dropped(madv_behavior);
+ 	get_file(file);
+ 	offset = (loff_t)(start - vma->vm_start)
+-			+ ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
++			+ ((loff_t)vma->vm_pgoff << MMUPAGE_SHIFT);
+ 	mmap_read_unlock(mm);
+ 	vfs_fadvise(file, offset, end - start, POSIX_FADV_WILLNEED);
+ 	fput(file);
+@@ -345,10 +344,10 @@ static inline int madvise_folio_pte_batch(unsigned long addr, unsigned long end,
+ 					  struct folio *folio, pte_t *ptep,
+ 					  pte_t *ptentp)
+ {
+-	int max_nr = (end - addr) / PAGE_SIZE;
++	int max_nr = (end - addr) / MMUPAGE_SIZE;
+ 
+ 	return folio_pte_batch_flags(folio, NULL, ptep, ptentp, max_nr,
+-				     FPB_MERGE_YOUNG_DIRTY);
++				     FPB_MERGE_YOUNG_DIRTY).nr;
+ }
+ 
+ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
+@@ -447,14 +446,14 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
+ 
+ regular_folio:
+ #endif
+-	tlb_change_page_size(tlb, PAGE_SIZE);
++	tlb_change_page_size(tlb, MMUPAGE_SIZE);
+ restart:
+ 	start_pte = pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+ 	if (!start_pte)
+ 		return 0;
+ 	flush_tlb_batched_pending(mm);
+ 	lazy_mmu_mode_enable();
+-	for (; addr < end; pte += nr, addr += nr * PAGE_SIZE) {
++	for (; addr < end; pte += nr, addr += nr * MMUPAGE_SIZE) {
+ 		nr = 1;
+ 		ptent = ptep_get(pte);
+ 
+@@ -670,13 +669,13 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
+ 		if (madvise_free_huge_pmd(tlb, vma, pmd, addr, next))
+ 			return 0;
+ 
+-	tlb_change_page_size(tlb, PAGE_SIZE);
++	tlb_change_page_size(tlb, MMUPAGE_SIZE);
+ 	start_pte = pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+ 	if (!start_pte)
+ 		return 0;
+ 	flush_tlb_batched_pending(mm);
+ 	lazy_mmu_mode_enable();
+-	for (; addr != end; pte += nr, addr += PAGE_SIZE * nr) {
++	for (; addr != end; pte += nr, addr += MMUPAGE_SIZE * nr) {
+ 		nr = 1;
+ 		ptent = ptep_get(pte);
+ 
+@@ -691,7 +690,7 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
+ 			softleaf_t entry = softleaf_from_pte(ptent);
+ 
+ 			if (softleaf_is_swap(entry)) {
+-				max_nr = (end - addr) / PAGE_SIZE;
++				max_nr = (end - addr) / MMUPAGE_SIZE;
+ 				nr = swap_pte_batch(pte, max_nr, ptent);
+ 				nr_swap -= nr;
+ 				swap_put_entries_direct(entry, nr);
+@@ -989,7 +988,7 @@ static long madvise_populate(struct madvise_behavior *madv_behavior)
+ 				return -ENOMEM;
+ 			}
+ 		}
+-		start += pages * PAGE_SIZE;
++		start += pages * MMUPAGE_SIZE;
+ 	}
+ 	return 0;
+ }
+@@ -1023,7 +1022,7 @@ static long madvise_remove(struct madvise_behavior *madv_behavior)
+ 		return -EACCES;
+ 
+ 	offset = (loff_t)(start - vma->vm_start)
+-			+ ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
++			+ ((loff_t)vma->vm_pgoff << MMUPAGE_SHIFT);
+ 
+ 	/*
+ 	 * Filesystem's fallocate may need to take i_rwsem.  We need to
+@@ -1183,7 +1182,7 @@ static long madvise_guard_install(struct madvise_behavior *madv_behavior)
+ 
+ 		if (err == 0) {
+ 			unsigned long nr_expected_pages =
+-				PHYS_PFN(range->end - range->start);
++				(range->end - range->start) >> MMUPAGE_SHIFT;
+ 
+ 			VM_WARN_ON(nr_pages != nr_expected_pages);
+ 			return 0;
+@@ -1841,9 +1840,9 @@ static bool is_valid_madvise(unsigned long start, size_t len_in, int behavior)
+ 	if (!madvise_behavior_valid(behavior))
+ 		return false;
+ 
+-	if (!PAGE_ALIGNED(start))
++	if (!MMUPAGE_ALIGNED(start))
+ 		return false;
+-	len = PAGE_ALIGN(len_in);
++	len = MMUPAGE_ALIGN(len_in);
+ 
+ 	/* Check to see whether len was rounded up from small -ve to zero */
+ 	if (len_in && !len)
+@@ -1873,7 +1872,7 @@ static bool madvise_should_skip(unsigned long start, size_t len_in,
+ 		*err = -EINVAL;
+ 		return true;
+ 	}
+-	if (start + PAGE_ALIGN(len_in) == start) {
++	if (start + MMUPAGE_ALIGN(len_in) == start) {
+ 		*err = 0;
+ 		return true;
+ 	}
+@@ -1920,7 +1919,7 @@ static int madvise_do_behavior(unsigned long start, size_t len_in,
+ 	}
+ 
+ 	range->start = get_untagged_addr(madv_behavior->mm, start);
+-	range->end = range->start + PAGE_ALIGN(len_in);
++	range->end = range->start + MMUPAGE_ALIGN(len_in);
+ 
+ 	blk_start_plug(&plug);
+ 	if (is_madvise_populate(madv_behavior))
+@@ -2186,9 +2185,9 @@ static int madvise_set_anon_name(struct mm_struct *mm, unsigned long start,
+ 		.anon_name = anon_name,
+ 	};
+ 
+-	if (start & ~PAGE_MASK)
++	if (start & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+-	len = (len_in + ~PAGE_MASK) & PAGE_MASK;
++	len = (len_in + ~MMUPAGE_MASK) & MMUPAGE_MASK;
+ 
+ 	/* Check to see whether len was rounded up from small -ve to zero */
+ 	if (len_in && !len)
+diff --git a/mm/mincore.c b/mm/mincore.c
+index 296f2e3922b5..85f045abb828 100644
+--- a/mm/mincore.c
++++ b/mm/mincore.c
+@@ -48,7 +48,7 @@ static int mincore_hugetlb(pte_t *pte, unsigned long hmask, unsigned long addr,
+ 			present = 1;
+ 	}
+ 
+-	for (; addr != end; vec++, addr += PAGE_SIZE)
++	for (; addr != end; vec++, addr += MMUPAGE_SIZE)
+ 		*vec = present;
+ 	walk->private = vec;
+ 	spin_unlock(ptl);
+@@ -135,7 +135,7 @@ static unsigned char mincore_page(struct address_space *mapping, pgoff_t index)
+ static int __mincore_unmapped_range(unsigned long addr, unsigned long end,
+ 				struct vm_area_struct *vma, unsigned char *vec)
+ {
+-	unsigned long nr = (end - addr) >> PAGE_SHIFT;
++	unsigned long nr = (end - addr) >> MMUPAGE_SHIFT;
+ 	int i;
+ 
+ 	if (vma->vm_file) {
+@@ -143,7 +143,8 @@ static int __mincore_unmapped_range(unsigned long addr, unsigned long end,
+ 
+ 		pgoff = linear_page_index(vma, addr);
+ 		for (i = 0; i < nr; i++, pgoff++)
+-			vec[i] = mincore_page(vma->vm_file->f_mapping, pgoff);
++			vec[i] = mincore_page(vma->vm_file->f_mapping,
++					      pgoff_mmu_to_page(pgoff));
+ 	} else {
+ 		for (i = 0; i < nr; i++)
+ 			vec[i] = 0;
+@@ -167,7 +168,7 @@ static int mincore_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
+ 	struct vm_area_struct *vma = walk->vma;
+ 	pte_t *ptep;
+ 	unsigned char *vec = walk->private;
+-	int nr = (end - addr) >> PAGE_SHIFT;
++	int nr = (end - addr) >> MMUPAGE_SHIFT;
+ 	int step, i;
+ 
+ 	ptl = pmd_trans_huge_lock(pmd, vma);
+@@ -182,19 +183,19 @@ static int mincore_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
+ 		walk->action = ACTION_AGAIN;
+ 		return 0;
+ 	}
+-	for (; addr != end; ptep += step, addr += step * PAGE_SIZE) {
++	for (; addr != end; ptep += step, addr += step * MMUPAGE_SIZE) {
+ 		pte_t pte = ptep_get(ptep);
+ 
+ 		step = 1;
+ 		/* We need to do cache lookup too for markers */
+ 		if (pte_none(pte) || pte_is_marker(pte))
+-			__mincore_unmapped_range(addr, addr + PAGE_SIZE,
++			__mincore_unmapped_range(addr, addr + MMUPAGE_SIZE,
+ 						 vma, vec);
+ 		else if (pte_present(pte)) {
+ 			unsigned int batch = pte_batch_hint(ptep, pte);
+ 
+ 			if (batch > 1) {
+-				unsigned int max_nr = (end - addr) >> PAGE_SHIFT;
++				unsigned int max_nr = (end - addr) >> MMUPAGE_SHIFT;
+ 
+ 				step = min_t(unsigned int, batch, max_nr);
+ 			}
+@@ -253,16 +254,27 @@ static long do_mincore(unsigned long addr, unsigned long pages, unsigned char *v
+ 	vma = vma_lookup(current->mm, addr);
+ 	if (!vma)
+ 		return -ENOMEM;
+-	end = min(vma->vm_end, addr + (pages << PAGE_SHIFT));
++	/*
++	 * pages << MMUPAGE_SHIFT can be as large as
++	 * PAGE_SIZE << MMUPAGE_SHIFT = (1 << PAGE_SHIFT) << MMUPAGE_SHIFT,
++	 * which on PGCL=6 / 32-bit (e.g. m68k PAGE_SHIFT=18) is 1 GiB
++	 * — easily overflows addr + size to wrap below vma->vm_end.
++	 * Saturate on overflow so the subsequent min() yields a sane end.
++	 */
++	end = addr + (pages << MMUPAGE_SHIFT);
++	if (end < addr)
++		end = vma->vm_end;
++	else
++		end = min(vma->vm_end, end);
+ 	if (!can_do_mincore(vma)) {
+-		unsigned long pages = DIV_ROUND_UP(end - addr, PAGE_SIZE);
++		unsigned long pages = DIV_ROUND_UP(end - addr, MMUPAGE_SIZE);
+ 		memset(vec, 1, pages);
+ 		return pages;
+ 	}
+ 	err = walk_page_range(vma->vm_mm, addr, end, &mincore_walk_ops, vec);
+ 	if (err < 0)
+ 		return err;
+-	return (end - addr) >> PAGE_SHIFT;
++	return (end - addr) >> MMUPAGE_SHIFT;
+ }
+ 
+ /*
+@@ -299,16 +311,16 @@ SYSCALL_DEFINE3(mincore, unsigned long, start, size_t, len,
+ 	start = untagged_addr(start);
+ 
+ 	/* Check the start address: needs to be page-aligned.. */
+-	if (unlikely(start & ~PAGE_MASK))
++	if (unlikely(start & ~MMUPAGE_MASK))
+ 		return -EINVAL;
+ 
+ 	/* ..and we need to be passed a valid user-space range */
+ 	if (!access_ok((void __user *) start, len))
+ 		return -ENOMEM;
+ 
+-	/* This also avoids any overflows on PAGE_ALIGN */
+-	pages = len >> PAGE_SHIFT;
+-	pages += (offset_in_page(len)) != 0;
++	/* This also avoids any overflows on MMUPAGE_ALIGN */
++	pages = len >> MMUPAGE_SHIFT;
++	pages += (len & ~MMUPAGE_MASK) != 0;
+ 
+ 	if (!access_ok(vec, pages))
+ 		return -EFAULT;
+@@ -324,7 +336,7 @@ SYSCALL_DEFINE3(mincore, unsigned long, start, size_t, len,
+ 		 * the temporary buffer size.
+ 		 */
+ 		mmap_read_lock(current->mm);
+-		retval = do_mincore(start, min(pages, PAGE_SIZE), tmp);
++		retval = do_mincore(start, min(pages, (unsigned long)PAGE_SIZE), tmp);
+ 		mmap_read_unlock(current->mm);
+ 
+ 		if (retval <= 0)
+@@ -335,7 +347,7 @@ SYSCALL_DEFINE3(mincore, unsigned long, start, size_t, len,
+ 		}
+ 		pages -= retval;
+ 		vec += retval;
+-		start += retval << PAGE_SHIFT;
++		start += retval << MMUPAGE_SHIFT;
+ 		retval = 0;
+ 	}
+ 	free_page((unsigned long) tmp);
+diff --git a/mm/mlock.c b/mm/mlock.c
+index 8c227fefa2df..365a05c97a2c 100644
+--- a/mm/mlock.c
++++ b/mm/mlock.c
+@@ -307,11 +307,16 @@ void munlock_folio(struct folio *folio)
+ static inline unsigned int folio_mlock_step(struct folio *folio,
+ 		pte_t *pte, unsigned long addr, unsigned long end)
+ {
+-	unsigned int count = (end - addr) >> PAGE_SHIFT;
++	unsigned int count = (end - addr) >> MMUPAGE_SHIFT;
+ 	pte_t ptent = ptep_get(pte);
+ 
+-	if (!folio_test_large(folio))
++	if (!folio_test_large(folio)) {
++#if PAGE_MMUSHIFT
++		return pgcl_pte_batch(ptent, pte, count);
++#else
+ 		return 1;
++#endif
++	}
+ 
+ 	return folio_pte_batch(folio, pte, ptent, count);
+ }
+@@ -381,7 +386,7 @@ static int mlock_pte_range(pmd_t *pmd, unsigned long addr,
+ 		return 0;
+ 	}
+ 
+-	for (pte = start_pte; addr != end; pte++, addr += PAGE_SIZE) {
++	for (pte = start_pte; addr != end; pte++, addr += MMUPAGE_SIZE) {
+ 		ptent = ptep_get(pte);
+ 		if (!pte_present(ptent))
+ 			continue;
+@@ -400,7 +405,7 @@ static int mlock_pte_range(pmd_t *pmd, unsigned long addr,
+ 
+ next_entry:
+ 		pte += step - 1;
+-		addr += (step - 1) << PAGE_SHIFT;
++		addr += (step - 1) << MMUPAGE_SHIFT;
+ 	}
+ 	pte_unmap(start_pte);
+ out:
+@@ -492,7 +497,7 @@ static int mlock_fixup(struct vma_iterator *vmi, struct vm_area_struct *vma,
+ 	/*
+ 	 * Keep track of amount of locked VM.
+ 	 */
+-	nr_pages = (end - start) >> PAGE_SHIFT;
++	nr_pages = (end - start) >> MMUPAGE_SHIFT;
+ 	if (!vma_flags_test(&new_vma_flags, VMA_LOCKED_BIT))
+ 		nr_pages = -nr_pages;
+ 	else if (vma_flags_test(&old_vma_flags, VMA_LOCKED_BIT))
+@@ -524,8 +529,8 @@ static int apply_vma_lock_flags(unsigned long start, size_t len,
+ 	struct vm_area_struct *vma, *prev;
+ 	VMA_ITERATOR(vmi, current->mm, start);
+ 
+-	VM_BUG_ON(offset_in_page(start));
+-	VM_BUG_ON(len != PAGE_ALIGN(len));
++	VM_BUG_ON(start & ~MMUPAGE_MASK);
++	VM_BUG_ON(len != MMUPAGE_ALIGN(len));
+ 	end = start + len;
+ 	if (end < start)
+ 		return -EINVAL;
+@@ -600,7 +605,7 @@ static unsigned long count_mm_mlocked_page_nr(struct mm_struct *mm,
+ 		}
+ 	}
+ 
+-	return count >> PAGE_SHIFT;
++	return count >> MMUPAGE_SHIFT;
+ }
+ 
+ /*
+@@ -626,12 +631,12 @@ static __must_check int do_mlock(unsigned long start, size_t len, vm_flags_t fla
+ 	if (!can_do_mlock())
+ 		return -EPERM;
+ 
+-	len = PAGE_ALIGN(len + (offset_in_page(start)));
+-	start &= PAGE_MASK;
++	len = MMUPAGE_ALIGN(len + (start & ~MMUPAGE_MASK));
++	start &= MMUPAGE_MASK;
+ 
+ 	lock_limit = rlimit(RLIMIT_MEMLOCK);
+-	lock_limit >>= PAGE_SHIFT;
+-	locked = len >> PAGE_SHIFT;
++	lock_limit >>= MMUPAGE_SHIFT;
++	locked = len >> MMUPAGE_SHIFT;
+ 
+ 	if (mmap_write_lock_killable(current->mm))
+ 		return -EINTR;
+@@ -686,8 +691,8 @@ SYSCALL_DEFINE2(munlock, unsigned long, start, size_t, len)
+ 
+ 	start = untagged_addr(start);
+ 
+-	len = PAGE_ALIGN(len + (offset_in_page(start)));
+-	start &= PAGE_MASK;
++	len = MMUPAGE_ALIGN(len + (start & ~MMUPAGE_MASK));
++	start &= MMUPAGE_MASK;
+ 
+ 	if (mmap_write_lock_killable(current->mm))
+ 		return -EINTR;
+@@ -761,7 +766,7 @@ SYSCALL_DEFINE1(mlockall, int, flags)
+ 		return -EPERM;
+ 
+ 	lock_limit = rlimit(RLIMIT_MEMLOCK);
+-	lock_limit >>= PAGE_SHIFT;
++	lock_limit >>= MMUPAGE_SHIFT;
+ 
+ 	if (mmap_write_lock_killable(current->mm))
+ 		return -EINTR;
+@@ -800,10 +805,10 @@ int user_shm_lock(size_t size, struct ucounts *ucounts)
+ 	long memlock;
+ 	int allowed = 0;
+ 
+-	locked = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
++	locked = (size + MMUPAGE_SIZE - 1) >> MMUPAGE_SHIFT;
+ 	lock_limit = rlimit(RLIMIT_MEMLOCK);
+ 	if (lock_limit != RLIM_INFINITY)
+-		lock_limit >>= PAGE_SHIFT;
++		lock_limit >>= MMUPAGE_SHIFT;
+ 	spin_lock(&shmlock_user_lock);
+ 	memlock = inc_rlimit_ucounts(ucounts, UCOUNT_RLIMIT_MEMLOCK, locked);
+ 
+@@ -825,7 +830,7 @@ int user_shm_lock(size_t size, struct ucounts *ucounts)
+ void user_shm_unlock(size_t size, struct ucounts *ucounts)
+ {
+ 	spin_lock(&shmlock_user_lock);
+-	dec_rlimit_ucounts(ucounts, UCOUNT_RLIMIT_MEMLOCK, (size + PAGE_SIZE - 1) >> PAGE_SHIFT);
++	dec_rlimit_ucounts(ucounts, UCOUNT_RLIMIT_MEMLOCK, (size + MMUPAGE_SIZE - 1) >> MMUPAGE_SHIFT);
+ 	spin_unlock(&shmlock_user_lock);
+ 	put_ucounts(ucounts);
+ }
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 5754d1c36462..756ef0a93ebc 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -151,8 +151,8 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
+ 			      mm->end_data, mm->start_data))
+ 		goto out;
+ 
+-	newbrk = PAGE_ALIGN(brk);
+-	oldbrk = PAGE_ALIGN(mm->brk);
++	newbrk = MMUPAGE_ALIGN(brk);
++	oldbrk = MMUPAGE_ALIGN(mm->brk);
+ 	if (oldbrk == newbrk) {
+ 		mm->brk = brk;
+ 		goto success;
+@@ -186,8 +186,8 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
+ 	 * expansion area
+ 	 */
+ 	vma_iter_init(&vmi, mm, oldbrk);
+-	next = vma_find(&vmi, newbrk + PAGE_SIZE + stack_guard_gap);
+-	if (next && newbrk + PAGE_SIZE > vm_start_gap(next))
++	next = vma_find(&vmi, newbrk + MMUPAGE_SIZE + stack_guard_gap);
++	if (next && newbrk + MMUPAGE_SIZE > vm_start_gap(next))
+ 		goto out;
+ 
+ 	brkvma = vma_prev_limit(&vmi, mm->start_brk);
+@@ -220,10 +220,10 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
+  */
+ static inline unsigned long round_hint_to_min(unsigned long hint)
+ {
+-	hint &= PAGE_MASK;
++	hint &= MMUPAGE_MASK;
+ 	if (((void *)hint != NULL) &&
+ 	    (hint < mmap_min_addr))
+-		return PAGE_ALIGN(mmap_min_addr);
++		return MMUPAGE_ALIGN(mmap_min_addr);
+ 	return hint;
+ }
+ 
+@@ -235,11 +235,11 @@ bool mlock_future_ok(const struct mm_struct *mm, bool is_vma_locked,
+ 	if (!is_vma_locked || capable(CAP_IPC_LOCK))
+ 		return true;
+ 
+-	locked_pages = bytes >> PAGE_SHIFT;
++	locked_pages = bytes >> MMUPAGE_SHIFT;
+ 	locked_pages += mm->locked_vm;
+ 
+ 	limit_pages = rlimit(RLIMIT_MEMLOCK);
+-	limit_pages >>= PAGE_SHIFT;
++	limit_pages >>= MMUPAGE_SHIFT;
+ 
+ 	return locked_pages <= limit_pages;
+ }
+@@ -271,7 +271,7 @@ static inline bool file_mmap_ok(struct file *file, struct inode *inode,
+ 	if (maxsize && len > maxsize)
+ 		return false;
+ 	maxsize -= len;
+-	if (pgoff > maxsize >> PAGE_SHIFT)
++	if (pgoff > maxsize >> MMUPAGE_SHIFT)
+ 		return false;
+ 	return true;
+ }
+@@ -367,12 +367,12 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
+ 		addr = round_hint_to_min(addr);
+ 
+ 	/* Careful about overflows.. */
+-	len = PAGE_ALIGN(len);
++	len = ALIGN(len, MMUPAGE_SIZE);
+ 	if (!len)
+ 		return -ENOMEM;
+ 
+-	/* offset overflow? */
+-	if ((pgoff + (len >> PAGE_SHIFT)) < pgoff)
++	/* offset overflow? pgoff is in MMUPAGE units */
++	if ((pgoff + (len >> MMUPAGE_SHIFT)) < pgoff)
+ 		return -EOVERFLOW;
+ 
+ 	/* Too many mappings? */
+@@ -536,7 +536,7 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
+ 			/*
+ 			 * Set pgoff according to addr for anon_vma.
+ 			 */
+-			pgoff = addr >> PAGE_SHIFT;
++			pgoff = addr >> MMUPAGE_SHIFT;
+ 			break;
+ 		default:
+ 			return -EINVAL;
+@@ -633,11 +633,11 @@ SYSCALL_DEFINE1(old_mmap, struct mmap_arg_struct __user *, arg)
+ 
+ 	if (copy_from_user(&a, arg, sizeof(a)))
+ 		return -EFAULT;
+-	if (offset_in_page(a.offset))
++	if (a.offset & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 
+ 	return ksys_mmap_pgoff(a.addr, a.len, a.prot, a.flags, a.fd,
+-			       a.offset >> PAGE_SHIFT);
++			       a.offset >> MMUPAGE_SHIFT);
+ }
+ #endif /* __ARCH_WANT_SYS_OLD_MMAP */
+ 
+@@ -648,7 +648,7 @@ SYSCALL_DEFINE1(old_mmap, struct mmap_arg_struct __user *, arg)
+ static inline unsigned long stack_guard_placement(vm_flags_t vm_flags)
+ {
+ 	if (vm_flags & VM_SHADOW_STACK)
+-		return PAGE_SIZE;
++		return MMUPAGE_SIZE;
+ 
+ 	return 0;
+ }
+@@ -703,7 +703,7 @@ generic_get_unmapped_area(struct file *filp, unsigned long addr,
+ 		return addr;
+ 
+ 	if (addr) {
+-		addr = PAGE_ALIGN(addr);
++		addr = MMUPAGE_ALIGN(addr);
+ 		vma = find_vma_prev(mm, addr, &prev);
+ 		if (mmap_end - len >= addr && addr >= mmap_min_addr &&
+ 		    (!vma || addr + len <= vm_start_gap(vma)) &&
+@@ -754,7 +754,7 @@ generic_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
+ 
+ 	/* requesting a specific address */
+ 	if (addr) {
+-		addr = PAGE_ALIGN(addr);
++		addr = MMUPAGE_ALIGN(addr);
+ 		vma = find_vma_prev(mm, addr, &prev);
+ 		if (mmap_end - len >= addr && addr >= mmap_min_addr &&
+ 				(!vma || addr + len <= vm_start_gap(vma)) &&
+@@ -764,7 +764,7 @@ generic_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
+ 
+ 	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+ 	info.length = len;
+-	info.low_limit = PAGE_SIZE;
++	info.low_limit = MMUPAGE_SIZE;
+ 	info.high_limit = arch_get_mmap_base(addr, mm->mmap_base);
+ 	info.start_gap = stack_guard_placement(vm_flags);
+ 	if (filp && is_file_hugepages(filp))
+@@ -777,7 +777,7 @@ generic_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
+ 	 * can happen with large stack limits and large mmap()
+ 	 * allocations.
+ 	 */
+-	if (offset_in_page(addr)) {
++	if (addr & ~MMUPAGE_MASK) {
+ 		VM_BUG_ON(addr != -ENOMEM);
+ 		info.flags = 0;
+ 		info.low_limit = TASK_UNMAPPED_BASE;
+@@ -857,7 +857,7 @@ __get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
+ 
+ 	if (addr > TASK_SIZE - len)
+ 		return -ENOMEM;
+-	if (offset_in_page(addr))
++	if (addr & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 
+ 	error = security_mmap_addr(addr);
+@@ -937,7 +937,7 @@ find_vma_prev(struct mm_struct *mm, unsigned long addr,
+ }
+ 
+ /* enforced gap between the expanding stack and other mappings. */
+-unsigned long stack_guard_gap = 256UL<<PAGE_SHIFT;
++unsigned long stack_guard_gap = 256UL<<MMUPAGE_SHIFT;
+ 
+ static int __init cmdline_parse_stack_guard_gap(char *p)
+ {
+@@ -946,7 +946,7 @@ static int __init cmdline_parse_stack_guard_gap(char *p)
+ 
+ 	val = simple_strtoul(p, &endptr, 10);
+ 	if (!*endptr)
+-		stack_guard_gap = val << PAGE_SHIFT;
++		stack_guard_gap = val << MMUPAGE_SHIFT;
+ 
+ 	return 1;
+ }
+@@ -962,7 +962,7 @@ struct vm_area_struct *find_extend_vma_locked(struct mm_struct *mm, unsigned lon
+ {
+ 	struct vm_area_struct *vma, *prev;
+ 
+-	addr &= PAGE_MASK;
++	addr &= MMUPAGE_MASK;
+ 	vma = find_vma_prev(mm, addr, &prev);
+ 	if (vma && (vma->vm_start <= addr))
+ 		return vma;
+@@ -985,7 +985,7 @@ struct vm_area_struct *find_extend_vma_locked(struct mm_struct *mm, unsigned lon
+ 	struct vm_area_struct *vma;
+ 	unsigned long start;
+ 
+-	addr &= PAGE_MASK;
++	addr &= MMUPAGE_MASK;
+ 	vma = find_vma(mm, addr);
+ 	if (!vma)
+ 		return NULL;
+@@ -1099,14 +1099,14 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
+ 
+ 	if (prot)
+ 		return ret;
+-	start = start & PAGE_MASK;
+-	size = size & PAGE_MASK;
++	start = start & MMUPAGE_MASK;
++	size = size & MMUPAGE_MASK;
+ 
+ 	if (start + size <= start)
+ 		return ret;
+ 
+ 	/* Does pgoff wrap? */
+-	if (pgoff + (size >> PAGE_SHIFT) < pgoff)
++	if (pgoff + (size >> MMUPAGE_SHIFT) < pgoff)
+ 		return ret;
+ 
+ 	if (mmap_read_lock_killable(mm))
+@@ -1214,7 +1214,7 @@ int vm_brk_flags(unsigned long addr, unsigned long request, bool is_exec)
+ 	LIST_HEAD(uf);
+ 	VMA_ITERATOR(vmi, mm, addr);
+ 
+-	len = PAGE_ALIGN(request);
++	len = ALIGN(request, MMUPAGE_SIZE);
+ 	if (len < request)
+ 		return -ENOMEM;
+ 	if (!len)
+@@ -1333,19 +1333,19 @@ void exit_mmap(struct mm_struct *mm)
+ bool may_expand_vm(struct mm_struct *mm, const vma_flags_t *vma_flags,
+ 		   unsigned long npages)
+ {
+-	if (mm->total_vm + npages > rlimit(RLIMIT_AS) >> PAGE_SHIFT)
++	if (mm->total_vm + npages > rlimit(RLIMIT_AS) >> MMUPAGE_SHIFT)
+ 		return false;
+ 
+ 	if (is_data_mapping_vma_flags(vma_flags) &&
+-	    mm->data_vm + npages > rlimit(RLIMIT_DATA) >> PAGE_SHIFT) {
++	    mm->data_vm + npages > rlimit(RLIMIT_DATA) >> MMUPAGE_SHIFT) {
+ 		/* Workaround for Valgrind */
+ 		if (rlimit(RLIMIT_DATA) == 0 &&
+-		    mm->data_vm + npages <= rlimit_max(RLIMIT_DATA) >> PAGE_SHIFT)
++		    mm->data_vm + npages <= rlimit_max(RLIMIT_DATA) >> MMUPAGE_SHIFT)
+ 			return true;
+ 
+ 		pr_warn_once("%s (%d): VmData %lu exceed data ulimit %lu. Update limits%s.\n",
+ 			     current->comm, current->pid,
+-			     (mm->data_vm + npages) << PAGE_SHIFT,
++			     (mm->data_vm + npages) << MMUPAGE_SHIFT,
+ 			     rlimit(RLIMIT_DATA),
+ 			     ignore_rlimit_data ? "" : " or use boot option ignore_rlimit_data");
+ 
+@@ -1474,7 +1474,7 @@ static struct vm_area_struct *__install_special_mapping(
+ 	if (ret)
+ 		goto out;
+ 
+-	vm_stat_account(mm, vma->vm_flags, len >> PAGE_SHIFT);
++	vm_stat_account(mm, vma->vm_flags, len >> MMUPAGE_SHIFT);
+ 
+ 	perf_event_mmap(vma);
+ 
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 9cbf932b028c..ae1b2e283e5b 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -110,10 +110,15 @@ static int mprotect_folio_pte_batch(struct folio *folio, pte_t *ptep,
+ 	if (!folio)
+ 		return 1;
+ 
+-	if (!folio_test_large(folio))
++	if (!folio_test_large(folio)) {
++#if PAGE_MMUSHIFT
++		return pgcl_pte_batch(pte, ptep, max_nr_ptes);
++#else
+ 		return 1;
++#endif
++	}
+ 
+-	return folio_pte_batch_flags(folio, NULL, ptep, &pte, max_nr_ptes, flags);
++	return folio_pte_batch_flags(folio, NULL, ptep, &pte, max_nr_ptes, flags).nr;
+ }
+ 
+ /* Set nr_ptes number of ptes, starting from idx */
+@@ -125,17 +130,23 @@ static __always_inline void prot_commit_flush_ptes(struct vm_area_struct *vma,
+ 	 * Advance the position in the batch by idx; note that if idx > 0,
+ 	 * then the nr_ptes passed here is <= batch size - idx.
+ 	 */
+-	addr += idx * PAGE_SIZE;
++	addr += idx * MMUPAGE_SIZE;
+ 	ptep += idx;
++#if PAGE_MMUSHIFT
++	/* pte_advance_pfn advances by PAGE_SIZE per unit; sub-pages are MMUPAGE apart */
++	oldpte = __pte(pte_val(oldpte) + __phys_to_pte_val((phys_addr_t)idx * MMUPAGE_SIZE));
++	ptent = __pte(pte_val(ptent) + __phys_to_pte_val((phys_addr_t)idx * MMUPAGE_SIZE));
++#else
+ 	oldpte = pte_advance_pfn(oldpte, idx);
+ 	ptent = pte_advance_pfn(ptent, idx);
++#endif
+ 
+ 	if (set_write)
+ 		ptent = pte_mkwrite(ptent, vma);
+ 
+ 	modify_prot_commit_ptes(vma, addr, ptep, oldpte, ptent, nr_ptes);
+ 	if (pte_needs_flush(oldpte, ptent))
+-		tlb_flush_pte_range(tlb, addr, nr_ptes * PAGE_SIZE);
++		tlb_flush_pte_range(tlb, addr, nr_ptes * MMUPAGE_SIZE);
+ }
+ 
+ /*
+@@ -208,6 +219,19 @@ static __always_inline void set_write_prot_commit_flush_ptes(struct vm_area_stru
+ 				       /* idx = */ 0, set_write, tlb);
+ 		return;
+ 	}
++	/*
++	 * With PGCL, pgcl_pte_batch batches sub-pages within the same kernel
++	 * page.  All sub-pages share ONE struct page, so page[idx] for idx>0
++	 * is NOT a sub-page — it's a different kernel page entirely.
++	 * Skip per-page sub-batching for non-large folios; they all share
++	 * the same PageAnonExclusive status.
++	 */
++	if (folio && !folio_test_large(folio)) {
++		prot_commit_flush_ptes(vma, addr, ptep, oldpte, ptent, nr_ptes,
++				       /* idx = */ 0,
++				       PageAnonExclusive(page), tlb);
++		return;
++	}
+ 	commit_anon_folio_batch(vma, folio, page, addr, ptep, oldpte, ptent, nr_ptes, tlb);
+ }
+ 
+@@ -328,7 +352,7 @@ static long change_pte_range(struct mmu_gather *tlb,
+ 	bool uffd_wp = cp_flags & MM_CP_UFFD_WP;
+ 	int nr_ptes;
+ 
+-	tlb_change_page_size(tlb, PAGE_SIZE);
++	tlb_change_page_size(tlb, MMUPAGE_SIZE);
+ 	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+ 	if (!pte)
+ 		return -EAGAIN;
+@@ -343,7 +367,7 @@ static long change_pte_range(struct mmu_gather *tlb,
+ 		oldpte = ptep_get(pte);
+ 		if (pte_present(oldpte)) {
+ 			const fpb_t flags = FPB_RESPECT_SOFT_DIRTY | FPB_RESPECT_WRITE;
+-			int max_nr_ptes = (end - addr) >> PAGE_SHIFT;
++			int max_nr_ptes = (end - addr) >> MMUPAGE_SHIFT;
+ 			struct folio *folio = NULL;
+ 			struct page *page;
+ 
+@@ -408,7 +432,7 @@ static long change_pte_range(struct mmu_gather *tlb,
+ 		} else  {
+ 			pages += change_softleaf_pte(vma, addr, pte, oldpte, cp_flags);
+ 		}
+-	} while (pte += nr_ptes, addr += nr_ptes * PAGE_SIZE, addr != end);
++	} while (pte += nr_ptes, addr += nr_ptes * MMUPAGE_SIZE, addr != end);
+ 	lazy_mmu_mode_disable();
+ 	pte_unmap_unlock(pte - 1, ptl);
+ 
+@@ -729,7 +753,7 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	const vma_flags_t old_vma_flags = READ_ONCE(vma->flags);
+ 	vma_flags_t new_vma_flags = legacy_to_vma_flags(newflags);
+-	long nrpages = (end - start) >> PAGE_SHIFT;
++	long nrpages = (end - start) >> MMUPAGE_SHIFT;
+ 	unsigned int mm_cp_flags = 0;
+ 	unsigned long charged = 0;
+ 	int error;
+@@ -851,11 +875,11 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
+ 	if (grows == (PROT_GROWSDOWN|PROT_GROWSUP)) /* can't be both */
+ 		return -EINVAL;
+ 
+-	if (start & ~PAGE_MASK)
++	if (start & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 	if (!len)
+ 		return 0;
+-	len = PAGE_ALIGN(len);
++	len = MMUPAGE_ALIGN(len);
+ 	end = start + len;
+ 	if (end <= start)
+ 		return -ENOMEM;
+diff --git a/mm/mremap.c b/mm/mremap.c
+index e9c8b1d05832..31bf28717331 100644
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -188,10 +188,16 @@ static int mremap_folio_pte_batch(struct vm_area_struct *vma, unsigned long addr
+ 		return 1;
+ 
+ 	folio = vm_normal_folio(vma, addr, pte);
+-	if (!folio || !folio_test_large(folio))
++	if (!folio)
++		return 1;
++#if PAGE_MMUSHIFT
++	if (!folio_test_large(folio))
++		return pgcl_pte_batch(pte, ptep, max_nr);
++#endif
++	if (!folio_test_large(folio))
+ 		return 1;
+ 
+-	return folio_pte_batch_flags(folio, NULL, ptep, &pte, max_nr, FPB_RESPECT_WRITE);
++	return folio_pte_batch_flags(folio, NULL, ptep, &pte, max_nr, FPB_RESPECT_WRITE).nr;
+ }
+ 
+ static int move_ptes(struct pagetable_move_control *pmc,
+@@ -262,12 +268,12 @@ static int move_ptes(struct pagetable_move_control *pmc,
+ 	flush_tlb_batched_pending(vma->vm_mm);
+ 	lazy_mmu_mode_enable();
+ 
+-	for (; old_addr < old_end; old_ptep += nr_ptes, old_addr += nr_ptes * PAGE_SIZE,
+-		new_ptep += nr_ptes, new_addr += nr_ptes * PAGE_SIZE) {
++	for (; old_addr < old_end; old_ptep += nr_ptes, old_addr += nr_ptes * MMUPAGE_SIZE,
++		new_ptep += nr_ptes, new_addr += nr_ptes * MMUPAGE_SIZE) {
+ 		VM_WARN_ON_ONCE(!pte_none(*new_ptep));
+ 
+ 		nr_ptes = 1;
+-		max_nr_ptes = (old_end - old_addr) >> PAGE_SHIFT;
++		max_nr_ptes = (old_end - old_addr) >> MMUPAGE_SHIFT;
+ 		old_pte = ptep_get(old_ptep);
+ 		if (pte_none(old_pte))
+ 			continue;
+@@ -301,6 +307,23 @@ static int move_ptes(struct pagetable_move_control *pmc,
+ 				else
+ 					pte = pte_swp_clear_uffd_wp(pte);
+ 			}
++#if PAGE_MMUSHIFT
++			/*
++			 * With PGCL, pgcl_pte_batch returns an MMUPAGE
++			 * count of contiguous sub-page PTEs within the
++			 * same kernel page. Write individual PTEs with
++			 * sub-page offset increments.
++			 */
++			if (nr_ptes > 1) {
++				int j;
++
++				for (j = 0; j < nr_ptes; j++) {
++					set_ptes(mm, new_addr + (unsigned long)j * MMUPAGE_SIZE, new_ptep + j, pte, 1);
++					pte = __pte(pte_val(pte) +
++						    __phys_to_pte_val(MMUPAGE_SIZE));
++				}
++			} else
++#endif
+ 			set_ptes(mm, new_addr, new_ptep, pte, nr_ptes);
+ 		}
+ 	}
+@@ -948,7 +971,7 @@ static unsigned long vrm_set_new_addr(struct vma_remap_struct *vrm)
+ 	struct vm_area_struct *vma = vrm->vma;
+ 	unsigned long map_flags = 0;
+ 	/* Page Offset _into_ the VMA. */
+-	pgoff_t internal_pgoff = (vrm->addr - vma->vm_start) >> PAGE_SHIFT;
++	pgoff_t internal_pgoff = (vrm->addr - vma->vm_start) >> MMUPAGE_SHIFT;
+ 	pgoff_t pgoff = vma->vm_pgoff + internal_pgoff;
+ 	unsigned long new_addr = vrm_implies_new_addr(vrm) ? vrm->new_addr : 0;
+ 	unsigned long res;
+@@ -985,9 +1008,9 @@ static bool vrm_calc_charge(struct vma_remap_struct *vrm)
+ 	 * the length of the new one. Otherwise it's just the delta in size.
+ 	 */
+ 	if (vrm->flags & MREMAP_DONTUNMAP)
+-		charged = vrm->new_len >> PAGE_SHIFT;
++		charged = vrm->new_len >> MMUPAGE_SHIFT;
+ 	else
+-		charged = vrm->delta >> PAGE_SHIFT;
++		charged = vrm->delta >> MMUPAGE_SHIFT;
+ 
+ 
+ 	/* This accounts 'charged' pages of memory. */
+@@ -1019,7 +1042,7 @@ static void vrm_uncharge(struct vma_remap_struct *vrm)
+ static void vrm_stat_account(struct vma_remap_struct *vrm,
+ 			     unsigned long bytes)
+ {
+-	unsigned long pages = bytes >> PAGE_SHIFT;
++	unsigned long pages = bytes >> MMUPAGE_SHIFT;
+ 	struct mm_struct *mm = current->mm;
+ 	struct vm_area_struct *vma = vrm->vma;
+ 
+@@ -1198,7 +1221,7 @@ static void unmap_source_vma(struct vma_remap_struct *vrm)
+ 	vrm->vmi_needs_invalidate = true;
+ 	if (err) {
+ 		/* OOM: unable to split vma, just get accounts right */
+-		vm_acct_memory(len >> PAGE_SHIFT);
++		vm_acct_memory(len >> MMUPAGE_SHIFT);
+ 		return;
+ 	}
+ 
+@@ -1256,7 +1279,7 @@ static int copy_vma_and_data(struct vma_remap_struct *vrm,
+ 			     struct vm_area_struct **new_vma_ptr)
+ {
+ 	unsigned long internal_offset = vrm->addr - vrm->vma->vm_start;
+-	unsigned long internal_pgoff = internal_offset >> PAGE_SHIFT;
++	unsigned long internal_pgoff = internal_offset >> MMUPAGE_SHIFT;
+ 	unsigned long new_pgoff = vrm->vma->vm_pgoff + internal_pgoff;
+ 	unsigned long moved_len;
+ 	struct vm_area_struct *vma = vrm->vma;
+@@ -1473,7 +1496,7 @@ static unsigned long mremap_to(struct vma_remap_struct *vrm)
+ 	/* MREMAP_DONTUNMAP expands by old_len since old_len == new_len */
+ 	if (vrm->flags & MREMAP_DONTUNMAP) {
+ 		vma_flags_t vma_flags = vrm->vma->flags;
+-		unsigned long pages = vrm->old_len >> PAGE_SHIFT;
++		unsigned long pages = vrm->old_len >> MMUPAGE_SHIFT;
+ 
+ 		if (!may_expand_vm(mm, &vma_flags, pages))
+ 			return -ENOMEM;
+@@ -1495,7 +1518,7 @@ static int vma_expandable(struct vm_area_struct *vma, unsigned long delta)
+ 	if (find_vma_intersection(vma->vm_mm, vma->vm_end, end))
+ 		return 0;
+ 	if (get_unmapped_area(NULL, vma->vm_start, end - vma->vm_start,
+-			      0, MAP_FIXED) & ~PAGE_MASK)
++			      0, MAP_FIXED) & ~MMUPAGE_MASK)
+ 		return 0;
+ 	return 1;
+ }
+@@ -1802,9 +1825,9 @@ static int check_prep_vma(struct vma_remap_struct *vrm)
+ 		vrm->populate_expand = true;
+ 
+ 	/* Need to be careful about a growing mapping */
+-	pgoff = (addr - vma->vm_start) >> PAGE_SHIFT;
++	pgoff = (addr - vma->vm_start) >> MMUPAGE_SHIFT;
+ 	pgoff += vma->vm_pgoff;
+-	if (pgoff + (new_len >> PAGE_SHIFT) < pgoff)
++	if (pgoff + (new_len >> MMUPAGE_SHIFT) < pgoff)
+ 		return -EINVAL;
+ 
+ 	if (vma->vm_flags & (VM_DONTEXPAND | VM_PFNMAP))
+@@ -1813,7 +1836,7 @@ static int check_prep_vma(struct vma_remap_struct *vrm)
+ 	if (!mlock_future_ok(mm, vma->vm_flags & VM_LOCKED, vrm->delta))
+ 		return -EAGAIN;
+ 
+-	if (!may_expand_vm(mm, &vma->flags, vrm->delta >> PAGE_SHIFT))
++	if (!may_expand_vm(mm, &vma->flags, vrm->delta >> MMUPAGE_SHIFT))
+ 		return -ENOMEM;
+ 
+ 	return 0;
+@@ -1833,8 +1856,8 @@ static unsigned long check_mremap_params(struct vma_remap_struct *vrm)
+ 	if (flags & ~(MREMAP_FIXED | MREMAP_MAYMOVE | MREMAP_DONTUNMAP))
+ 		return -EINVAL;
+ 
+-	/* Start address must be page-aligned. */
+-	if (offset_in_page(addr))
++	/* Start address must be page-aligned (MMUPAGE for PGCL). */
++	if (addr & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 
+ 	/*
+@@ -1857,8 +1880,8 @@ static unsigned long check_mremap_params(struct vma_remap_struct *vrm)
+ 	if (vrm->new_addr > TASK_SIZE - vrm->new_len)
+ 		return -EINVAL;
+ 
+-	/* The new address must be page-aligned. */
+-	if (offset_in_page(vrm->new_addr))
++	/* The new address must be page-aligned (MMUPAGE for PGCL). */
++	if (vrm->new_addr & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 
+ 	/* A fixed address implies a move. */
+@@ -1971,8 +1994,8 @@ static unsigned long do_mremap(struct vma_remap_struct *vrm)
+ 	unsigned long res;
+ 	bool failed;
+ 
+-	vrm->old_len = PAGE_ALIGN(vrm->old_len);
+-	vrm->new_len = PAGE_ALIGN(vrm->new_len);
++	vrm->old_len = MMUPAGE_ALIGN(vrm->old_len);
++	vrm->new_len = MMUPAGE_ALIGN(vrm->new_len);
+ 
+ 	res = check_mremap_params(vrm);
+ 	if (res)
+diff --git a/mm/msync.c b/mm/msync.c
+index ac4c9bfea2e7..82012c6b9ff5 100644
+--- a/mm/msync.c
++++ b/mm/msync.c
+@@ -41,12 +41,12 @@ SYSCALL_DEFINE3(msync, unsigned long, start, size_t, len, int, flags)
+ 
+ 	if (flags & ~(MS_ASYNC | MS_INVALIDATE | MS_SYNC))
+ 		goto out;
+-	if (offset_in_page(start))
++	if (start & ~MMUPAGE_MASK)
+ 		goto out;
+ 	if ((flags & MS_ASYNC) && (flags & MS_SYNC))
+ 		goto out;
+ 	error = -ENOMEM;
+-	len = (len + ~PAGE_MASK) & PAGE_MASK;
++	len = (len + ~MMUPAGE_MASK) & MMUPAGE_MASK;
+ 	end = start + len;
+ 	if (end < start)
+ 		goto out;
+@@ -86,7 +86,7 @@ SYSCALL_DEFINE3(msync, unsigned long, start, size_t, len, int, flags)
+ 		}
+ 		file = vma->vm_file;
+ 		fstart = (start - vma->vm_start) +
+-			 ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
++			 ((loff_t)vma->vm_pgoff << MMUPAGE_SHIFT);
+ 		fend = fstart + (min(end, vma->vm_end) - start) - 1;
+ 		start = vma->vm_end;
+ 		if ((flags & MS_SYNC) && file &&
+diff --git a/mm/util.c b/mm/util.c
+index 3cc949a0b7ed..d03ed9e1b539 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -348,9 +348,9 @@ unsigned long randomize_stack_top(unsigned long stack_top)
+ 		random_variable <<= PAGE_SHIFT;
+ 	}
+ #ifdef CONFIG_STACK_GROWSUP
+-	return PAGE_ALIGN(stack_top) + random_variable;
++	return MMUPAGE_ALIGN(stack_top) + random_variable;
+ #else
+-	return PAGE_ALIGN(stack_top) - random_variable;
++	return MMUPAGE_ALIGN(stack_top) - random_variable;
+ #endif
+ }
+ 
+@@ -370,20 +370,20 @@ unsigned long randomize_stack_top(unsigned long stack_top)
+  */
+ unsigned long randomize_page(unsigned long start, unsigned long range)
+ {
+-	if (!PAGE_ALIGNED(start)) {
+-		range -= PAGE_ALIGN(start) - start;
+-		start = PAGE_ALIGN(start);
++	if (!IS_ALIGNED(start, MMUPAGE_SIZE)) {
++		range -= ALIGN(start, MMUPAGE_SIZE) - start;
++		start = ALIGN(start, MMUPAGE_SIZE);
+ 	}
+ 
+ 	if (start > ULONG_MAX - range)
+ 		range = ULONG_MAX - start;
+ 
+-	range >>= PAGE_SHIFT;
++	range >>= MMUPAGE_SHIFT;
+ 
+ 	if (range == 0)
+ 		return start;
+ 
+-	return start + (get_random_long() % range << PAGE_SHIFT);
++	return start + (get_random_long() % range << MMUPAGE_SHIFT);
+ }
+ 
+ #ifdef CONFIG_ARCH_WANT_DEFAULT_TOPDOWN_MMAP_LAYOUT
+@@ -407,7 +407,7 @@ unsigned long arch_mmap_rnd(void)
+ #endif /* CONFIG_HAVE_ARCH_MMAP_RND_COMPAT_BITS */
+ 		rnd = get_random_long() & ((1UL << mmap_rnd_bits) - 1);
+ 
+-	return rnd << PAGE_SHIFT;
++	return rnd << MMUPAGE_SHIFT;
+ }
+ 
+ static int mmap_is_legacy(const struct rlimit *rlim_stack)
+@@ -566,7 +566,7 @@ unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
+ 	unsigned long len, unsigned long prot,
+ 	unsigned long flag, unsigned long pgoff)
+ {
+-	loff_t off = (loff_t)pgoff << PAGE_SHIFT;
++	loff_t off = (loff_t)pgoff << MMUPAGE_SHIFT;
+ 	unsigned long ret;
+ 	struct mm_struct *mm = current->mm;
+ 	unsigned long populate;
+@@ -609,12 +609,12 @@ unsigned long vm_mmap(struct file *file, unsigned long addr,
+ 	unsigned long len, unsigned long prot,
+ 	unsigned long flag, unsigned long offset)
+ {
+-	if (unlikely(offset + PAGE_ALIGN(len) < offset))
++	if (unlikely(offset + MMUPAGE_ALIGN(len) < offset))
+ 		return -EINVAL;
+-	if (unlikely(offset_in_page(offset)))
++	if (unlikely(offset & ~MMUPAGE_MASK))
+ 		return -EINVAL;
+ 
+-	return vm_mmap_pgoff(file, addr, len, prot, flag, offset >> PAGE_SHIFT);
++	return vm_mmap_pgoff(file, addr, len, prot, flag, offset >> MMUPAGE_SHIFT);
+ }
+ EXPORT_SYMBOL(vm_mmap);
+ 
+@@ -906,11 +906,17 @@ unsigned long vm_commit_limit(void)
+ 	unsigned long allowed;
+ 
+ 	if (sysctl_overcommit_kbytes)
+-		allowed = sysctl_overcommit_kbytes >> (PAGE_SHIFT - 10);
++		allowed = sysctl_overcommit_kbytes >> (MMUPAGE_SHIFT - 10);
+ 	else
+-		allowed = ((totalram_pages() - hugetlb_total_pages())
++		allowed = (((totalram_pages() - hugetlb_total_pages())
++			    << PAGE_MMUSHIFT)
+ 			   * sysctl_overcommit_ratio / 100);
+-	allowed += total_swap_pages;
++	/*
++	 * total_swap_pages counts swap slots, which are PAGE (cluster) sized;
++	 * the rest of this limit is in MMUPAGE units, so scale swap up too.
++	 * Identity at PAGE_MMUSHIFT == 0.
++	 */
++	allowed += total_swap_pages << PAGE_MMUSHIFT;
+ 
+ 	return allowed;
+ }
+@@ -970,7 +976,8 @@ int __vm_enough_memory(const struct mm_struct *mm, long pages, int cap_sys_admin
+ 		return 0;
+ 
+ 	if (sysctl_overcommit_memory == OVERCOMMIT_GUESS) {
+-		if (pages > totalram_pages() + total_swap_pages)
++		if (pages > (totalram_pages() << PAGE_MMUSHIFT) +
++			    (total_swap_pages << PAGE_MMUSHIFT))
+ 			goto error;
+ 		return 0;
+ 	}
+@@ -980,13 +987,13 @@ int __vm_enough_memory(const struct mm_struct *mm, long pages, int cap_sys_admin
+ 	 * Reserve some for root
+ 	 */
+ 	if (!cap_sys_admin)
+-		allowed -= sysctl_admin_reserve_kbytes >> (PAGE_SHIFT - 10);
++		allowed -= sysctl_admin_reserve_kbytes >> (MMUPAGE_SHIFT - 10);
+ 
+ 	/*
+ 	 * Don't let a single process grow so big a user can't recover
+ 	 */
+ 	if (mm) {
+-		long reserve = sysctl_user_reserve_kbytes >> (PAGE_SHIFT - 10);
++		long reserve = sysctl_user_reserve_kbytes >> (MMUPAGE_SHIFT - 10);
+ 
+ 		allowed -= min_t(long, mm->total_vm / 32, reserve);
+ 	}
+@@ -994,7 +1001,7 @@ int __vm_enough_memory(const struct mm_struct *mm, long pages, int cap_sys_admin
+ 	if (percpu_counter_read_positive(&vm_committed_as) < allowed)
+ 		return 0;
+ error:
+-	bytes_failed = pages << PAGE_SHIFT;
++	bytes_failed = pages << MMUPAGE_SHIFT;
+ 	pr_warn_ratelimited("%s: pid: %d, comm: %s, bytes: %lu not enough memory for the allocation\n",
+ 			    __func__, current->pid, current->comm, bytes_failed);
+ 	vm_unacct_memory(pages);
+@@ -1555,7 +1562,7 @@ EXPORT_SYMBOL(mmap_action_complete);
+ unsigned int folio_pte_batch(struct folio *folio, pte_t *ptep, pte_t pte,
+ 		unsigned int max_nr)
+ {
+-	return folio_pte_batch_flags(folio, NULL, ptep, &pte, max_nr, 0);
++	return folio_pte_batch_flags(folio, NULL, ptep, &pte, max_nr, 0).nr;
+ }
+ #endif /* CONFIG_MMU */
+ 
+diff --git a/mm/vma.c b/mm/vma.c
+index d90791b00a7b..b946ac8bbe72 100644
+--- a/mm/vma.c
++++ b/mm/vma.c
+@@ -49,7 +49,7 @@ struct mmap_state {
+ 		.addr = addr_,						\
+ 		.end = (addr_) + (len_),				\
+ 		.pgoff = pgoff_,					\
+-		.pglen = PHYS_PFN(len_),				\
++		.pglen = (len_) >> MMUPAGE_SHIFT,			\
+ 		.vma_flags = vma_flags_,				\
+ 		.file = file_,						\
+ 		.page_prot = vma_get_page_prot(vma_flags_),		\
+@@ -197,7 +197,7 @@ static void init_multi_vma_prep(struct vma_prepare *vp,
+  */
+ static bool can_vma_merge_before(struct vma_merge_struct *vmg)
+ {
+-	pgoff_t pglen = PHYS_PFN(vmg->end - vmg->start);
++	pgoff_t pglen = (vmg->end - vmg->start) >> MMUPAGE_SHIFT;
+ 
+ 	if (is_mergeable_vma(vmg, /* merge_next = */ true) &&
+ 	    is_mergeable_anon_vma(vmg, /* merge_next = */ true)) {
+@@ -521,7 +521,7 @@ __split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
+ 		new->vm_end = addr;
+ 	} else {
+ 		new->vm_start = addr;
+-		new->vm_pgoff += ((addr - vma->vm_start) >> PAGE_SHIFT);
++		new->vm_pgoff += ((addr - vma->vm_start) >> MMUPAGE_SHIFT);
+ 	}
+ 
+ 	err = -ENOMEM;
+@@ -560,7 +560,7 @@ __split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
+ 
+ 	if (new_below) {
+ 		vma->vm_start = addr;
+-		vma->vm_pgoff += (addr - new->vm_start) >> PAGE_SHIFT;
++		vma->vm_pgoff += (addr - new->vm_start) >> MMUPAGE_SHIFT;
+ 	} else {
+ 		vma->vm_end = addr;
+ 	}
+@@ -709,10 +709,10 @@ static void vmg_adjust_set_range(struct vma_merge_struct *vmg)
+ 
+ 	if (vmg->__adjust_middle_start) {
+ 		adjust = vmg->middle;
+-		pgoff = adjust->vm_pgoff + PHYS_PFN(vmg->end - adjust->vm_start);
++		pgoff = adjust->vm_pgoff + ((vmg->end - adjust->vm_start) >> MMUPAGE_SHIFT);
+ 	} else if (vmg->__adjust_next_start) {
+ 		adjust = vmg->next;
+-		pgoff = adjust->vm_pgoff - PHYS_PFN(adjust->vm_start - vmg->end);
++		pgoff = adjust->vm_pgoff - ((adjust->vm_start - vmg->end) >> MMUPAGE_SHIFT);
+ 	} else {
+ 		return;
+ 	}
+@@ -965,7 +965,7 @@ static __must_check struct vm_area_struct *vma_merge_existing_range(
+ 		 * shrink/delete extend
+ 		 */
+ 
+-		pgoff_t pglen = PHYS_PFN(vmg->end - vmg->start);
++		pgoff_t pglen = (vmg->end - vmg->start) >> MMUPAGE_SHIFT;
+ 
+ 		VM_WARN_ON_VMG(!merge_right, vmg);
+ 		/* If we are offset into a VMA, then prev must be middle. */
+@@ -1634,10 +1634,10 @@ int do_vmi_munmap(struct vma_iterator *vmi, struct mm_struct *mm,
+ 	unsigned long end;
+ 	struct vm_area_struct *vma;
+ 
+-	if ((offset_in_page(start)) || start > TASK_SIZE || len > TASK_SIZE-start)
++	if ((start & ~MMUPAGE_MASK) || start > TASK_SIZE || len > TASK_SIZE-start)
+ 		return -EINVAL;
+ 
+-	end = start + PAGE_ALIGN(len);
++	end = start + ALIGN(len, MMUPAGE_SIZE);
+ 	if (end == start)
+ 		return -EINVAL;
+ 
+@@ -1878,7 +1878,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
+ 	 * to match new location, to increase its chance of merging.
+ 	 */
+ 	if (unlikely(vma_is_anonymous(vma) && !vma->anon_vma)) {
+-		pgoff = addr >> PAGE_SHIFT;
++		pgoff = addr >> MMUPAGE_SHIFT;
+ 		faulted_in_anon_vma = false;
+ 	}
+ 
+@@ -1979,7 +1979,7 @@ static int anon_vma_compatible(struct vm_area_struct *a, struct vm_area_struct *
+ 		mpol_equal(vma_policy(a), vma_policy(b)) &&
+ 		a->vm_file == b->vm_file &&
+ 		vma_flags_empty(&diff) &&
+-		b->vm_pgoff == a->vm_pgoff + ((b->vm_start - a->vm_start) >> PAGE_SHIFT);
++		b->vm_pgoff == a->vm_pgoff + ((b->vm_start - a->vm_start) >> MMUPAGE_SHIFT);
+ }
+ 
+ /*
+@@ -2892,13 +2892,13 @@ int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
+ 	vma_flags_set_mask(&vma_flags, mm->def_vma_flags);
+ 
+ 	vma_flags = ksm_vma_flags(mm, NULL, vma_flags);
+-	if (!may_expand_vm(mm, &vma_flags, len >> PAGE_SHIFT))
++	if (!may_expand_vm(mm, &vma_flags, len >> MMUPAGE_SHIFT))
+ 		return -ENOMEM;
+ 
+ 	if (mm->map_count > get_sysctl_max_map_count())
+ 		return -ENOMEM;
+ 
+-	if (security_vm_enough_memory_mm(mm, len >> PAGE_SHIFT))
++	if (security_vm_enough_memory_mm(mm, len >> MMUPAGE_SHIFT))
+ 		return -ENOMEM;
+ 
+ 	/*
+@@ -2906,7 +2906,7 @@ int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
+ 	 * occur after forking, so the expand will only happen on new VMAs.
+ 	 */
+ 	if (vma && vma->vm_end == addr) {
+-		VMG_STATE(vmg, mm, vmi, addr, addr + len, vma_flags, PHYS_PFN(addr));
++		VMG_STATE(vmg, mm, vmi, addr, addr + len, vma_flags, addr >> MMUPAGE_SHIFT);
+ 
+ 		vmg.prev = vma;
+ 		/* vmi is positioned at prev, which this mode expects. */
+@@ -2926,7 +2926,7 @@ int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
+ 		goto unacct_fail;
+ 
+ 	vma_set_anonymous(vma);
+-	vma_set_range(vma, addr, addr + len, addr >> PAGE_SHIFT);
++	vma_set_range(vma, addr, addr + len, addr >> MMUPAGE_SHIFT);
+ 	vma->flags = vma_flags;
+ 	vma->vm_page_prot = vm_get_page_prot(vma_flags_to_legacy(vma_flags));
+ 	vma_start_write(vma);
+@@ -2937,10 +2937,10 @@ int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
+ 	validate_mm(mm);
+ out:
+ 	perf_event_mmap(vma);
+-	mm->total_vm += len >> PAGE_SHIFT;
+-	mm->data_vm += len >> PAGE_SHIFT;
++	mm->total_vm += len >> MMUPAGE_SHIFT;
++	mm->data_vm += len >> MMUPAGE_SHIFT;
+ 	if (vma_flags_test(&vma_flags, VMA_LOCKED_BIT))
+-		mm->locked_vm += (len >> PAGE_SHIFT);
++		mm->locked_vm += (len >> MMUPAGE_SHIFT);
+ 	if (pgtable_supports_soft_dirty())
+ 		vma_set_flags(vma, VMA_SOFTDIRTY_BIT);
+ 	return 0;
+@@ -2948,7 +2948,7 @@ int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
+ mas_store_fail:
+ 	vm_area_free(vma);
+ unacct_fail:
+-	vm_unacct_memory(len >> PAGE_SHIFT);
++	vm_unacct_memory(len >> MMUPAGE_SHIFT);
+ 	return -ENOMEM;
+ }
+ 
+@@ -3084,7 +3084,7 @@ static int acct_stack_growth(struct vm_area_struct *vma,
+ 
+ 	/* mlock limit tests */
+ 	if (!mlock_future_ok(mm, vma_test(vma, VMA_LOCKED_BIT),
+-			     grow << PAGE_SHIFT))
++			     grow << MMUPAGE_SHIFT))
+ 		return -ENOMEM;
+ 
+ 	/* Check to ensure the stack will not grow into a hugetlb-only region */
+@@ -3125,10 +3125,10 @@ int expand_upwards(struct vm_area_struct *vma, unsigned long address)
+ 	mmap_assert_write_locked(mm);
+ 
+ 	/* Guard against exceeding limits of the address space. */
+-	address &= PAGE_MASK;
+-	if (address >= (TASK_SIZE & PAGE_MASK))
++	address &= MMUPAGE_MASK;
++	if (address >= (TASK_SIZE & MMUPAGE_MASK))
+ 		return -ENOMEM;
+-	address += PAGE_SIZE;
++	address += MMUPAGE_SIZE;
+ 
+ 	/* Enforce stack_guard_gap */
+ 	gap_addr = address + stack_guard_gap;
+@@ -3167,10 +3167,10 @@ int expand_upwards(struct vm_area_struct *vma, unsigned long address)
+ 		unsigned long size, grow;
+ 
+ 		size = address - vma->vm_start;
+-		grow = (address - vma->vm_end) >> PAGE_SHIFT;
++		grow = (address - vma->vm_end) >> MMUPAGE_SHIFT;
+ 
+ 		error = -ENOMEM;
+-		if (vma->vm_pgoff + (size >> PAGE_SHIFT) >= vma->vm_pgoff) {
++		if (vma->vm_pgoff + (size >> MMUPAGE_SHIFT) >= vma->vm_pgoff) {
+ 			error = acct_stack_growth(vma, size, grow);
+ 			if (!error) {
+ 				if (vma_test(vma, VMA_LOCKED_BIT))
+@@ -3209,7 +3209,7 @@ int expand_downwards(struct vm_area_struct *vma, unsigned long address)
+ 
+ 	mmap_assert_write_locked(mm);
+ 
+-	address &= PAGE_MASK;
++	address &= MMUPAGE_MASK;
+ 	if (address < mmap_min_addr || address < FIRST_USER_ADDRESS)
+ 		return -EPERM;
+ 
+@@ -3246,7 +3246,7 @@ int expand_downwards(struct vm_area_struct *vma, unsigned long address)
+ 		unsigned long size, grow;
+ 
+ 		size = vma->vm_end - address;
+-		grow = (vma->vm_start - address) >> PAGE_SHIFT;
++		grow = (vma->vm_start - address) >> MMUPAGE_SHIFT;
+ 
+ 		error = -ENOMEM;
+ 		if (grow <= vma->vm_pgoff) {
+@@ -3319,7 +3319,7 @@ int insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
+ 	 */
+ 	if (vma_is_anonymous(vma)) {
+ 		BUG_ON(vma->anon_vma);
+-		vma->vm_pgoff = vma->vm_start >> PAGE_SHIFT;
++		vma->vm_pgoff = vma->vm_start >> MMUPAGE_SHIFT;
+ 	}
+ 
+ 	if (vma_link(mm, vma)) {
+@@ -3349,5 +3349,8 @@ int insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
+  */
+ __weak unsigned long vma_mmu_pagesize(struct vm_area_struct *vma)
+ {
+-	return vma_kernel_pagesize(vma);
++	/* For hugetlb, delegate to kernel pagesize; otherwise MMUPAGE_SIZE */
++	if (is_vm_hugetlb_page(vma))
++		return vma_kernel_pagesize(vma);
++	return MMUPAGE_SIZE;
+ }
+-- 
+2.54.0
+

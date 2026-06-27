@@ -1,0 +1,1404 @@
+From a8322e5900a77280d33e9fe8c1690a79ac1d4629 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:22 +0200
+Subject: [RFC PATCH 01/28] mm: page clustering definitions and Kconfig
+ (CONFIG_PAGE_MMUSHIFT)
+
+---
+ include/asm-generic/fixmap.h      |  12 +-
+ include/asm-generic/shmparam.h    |   2 +-
+ include/asm-generic/tlb.h         |  10 +-
+ include/asm-generic/vmlinux.lds.h |  23 +-
+ include/drm/drm_vma_manager.h     |   4 +-
+ include/linux/blk_types.h         |   2 +
+ include/linux/huge_mm.h           |   3 +
+ include/linux/hyperv.h            |   4 +-
+ include/linux/mm.h                | 101 +++++-
+ include/linux/mm_types_task.h     |  11 +
+ include/linux/pagemap.h           |  23 +-
+ include/linux/percpu-defs.h       |  13 +-
+ include/linux/pgtable.h           | 115 ++++++-
+ include/linux/pte_cluster.h       | 532 ++++++++++++++++++++++++++++++
+ include/linux/rmap.h              |  32 +-
+ include/vdso/datapage.h           |  10 +-
+ include/vdso/page.h               |  32 +-
+ 17 files changed, 882 insertions(+), 47 deletions(-)
+ create mode 100644 include/linux/pte_cluster.h
+
+diff --git a/include/asm-generic/fixmap.h b/include/asm-generic/fixmap.h
+index 29cab7947980..cb2cb5f35349 100644
+--- a/include/asm-generic/fixmap.h
++++ b/include/asm-generic/fixmap.h
+@@ -18,8 +18,14 @@
+ #include <linux/bug.h>
+ #include <linux/mm_types.h>
+ 
+-#define __fix_to_virt(x)	(FIXADDR_TOP - ((x) << PAGE_SHIFT))
+-#define __virt_to_fix(x)	((FIXADDR_TOP - ((x)&PAGE_MASK)) >> PAGE_SHIFT)
++/*
++ * Fixmap slots are spaced at MMUPAGE_SIZE (the hardware MMU page size),
++ * not PAGE_SIZE, because each slot maps a single PTE which addresses
++ * one MMU page.  When PAGE_MMUSHIFT == 0, this is identical to the
++ * original PAGE_SHIFT spacing.
++ */
++#define __fix_to_virt(x)	(FIXADDR_TOP - ((x) << MMUPAGE_SHIFT))
++#define __virt_to_fix(x)	((FIXADDR_TOP - ((x)&MMUPAGE_MASK)) >> MMUPAGE_SHIFT)
+ 
+ #ifndef __ASSEMBLY__
+ /*
+@@ -75,7 +81,7 @@ static inline unsigned long virt_to_fix(const unsigned long vaddr)
+ ({									\
+ 	unsigned long ________addr;					\
+ 	__set_fixmap(idx, phys, flags);					\
+-	________addr = fix_to_virt(idx) + ((phys) & (PAGE_SIZE - 1));	\
++	________addr = fix_to_virt(idx) + ((phys) & (MMUPAGE_SIZE - 1));\
+ 	________addr;							\
+ })
+ 
+diff --git a/include/asm-generic/shmparam.h b/include/asm-generic/shmparam.h
+index b8f9035ffc2c..fa3e3e9cebb6 100644
+--- a/include/asm-generic/shmparam.h
++++ b/include/asm-generic/shmparam.h
+@@ -2,6 +2,6 @@
+ #ifndef __ASM_GENERIC_SHMPARAM_H
+ #define __ASM_GENERIC_SHMPARAM_H
+ 
+-#define SHMLBA PAGE_SIZE	 /* attach addr a multiple of this */
++#define SHMLBA MMUPAGE_SIZE	 /* attach addr a multiple of this */
+ 
+ #endif /* _ASM_GENERIC_SHMPARAM_H */
+diff --git a/include/asm-generic/tlb.h b/include/asm-generic/tlb.h
+index bdcc2778ac64..9e86a6b6976a 100644
+--- a/include/asm-generic/tlb.h
++++ b/include/asm-generic/tlb.h
+@@ -543,7 +543,7 @@ static inline void tlb_change_page_size(struct mmu_gather *tlb,
+ static inline unsigned long tlb_get_unmap_shift(struct mmu_gather *tlb)
+ {
+ 	if (tlb->cleared_ptes)
+-		return PAGE_SHIFT;
++		return MMUPAGE_SHIFT;
+ 	if (tlb->cleared_pmds)
+ 		return PMD_SHIFT;
+ 	if (tlb->cleared_puds)
+@@ -551,7 +551,7 @@ static inline unsigned long tlb_get_unmap_shift(struct mmu_gather *tlb)
+ 	if (tlb->cleared_p4ds)
+ 		return P4D_SHIFT;
+ 
+-	return PAGE_SHIFT;
++	return MMUPAGE_SHIFT;
+ }
+ 
+ static inline unsigned long tlb_get_unmap_size(struct mmu_gather *tlb)
+@@ -658,7 +658,7 @@ static inline void __tlb_remove_tlb_entry(struct mmu_gather *tlb, pte_t *ptep, u
+  */
+ #define tlb_remove_tlb_entry(tlb, ptep, address)		\
+ 	do {							\
+-		tlb_flush_pte_range(tlb, address, PAGE_SIZE);	\
++		tlb_flush_pte_range(tlb, address, MMUPAGE_SIZE);\
+ 		__tlb_remove_tlb_entry(tlb, ptep, address);	\
+ 	} while (0)
+ 
+@@ -672,13 +672,13 @@ static inline void __tlb_remove_tlb_entry(struct mmu_gather *tlb, pte_t *ptep, u
+ static inline void tlb_remove_tlb_entries(struct mmu_gather *tlb,
+ 		pte_t *ptep, unsigned int nr, unsigned long address)
+ {
+-	tlb_flush_pte_range(tlb, address, PAGE_SIZE * nr);
++	tlb_flush_pte_range(tlb, address, MMUPAGE_SIZE * nr);
+ 	for (;;) {
+ 		__tlb_remove_tlb_entry(tlb, ptep, address);
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		address += PAGE_SIZE;
++		address += MMUPAGE_SIZE;
+ 	}
+ }
+ 
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 60c8c22fd3e4..219e57d52b99 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -559,6 +559,27 @@
+ 	__end_rodata = .;
+ 
+ 
++/*
++ * Place .text.hot at a TLB-page boundary for the locality benefit.  The
++ * alignment is what's needed by the MMU, not what the kernel uses for its
++ * page allocator, so MMUPAGE_SIZE is the right granularity: under page
++ * clustering (PAGE_MMUSHIFT > 0) PAGE_SIZE can be many MMU-pages, and
++ * aligning on it wastes up to PAGE_SIZE - 1 bytes here -- enough on
++ * parisc/PGCL=6 to push the trap-vector branch to intr_extint past the
++ * 19-bit displacement field.
++ *
++ * Many arch lds files don't expose MMUPAGE_SIZE to the linker-script
++ * preprocessor (they synthesize PAGE_SIZE from asm-offsets via a private
++ * symbol like _PAGE_SIZE).  Fall back to PAGE_SIZE when MMUPAGE_SIZE
++ * isn't visible -- correct on non-PGCL kernels and matches the previous
++ * behavior on arches that haven't surfaced MMUPAGE_SIZE to their lds yet.
++ */
++#ifdef MMUPAGE_SIZE
++#define LDS_ALIGN_TLB_PAGE()	. = ALIGN(MMUPAGE_SIZE)
++#else
++#define LDS_ALIGN_TLB_PAGE()	. = ALIGN(PAGE_SIZE)
++#endif
++
+ /*
+  * Non-instrumentable text section
+  */
+@@ -603,7 +624,7 @@
+ 		*(.text.unknown .text.unknown.*)			\
+ 		TEXT_SPLIT						\
+ 		TEXT_UNLIKELY						\
+-		. = ALIGN(PAGE_SIZE);					\
++		LDS_ALIGN_TLB_PAGE();					\
+ 		TEXT_HOT						\
+ 		*(TEXT_MAIN .text.fixup)				\
+ 		NOINSTR_TEXT						\
+diff --git a/include/drm/drm_vma_manager.h b/include/drm/drm_vma_manager.h
+index 6c2a2f21dbf0..3ad351b147d6 100644
+--- a/include/drm/drm_vma_manager.h
++++ b/include/drm/drm_vma_manager.h
+@@ -202,7 +202,7 @@ static inline unsigned long drm_vma_node_size(struct drm_vma_offset_node *node)
+  */
+ static inline __u64 drm_vma_node_offset_addr(struct drm_vma_offset_node *node)
+ {
+-	return ((__u64)node->vm_node.start) << PAGE_SHIFT;
++	return ((__u64)node->vm_node.start) << MMUPAGE_SHIFT;
+ }
+ 
+ /**
+@@ -223,7 +223,7 @@ static inline void drm_vma_node_unmap(struct drm_vma_offset_node *node,
+ 	if (drm_mm_node_allocated(&node->vm_node))
+ 		unmap_mapping_range(file_mapping,
+ 				    drm_vma_node_offset_addr(node),
+-				    drm_vma_node_size(node) << PAGE_SHIFT, 1);
++				    drm_vma_node_size(node) << MMUPAGE_SHIFT, 1);
+ }
+ 
+ /**
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index 8808ee76e73c..558a872c863c 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -36,6 +36,8 @@ struct bio_crypt_ctx;
+ 
+ #define PAGE_SECTORS_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
+ #define PAGE_SECTORS		(1 << PAGE_SECTORS_SHIFT)
++#define MMUPAGE_SECTORS_SHIFT	(MMUPAGE_SHIFT - SECTOR_SHIFT)
++#define MMUPAGE_SECTORS		(1 << MMUPAGE_SECTORS_SHIFT)
+ #define SECTOR_MASK		(PAGE_SECTORS - 1)
+ 
+ struct block_device {
+diff --git a/include/linux/huge_mm.h b/include/linux/huge_mm.h
+index 2949e5acff35..a06ba7ec80d5 100644
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@ -116,11 +116,14 @@ enum tva_type {
+ 
+ #define HPAGE_PMD_ORDER (HPAGE_PMD_SHIFT-PAGE_SHIFT)
+ #define HPAGE_PMD_NR (1<<HPAGE_PMD_ORDER)
++/* MMUPAGE count in a PMD huge page — use for RSS counters (MMUPAGE-granular) */
++#define HPAGE_PMD_MMUNR (1<<(HPAGE_PMD_SHIFT-MMUPAGE_SHIFT))
+ #define HPAGE_PMD_MASK	(~(HPAGE_PMD_SIZE - 1))
+ #define HPAGE_PMD_SIZE	((1UL) << HPAGE_PMD_SHIFT)
+ 
+ #define HPAGE_PUD_ORDER (HPAGE_PUD_SHIFT-PAGE_SHIFT)
+ #define HPAGE_PUD_NR (1<<HPAGE_PUD_ORDER)
++#define HPAGE_PUD_MMUNR (1<<(HPAGE_PUD_SHIFT-MMUPAGE_SHIFT))
+ #define HPAGE_PUD_MASK	(~(HPAGE_PUD_SIZE - 1))
+ #define HPAGE_PUD_SIZE	((1UL) << HPAGE_PUD_SHIFT)
+ 
+diff --git a/include/linux/hyperv.h b/include/linux/hyperv.h
+index 734b7ef98f4d..33c8ff31ed6f 100644
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@ -154,8 +154,8 @@ struct hv_ring_buffer {
+ 		u32 value;
+ 	} feature_bits;
+ 
+-	/* Pad it to PAGE_SIZE so that data starts on page boundary */
+-	u8	reserved2[PAGE_SIZE - 68];
++	/* Pad it to HV_HYP_PAGE_SIZE so that data starts on page boundary */
++	u8	reserved2[HV_HYP_PAGE_SIZE - 68];
+ 
+ 	/*
+ 	 * Ring data starts here + RingDataStartOffset
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index fc2acedf0b76..dcba34277abf 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -229,6 +229,15 @@ static inline bool page_range_contiguous(const struct page *page,
+ /* test whether an address (unsigned long or pointer) is aligned to PAGE_SIZE */
+ #define PAGE_ALIGNED(addr)	IS_ALIGNED((unsigned long)(addr), PAGE_SIZE)
+ 
++/* to align the pointer to the (next) MMUPAGE boundary */
++#define MMUPAGE_ALIGN(addr) ALIGN(addr, MMUPAGE_SIZE)
++
++/* to align the pointer to the (prev) MMUPAGE boundary */
++#define MMUPAGE_ALIGN_DOWN(addr) ALIGN_DOWN(addr, MMUPAGE_SIZE)
++
++/* test whether an address is aligned to MMUPAGE_SIZE */
++#define MMUPAGE_ALIGNED(addr)	IS_ALIGNED((unsigned long)(addr), MMUPAGE_SIZE)
++
+ /**
+  * folio_page_idx - Return the number of a page in a folio.
+  * @folio: The folio.
+@@ -760,6 +769,62 @@ struct vm_fault {
+ 
+ struct vm_uffd_ops;
+ 
++/*
++ * vma_suboffset - compute the byte offset of a virtual address within
++ * its kernel page, based on the VMA's file offset alignment.
++ *
++ * When PAGE_MMUSHIFT == 0, always returns 0 (no sub-pages).
++ *
++ * When PAGE_MMUSHIFT > 0, the kernel page containing a given virtual
++ * address depends on the alignment of vm_pgoff.  Two addresses in the
++ * same VMA that are PAGE_SIZE apart always land in different kernel pages,
++ * but the boundary between kernel pages is shifted by the VMA's file
++ * offset modulo PAGE_MMUCOUNT.
++ */
++static inline unsigned long vma_suboffset(struct vm_area_struct *vma,
++					  unsigned long address)
++{
++#if PAGE_MMUSHIFT
++	return (((address >> MMUPAGE_SHIFT) - vma->vm_pgoff) &
++		(PAGE_MMUCOUNT - 1)) << MMUPAGE_SHIFT;
++#else
++	return 0;
++#endif
++}
++
++/*
++ * Page cache pgoff conversion helpers for PGCL.
++ *
++ * In PGCL, vma->vm_pgoff is in MMUPAGE-sized units (to support sub-PAGE
++ * mmap offsets), while the page cache indexes folios in PAGE-sized units.
++ * These helpers convert between the two.
++ *
++ * When PAGE_MMUSHIFT == 0, these are identity operations.
++ */
++
++/* Convert page cache index (PAGE-unit) to VMA pgoff (MMUPAGE-unit) */
++static inline pgoff_t pgoff_page_to_mmu(pgoff_t page_pgoff)
++{
++	return page_pgoff << PAGE_MMUSHIFT;
++}
++
++/* Convert VMA pgoff (MMUPAGE-unit) to page cache index (PAGE-unit) */
++static inline pgoff_t pgoff_mmu_to_page(pgoff_t mmu_pgoff)
++{
++	return mmu_pgoff >> PAGE_MMUSHIFT;
++}
++
++/*
++ * Compute the virtual address in a VMA for a page cache pgoff.
++ * Handles the unit mismatch: pgoff is in PAGE units, vm_pgoff is MMUPAGE.
++ */
++static inline unsigned long pgoff_to_vma_addr(
++		const struct vm_area_struct *vma, pgoff_t pgoff)
++{
++	return vma->vm_start +
++		((pgoff << PAGE_SHIFT) - ((loff_t)vma->vm_pgoff << MMUPAGE_SHIFT));
++}
++
+ /*
+  * These are the virtual MM functions - opening of an area, closing and
+  * unmapping it (needed to keep files on disk up-to-date etc), pointer
+@@ -3687,6 +3752,24 @@ static inline void pagetable_free(struct ptdesc *pt)
+ }
+ 
+ #if defined(CONFIG_SPLIT_PTE_PTLOCKS)
++/*
++ * PTE_PACK_ORDER: log2 of how many MMUPAGE-sized PTE tables share one
++ * PAGE_SIZE ptdesc.  Default 0 (no packing).  Architectures that opt
++ * into PTE table packing (CONFIG_PACK_PTE_PTLOCKS) override this in
++ * <asm/page.h>.  At order 0, pte_pack_index() is constant 0 and the
++ * spinlock array degenerates to a single lock — the historical
++ * behaviour, preserved bit-for-bit for non-packing arches.
++ */
++#ifndef PTE_PACK_ORDER
++#define PTE_PACK_ORDER 0
++#endif
++#define PTE_PACK_NR (1U << PTE_PACK_ORDER)
++
++static inline unsigned int pte_pack_index(unsigned long addr)
++{
++	return (addr >> MMUPAGE_SHIFT) & (PTE_PACK_NR - 1);
++}
++
+ #if ALLOC_SPLIT_PTLOCKS
+ void __init ptlock_cache_init(void);
+ bool ptlock_alloc(struct ptdesc *ptdesc);
+@@ -3718,18 +3801,23 @@ static inline spinlock_t *ptlock_ptr(struct ptdesc *ptdesc)
+ 
+ static inline spinlock_t *pte_lockptr(struct mm_struct *mm, pmd_t *pmd)
+ {
+-	return ptlock_ptr(page_ptdesc(pmd_page(*pmd)));
++	struct ptdesc *pt = page_ptdesc(pmd_page(*pmd));
++	unsigned long pmdv = (unsigned long)pmd_page_vaddr(*pmd);
++
++	return &ptlock_ptr(pt)[pte_pack_index(pmdv)];
+ }
+ 
+ static inline spinlock_t *ptep_lockptr(struct mm_struct *mm, pte_t *pte)
+ {
+ 	BUILD_BUG_ON(IS_ENABLED(CONFIG_HIGHPTE));
+ 	BUILD_BUG_ON(MAX_PTRS_PER_PTE * sizeof(pte_t) > PAGE_SIZE);
+-	return ptlock_ptr(virt_to_ptdesc(pte));
++	return &ptlock_ptr(virt_to_ptdesc(pte))[pte_pack_index((unsigned long)pte)];
+ }
+ 
+ static inline bool ptlock_init(struct ptdesc *ptdesc)
+ {
++	unsigned int i;
++
+ 	/*
+ 	 * prep_new_page() initialize page->private (and therefore page->ptl)
+ 	 * with 0. Make sure nobody took it in use in between.
+@@ -3740,7 +3828,8 @@ static inline bool ptlock_init(struct ptdesc *ptdesc)
+ 	VM_BUG_ON_PAGE(*(unsigned long *)&ptdesc->ptl, ptdesc_page(ptdesc));
+ 	if (!ptlock_alloc(ptdesc))
+ 		return false;
+-	spin_lock_init(ptlock_ptr(ptdesc));
++	for (i = 0; i < PTE_PACK_NR; i++)
++		spin_lock_init(&ptlock_ptr(ptdesc)[i]);
+ 	return true;
+ }
+ 
+@@ -4234,14 +4323,14 @@ static inline unsigned long vm_end_gap(const struct vm_area_struct *vma)
+ 	if (vma->vm_flags & VM_GROWSUP) {
+ 		vm_end += stack_guard_gap;
+ 		if (vm_end < vma->vm_end)
+-			vm_end = -PAGE_SIZE;
++			vm_end = -MMUPAGE_SIZE;
+ 	}
+ 	return vm_end;
+ }
+ 
+ static inline unsigned long vma_pages(const struct vm_area_struct *vma)
+ {
+-	return (vma->vm_end - vma->vm_start) >> PAGE_SHIFT;
++	return (vma->vm_end - vma->vm_start) >> MMUPAGE_SHIFT;
+ }
+ 
+ static inline unsigned long vma_last_pgoff(struct vm_area_struct *vma)
+@@ -4256,7 +4345,7 @@ static inline unsigned long vma_desc_size(const struct vm_area_desc *desc)
+ 
+ static inline unsigned long vma_desc_pages(const struct vm_area_desc *desc)
+ {
+-	return vma_desc_size(desc) >> PAGE_SHIFT;
++	return vma_desc_size(desc) >> MMUPAGE_SHIFT;
+ }
+ 
+ /**
+diff --git a/include/linux/mm_types_task.h b/include/linux/mm_types_task.h
+index 11bf319d78ec..a9e7a5d7caa3 100644
+--- a/include/linux/mm_types_task.h
++++ b/include/linux/mm_types_task.h
+@@ -17,7 +17,18 @@
+ #include <asm/tlbbatch.h>
+ #endif
+ 
++/*
++ * When PACK_PTE_PTLOCKS is on, an architecture packs multiple
++ * MMUPAGE-sized PTE tables into a single PAGE_SIZE ptdesc; the ptdesc
++ * therefore carries an array of spinlocks (one per sub-table) that must
++ * be dynamically allocated regardless of spinlock_t size.  Force the
++ * ALLOC_SPLIT_PTLOCKS path so ptdesc->ptl is a pointer.
++ */
++#ifdef CONFIG_PACK_PTE_PTLOCKS
++#define ALLOC_SPLIT_PTLOCKS	1
++#else
+ #define ALLOC_SPLIT_PTLOCKS	(SPINLOCK_SIZE > BITS_PER_LONG/8)
++#endif
+ 
+ /*
+  * When updating this, please also update struct resident_page_types[] in
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index 31a848485ad9..21b0febaf7c5 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -1065,15 +1065,36 @@ static inline pgoff_t folio_pgoff(const struct folio *folio)
+ 	return folio->index;
+ }
+ 
++/*
++ * With PAGE_MMUSHIFT > 0 (larpage), vm_pgoff is in MMUPAGE-sized units
++ * so that file-backed mappings preserve sub-PAGE offset granularity.
++ * This function returns the MMUPAGE-unit pgoff for a given address.
++ */
+ static inline pgoff_t linear_page_index(const struct vm_area_struct *vma,
+ 					const unsigned long address)
+ {
+ 	pgoff_t pgoff;
+-	pgoff = (address - vma->vm_start) >> PAGE_SHIFT;
++	pgoff = (address - vma->vm_start) >> MMUPAGE_SHIFT;
+ 	pgoff += vma->vm_pgoff;
+ 	return pgoff;
+ }
+ 
++/*
++ * Convert MMUPAGE-unit pgoff to page cache index (PAGE-sized units).
++ */
++static inline pgoff_t pgoff_to_page_cache_index(pgoff_t pgoff)
++{
++	return pgoff >> PAGE_MMUSHIFT;
++}
++
++/*
++ * Return the sub-MMUPAGE index within a PAGE for a given MMUPAGE pgoff.
++ */
++static inline unsigned int pgoff_sub_page_index(pgoff_t pgoff)
++{
++	return pgoff & (PAGE_MMUCOUNT - 1);
++}
++
+ struct wait_page_key {
+ 	struct folio *folio;
+ 	int bit_nr;
+diff --git a/include/linux/percpu-defs.h b/include/linux/percpu-defs.h
+index 43c854a273c3..029916a90254 100644
+--- a/include/linux/percpu-defs.h
++++ b/include/linux/percpu-defs.h
+@@ -155,14 +155,23 @@
+ 
+ /*
+  * Declaration/definition used for per-CPU variables that must be page aligned.
++ *
++ * Aligned to MMUPAGE_SIZE (the hardware page), not the kernel PAGE_SIZE: under
++ * page clustering (PAGE_MMUSHIFT > 0) the two differ, and every page-aligned
++ * per-CPU variable in the tree needs only hardware-page alignment -- they are
++ * hardware structures mapped into the cpu_entry_area at hardware-page
++ * granularity (DS area, TSS, GDT, entry/exception/doublefault stacks) or
++ * vmapped, guard-paged stacks.  None requires kernel-cluster-page alignment, so
++ * aligning to the (large) PAGE_SIZE would only waste memory.  Identity at
++ * PAGE_MMUSHIFT == 0 (MMUPAGE_SIZE == PAGE_SIZE).
+  */
+ #define DECLARE_PER_CPU_PAGE_ALIGNED(type, name)			\
+ 	DECLARE_PER_CPU_SECTION(type, name, "..page_aligned")		\
+-	__aligned(PAGE_SIZE)
++	__aligned(MMUPAGE_SIZE)
+ 
+ #define DEFINE_PER_CPU_PAGE_ALIGNED(type, name)				\
+ 	DEFINE_PER_CPU_SECTION(type, name, "..page_aligned")		\
+-	__aligned(PAGE_SIZE)
++	__aligned(MMUPAGE_SIZE)
+ 
+ /*
+  * Declaration/definition used for per-CPU variables that must be read mostly.
+diff --git a/include/linux/pgtable.h b/include/linux/pgtable.h
+index cdd68ed3ae1a..36c6b672d50d 100644
+--- a/include/linux/pgtable.h
++++ b/include/linux/pgtable.h
+@@ -47,7 +47,7 @@
+ 
+ static inline unsigned long pte_index(unsigned long address)
+ {
+-	return (address >> PAGE_SHIFT) & (PTRS_PER_PTE - 1);
++	return (address >> MMUPAGE_SHIFT) & (PTRS_PER_PTE - 1);
+ }
+ 
+ #ifndef pmd_index
+@@ -388,6 +388,26 @@ static inline pte_t pte_advance_pfn(pte_t pte, unsigned long nr)
+ 
+ #define pte_next_pfn(pte) pte_advance_pfn(pte, 1)
+ 
++/*
++ * Generic fallback for __phys_to_pte_val: identity transform.
++ * Architectures where the PTE PFN field is not a direct physical address
++ * (e.g. riscv with _PAGE_PFN_SHIFT != MMUPAGE_SHIFT) must define their own.
++ * Defined here (before set_ptes) so PGCL sub-page PTE encoding works.
++ */
++#ifndef __phys_to_pte_val
++#define __phys_to_pte_val(phys)	(phys)
++#endif
++
++/*
++ * Inverse of __phys_to_pte_val.  Identity on archs where the PTE PFN field
++ * is a direct physical address (x86, s390 etc).  Archs where the encoding
++ * differs (mips PFN at bit 6, riscv _PAGE_PFN_SHIFT != MMUPAGE_SHIFT) must
++ * override this together with __phys_to_pte_val.
++ */
++#ifndef __pte_val_to_phys
++#define __pte_val_to_phys(val)	(val)
++#endif
++
+ #ifndef set_ptes
+ /**
+  * set_ptes - Map consecutive pages to a contiguous range of addresses.
+@@ -410,6 +430,29 @@ static inline pte_t pte_advance_pfn(pte_t pte, unsigned long nr)
+ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 		pte_t *ptep, pte_t pte, unsigned int nr)
+ {
++#if PAGE_MMUSHIFT > 0
++	page_table_check_ptes_set(mm, addr, ptep, pte, nr);
++
++	if (nr == 1) {
++		/* Single PTE: caller already set up sub-page offset */
++		set_pte(ptep, pte);
++	} else {
++		unsigned int i;
++
++		/*
++		 * With page clustering, nr is the number of PTEs
++		 * (MMUPAGE-granular entries) to write.  Each PTE
++		 * maps one MMUPAGE.  Advance physical address by
++		 * MMUPAGE_SIZE per PTE.
++		 */
++		for (i = 0; i < nr; i++) {
++			set_pte(ptep, pte);
++			ptep++;
++			pte = __pte(pte_val(pte) +
++				    __phys_to_pte_val(MMUPAGE_SIZE));
++		}
++	}
++#else
+ 	page_table_check_ptes_set(mm, addr, ptep, pte, nr);
+ 
+ 	for (;;) {
+@@ -419,6 +462,7 @@ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 		ptep++;
+ 		pte = pte_next_pfn(pte);
+ 	}
++#endif
+ }
+ #endif
+ #define set_pte_at(mm, addr, ptep, pte) set_ptes(mm, addr, ptep, pte, 1)
+@@ -658,7 +702,7 @@ static inline void clear_young_dirty_ptes(struct vm_area_struct *vma,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 	}
+ }
+ #endif
+@@ -845,7 +889,7 @@ static inline pte_t get_and_clear_full_ptes(struct mm_struct *mm,
+ 	pte = ptep_get_and_clear_full(mm, addr, ptep, full);
+ 	while (--nr) {
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 		tmp_pte = ptep_get_and_clear_full(mm, addr, ptep, full);
+ 		if (pte_dirty(tmp_pte))
+ 			pte = pte_mkdirty(pte);
+@@ -906,7 +950,7 @@ static inline void clear_full_ptes(struct mm_struct *mm, unsigned long addr,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 	}
+ }
+ #endif
+@@ -993,7 +1037,7 @@ static inline void clear_not_present_full_ptes(struct mm_struct *mm,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 	}
+ }
+ #endif
+@@ -1020,6 +1064,48 @@ static inline pte_t pte_mkwrite(pte_t pte, struct vm_area_struct *vma)
+ }
+ #endif
+ 
++/*
++ * pte_mksub - adjust a PTE to address a sub-page (MMU page) within a
++ * kernel page.  offset is in bytes, always a multiple of MMUPAGE_SIZE.
++ * When PAGE_MMUSHIFT == 0, this is a no-op (offset is always 0).
++ * Architectures should override this if their PTE format requires
++ * special handling.
++ */
++#ifndef pte_mksub
++static inline pte_t pte_mksub(pte_t pte, unsigned long offset)
++{
++#if PAGE_MMUSHIFT
++	return __pte(pte_val(pte) + __phys_to_pte_val(offset));
++#else
++	return pte;
++#endif
++}
++#define pte_mksub pte_mksub
++#endif
++
++/*
++ * pte_suboffset - extract the sub-page byte offset from a PTE.
++ * Returns the offset of the addressed MMU page within its kernel page.
++ * When PAGE_MMUSHIFT == 0, always returns 0.
++ */
++#ifndef pte_suboffset
++static inline unsigned long pte_suboffset(pte_t pte)
++{
++#if PAGE_MMUSHIFT
++	/*
++	 * Convert the PTE's PFN field back to a physical address (identity
++	 * on most archs; mips/riscv encode PFN at a different bit position
++	 * and override __pte_val_to_phys), then mask out everything except
++	 * the sub-page bits within a kernel page.
++	 */
++	return __pte_val_to_phys(pte_val(pte)) & (PAGE_SIZE - 1) & MMUPAGE_MASK;
++#else
++	return 0;
++#endif
++}
++#define pte_suboffset pte_suboffset
++#endif
++
+ #if defined(CONFIG_ARCH_WANT_PMD_MKWRITE) && !defined(pmd_mkwrite)
+ static inline pmd_t pmd_mkwrite(pmd_t pmd, struct vm_area_struct *vma)
+ {
+@@ -1062,7 +1148,7 @@ static inline void wrprotect_ptes(struct mm_struct *mm, unsigned long addr,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 	}
+ }
+ #endif
+@@ -1095,7 +1181,7 @@ static inline bool clear_flush_young_ptes(struct vm_area_struct *vma,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 	}
+ 
+ 	return young;
+@@ -1616,7 +1702,7 @@ static inline pte_t modify_prot_start_ptes(struct vm_area_struct *vma,
+ 	pte = ptep_modify_prot_start(vma, addr, ptep);
+ 	while (--nr) {
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 		tmp_pte = ptep_modify_prot_start(vma, addr, ptep);
+ 		if (pte_dirty(tmp_pte))
+ 			pte = pte_mkdirty(pte);
+@@ -1653,12 +1739,21 @@ static inline void modify_prot_commit_ptes(struct vm_area_struct *vma, unsigned
+ {
+ 	int i;
+ 
+-	for (i = 0; i < nr; ++i, ++ptep, addr += PAGE_SIZE) {
++	for (i = 0; i < nr; ++i, ++ptep, addr += MMUPAGE_SIZE) {
+ 		ptep_modify_prot_commit(vma, addr, ptep, old_pte, pte);
+ 
+-		/* Advance PFN only, set same prot */
++		/*
++		 * Advance PFN only, set same prot.
++		 * pte_next_pfn advances by PAGE_SIZE.  With PGCL, consecutive
++		 * sub-pages differ by MMUPAGE_SIZE, not PAGE_SIZE.
++		 */
++#if PAGE_MMUSHIFT
++		old_pte = __pte(pte_val(old_pte) + __phys_to_pte_val(MMUPAGE_SIZE));
++		pte = __pte(pte_val(pte) + __phys_to_pte_val(MMUPAGE_SIZE));
++#else
+ 		old_pte = pte_next_pfn(old_pte);
+ 		pte = pte_next_pfn(pte);
++#endif
+ 	}
+ }
+ #endif
+diff --git a/include/linux/pte_cluster.h b/include/linux/pte_cluster.h
+new file mode 100644
+index 000000000000..3838444edb27
+--- /dev/null
++++ b/include/linux/pte_cluster.h
+@@ -0,0 +1,532 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_PTE_CLUSTER_H
++#define _LINUX_PTE_CLUSTER_H
++
++/*
++ * include/linux/pte_cluster.h
++ *
++ * Translated from include/linux/folio.h by Hugh Dickins hugh@veritas.com
++ * 31may01 to modern (6.x) kernel APIs.
++ *
++ * Original naming used "folio" which now conflicts with struct folio
++ * (compound page abstraction, 5.16+). Renamed to "pte_cluster".
++ *
++ * This header is intended for inclusion in mm/memory.c alone.
++ * It provides functions for the fault handlers do_fault(),
++ * do_anonymous_page(), do_swap_page() and do_wp_page().
++ *
++ * On a standard system (PAGE_MMUSHIFT == 0), these functions are
++ * trivial.  On a system with page clustering (PAGE_MMUSHIFT != 0),
++ * they manage the awkwardness of presenting small MMUPAGE_SIZE pages
++ * to user programs from a kernel pool of large PAGE_SIZE pages.
++ *
++ * Shared file mappings present little problem, but without this
++ * treatment, private mappings might quickly degenerate into needing
++ * one PAGE_SIZE page to support each MMUPAGE_SIZE mapping.
++ */
++
++#include <linux/mm.h>
++#include <linux/pgtable.h>
++#include <linux/swap.h>
++#include <linux/swapops.h>
++#include <linux/highmem.h>
++
++#if PAGE_MMUSHIFT
++
++/*
++ * Test whether pte2 indicates the same page as pte1.
++ */
++static inline int pte_cluster_match(pte_t *pte1, pte_t *pte2)
++{
++	if (pte_none(*pte1))
++		return pte_none(*pte2);
++	if (pte_present(*pte1)) {
++		if (!pte_present(*pte2))
++			return 0;
++		return pte_page(*pte2) == pte_page(*pte1);
++	}
++	if (pte_none(*pte2) || pte_present(*pte2))
++		return 0;
++	return __pte_to_swp_entry(*pte2).val == __pte_to_swp_entry(*pte1).val;
++}
++
++/*
++ * Test whether nearby vma2 could ever share a private page with vma1.
++ */
++static inline int vma_neighbourly(struct vm_area_struct *vma1,
++				  struct vm_area_struct *vma2)
++{
++	if ((vma1->vm_flags | vma2->vm_flags) & VM_MAYSHARE)
++		return 0;
++	if ((((vma1->vm_start - vma2->vm_start) >> MMUPAGE_SHIFT) -
++	      (vma1->vm_pgoff - vma2->vm_pgoff)) & (PAGE_MMUCOUNT - 1))
++		return 0;
++	return 1;
++}
++
++/*
++ * Prepare pte_cluster of page table pointers for the fault handlers.
++ *
++ * Walks the page table to fill in an array of PTE pointers for all
++ * MMU pages within the kernel page containing 'address'.  Entries
++ * that fall outside the VMA (or outside the page table) are set to
++ * NULL.  When 'wide' is set, neighbouring VMAs that could share a
++ * private page are included.
++ *
++ * Modern port notes:
++ * - Uses 5-level page tables (pgd -> p4d -> pud -> pmd -> pte)
++ * - Uses pte_offset_map() / pte_unmap() instead of raw pte_offset()
++ * - Uses find_vma() and VMA iteration via vma_next()
++ *
++ * Returns nonzero if the page_table_lock was not held throughout
++ * (requiring a re-call after re-acquiring the lock).
++ */
++static __maybe_unused int prepare_pte_cluster(pte_t *cluster[],
++	struct vm_area_struct *vma,
++	unsigned long address, pte_t *ptep, int wide)
++{
++	struct vm_area_struct *vmp;
++	unsigned long suboffset;
++	unsigned long base, addr;
++	int subnr, ptenr;
++	int j, limit;
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++	pte_t *mapped_pte;
++	int reprep = 0;
++
++	suboffset = vma_suboffset(vma, address);
++	base = (address - suboffset) & MMUPAGE_MASK;
++	subnr = suboffset >> MMUPAGE_SHIFT;
++	ptenr = (address & ~PMD_MASK) >> MMUPAGE_SHIFT;
++
++	/* First approximation: set full vector of probable pteps */
++	ptep -= subnr;
++	for (j = 0; j < PAGE_MMUCOUNT; j++)
++		cluster[j] = ptep + j;
++	j = 0;
++
++	/* Second approximation: wipe pteps which don't belong to vma;
++	 * but if wide, include neighbouring vmas perhaps sharing page.
++	 */
++	addr = base;
++	if (addr > TASK_SIZE) {	/* wrapped */
++		for (; addr > TASK_SIZE; addr += MMUPAGE_SIZE, j++)
++			cluster[j] = NULL;
++	}
++	if (addr < vma->vm_start) {
++		if (wide) {
++			for (vmp = find_vma(vma->vm_mm, addr);
++			     vmp && vmp != vma;
++			     vmp = find_vma(vma->vm_mm, addr)) {
++				for (; addr < vmp->vm_start;
++				     addr += MMUPAGE_SIZE, j++)
++					cluster[j] = NULL;
++				if (vma_neighbourly(vma, vmp)) {
++					j += (min(vmp->vm_end,
++						  vma->vm_start) - addr)
++						>> MMUPAGE_SHIFT;
++					addr = min(vmp->vm_end, vma->vm_start);
++				} else {
++					addr = vmp->vm_end;
++				}
++				if (addr >= vma->vm_start)
++					break;
++			}
++		}
++		for (; addr < vma->vm_start; addr += MMUPAGE_SIZE, j++)
++			cluster[j] = NULL;
++	}
++	if (vma->vm_end < base + PAGE_SIZE) {
++		j = (vma->vm_end - base) >> MMUPAGE_SHIFT;
++		if (wide) {
++			addr = vma->vm_end;
++			vmp = find_vma(vma->vm_mm, addr);
++			while (vmp && vmp->vm_start < base + PAGE_SIZE) {
++				for (; addr < vmp->vm_start;
++				     addr += MMUPAGE_SIZE, j++)
++					cluster[j] = NULL;
++				if (vma_neighbourly(vma, vmp)) {
++					unsigned long end = min(vmp->vm_end,
++							base + PAGE_SIZE);
++					j += (end - addr) >> MMUPAGE_SHIFT;
++					addr = end;
++				} else {
++					addr = vmp->vm_end;
++				}
++				if (addr >= base + PAGE_SIZE)
++					break;
++				vmp = find_vma(vma->vm_mm, addr);
++			}
++		}
++		for (; j < PAGE_MMUCOUNT; j++)
++			cluster[j] = NULL;
++	}
++
++	/* Third approximation: fix pteps to page table below or above.
++	 *
++	 * If the kernel page spans a page table boundary (the cluster
++	 * entries straddle two different PTE pages), we need to walk
++	 * the page tables to find the other PTE page.
++	 */
++	if (subnr > ptenr) {
++		limit = subnr - ptenr;
++		for (j = 0; !cluster[j]; j++)
++			;
++		if (j < limit) {
++			mapped_pte = NULL;
++			pgd = pgd_offset(vma->vm_mm, base);
++			if (!pgd_none(*pgd) && !pgd_bad(*pgd)) {
++				p4d = p4d_offset(pgd, base);
++				if (!p4d_none(*p4d) && !p4d_bad(*p4d)) {
++					pud = pud_offset(p4d, base);
++					if (!pud_none(*pud) && !pud_bad(*pud)) {
++						pmd = pmd_offset(pud, base);
++						if (!pmd_none(*pmd) &&
++						    !pmd_bad(*pmd))
++							mapped_pte = pte_offset_map(pmd, base);
++					}
++				}
++			}
++			if (mapped_pte) {
++				for (; j < limit; j++) {
++					if (cluster[j])
++						cluster[j] = mapped_pte + j;
++				}
++				pte_unmap(mapped_pte);
++			} else {
++				for (; j < limit; j++)
++					cluster[j] = NULL;
++				reprep = 1;
++			}
++		}
++	}
++	if (ptenr > subnr + PTRS_PER_PTE - PAGE_MMUCOUNT) {
++		j = subnr + PTRS_PER_PTE - ptenr;
++		for (limit = PAGE_MMUCOUNT; !cluster[limit-1]; limit--)
++			;
++		if (j < limit) {
++			mapped_pte = NULL;
++			base += PAGE_SIZE;
++			pgd = pgd_offset(vma->vm_mm, base);
++			if (!pgd_none(*pgd) && !pgd_bad(*pgd)) {
++				p4d = p4d_offset(pgd, base);
++				if (!p4d_none(*p4d) && !p4d_bad(*p4d)) {
++					pud = pud_offset(p4d, base);
++					if (!pud_none(*pud) && !pud_bad(*pud)) {
++						pmd = pmd_offset(pud, base);
++						if (!pmd_none(*pmd) &&
++						    !pmd_bad(*pmd))
++							mapped_pte = pte_offset_map(pmd, base);
++					}
++				}
++			}
++			if (mapped_pte) {
++				mapped_pte -= PAGE_MMUCOUNT;
++				for (; j < limit; j++) {
++					if (cluster[j])
++						cluster[j] = mapped_pte + j;
++				}
++				pte_unmap(mapped_pte + PAGE_MMUCOUNT);
++			} else {
++				for (; j < limit; j++)
++					cluster[j] = NULL;
++				reprep = 1;
++			}
++		}
++	}
++	return reprep;	/* needs recall if page_table_lock dropped */
++}
++
++/*
++ * Check if the wide cluster already has a private page allocated to it.
++ *
++ * This examines all the PTE entries in the cluster to see if they
++ * already reference a private page (one not shared with other processes).
++ * If found, the existing page can be reused instead of allocating a new one.
++ *
++ * swap_page: the page being swapped in (for do_swap_page), or NULL.
++ */
++static __maybe_unused struct page *private_cluster_page(pte_t *cluster[],
++					 struct page *swap_page)
++{
++	struct page *page;
++	struct folio *folio;
++	swp_entry_t entry;
++	pte_t swap_pte;
++	int fcount, pcount, scount, tcount;
++	int i, j;
++
++	for (j = PAGE_MMUCOUNT - 1; !cluster[j]; j--)
++		;
++	fcount = j + 1;
++
++	/*
++	 * The easiest way to handle the do_swap_page() case is
++	 * to make up one extra element on the end of the cluster:
++	 * typically all the cluster entries will be swapped out,
++	 * and we need one present page to make sense of them.
++	 */
++	if (swap_page) {
++		swap_pte = mk_pte(swap_page, PAGE_KERNEL);
++		cluster[fcount] = &swap_pte;
++		fcount++;
++	}
++
++	j = 0;
++	while (j < fcount) {
++		if (!cluster[j] || !pte_present(*cluster[j])) {
++			j++;
++			continue;
++		}
++		tcount = 1;
++		page = pte_page(*cluster[j]);
++		while (++j < fcount) {
++			if (!cluster[j] || !pte_present(*cluster[j]))
++				continue;
++			if (pte_page(*cluster[j]) != page)
++				break;
++			tcount++;
++		}
++		if (PageReserved(page))
++			continue;
++		folio = page_folio(page);
++		if (folio_test_swapcache(folio)) {
++			if (page != swap_page) {
++				if (!folio_trylock(folio))
++					continue;
++				if (!folio_test_swapcache(folio)) {
++					folio_unlock(folio);
++					continue;
++				}
++			}
++			entry = folio->swap;
++			pcount = page_count(page) - 1;	/* omit swap cache */
++			scount = swp_swapcount(entry) - 1; /* omit swap cache */
++			if (page != swap_page)
++				folio_unlock(folio);
++			if (pcount + scount > fcount)
++				continue;
++		} else {
++			if (folio->mapping)
++				continue;
++			pcount = page_count(page);
++			scount = 0;
++		}
++		pcount -= tcount;
++		if (j + pcount > fcount)
++			continue;
++		for (i = j + 1; pcount && i < fcount; i++) {
++			if (!cluster[i] || !pte_present(*cluster[i]))
++				continue;
++			if (pte_page(*cluster[i]) == page)
++				pcount--;
++		}
++		if (pcount)
++			continue;
++		for (i = 0; scount && i < fcount; i++) {
++			if (!cluster[i] || pte_present(*cluster[i]))
++				continue;
++			if (softleaf_from_pte(*cluster[i]).val == entry.val)
++				scount--;
++		}
++		if (scount)
++			continue;
++		return page;
++	}
++	return NULL;
++}
++
++/*
++ * Replace page just allocated by private cluster page if it has one.
++ */
++static inline struct page *private_cluster_page_xchg(pte_t *cluster[],
++						     struct page *new_page)
++{
++	struct page *cluster_page = private_cluster_page(cluster, NULL);
++
++	if (!cluster_page)
++		return new_page;
++	put_page(new_page);
++	get_page(cluster_page);
++	return cluster_page;
++}
++
++/*
++ * Limit cluster to page table entries of this vma matching this *ptep.
++ */
++static __maybe_unused void restrict_pte_cluster(pte_t *cluster[],
++	struct vm_area_struct *vma,
++	unsigned long address, pte_t *ptep)
++{
++	unsigned long addr;
++	int j;
++
++	addr = address - vma_suboffset(vma, address);
++	for (j = 0; j < PAGE_MMUCOUNT; j++, addr += MMUPAGE_SIZE) {
++		if (!cluster[j])
++			continue;
++		if (addr < vma->vm_start || addr >= vma->vm_end ||
++		    !pte_cluster_match(cluster[j], ptep))
++			cluster[j] = NULL;
++	}
++}
++
++/*
++ * Copy (or clear) cluster of mmupages from src_page to dst_page.
++ *
++ * Uses kmap_local_page() (modern replacement for kmap/kunmap).
++ * For the zero page case, uses memset to clear.
++ */
++static __maybe_unused void copy_pte_cluster(pte_t *cluster[],
++	struct page *dst_page,
++	struct page *src_page, unsigned long address)
++{
++	char *src, *dst;
++	unsigned int size;
++	unsigned int offset = 0;
++	int j = 0;
++
++	dst = kmap_local_page(dst_page);
++	src = (src_page != ZERO_PAGE(address)) ?
++		kmap_local_page(src_page) : NULL;
++
++	while (j < PAGE_MMUCOUNT) {
++		if (!cluster[j]) {
++			offset += MMUPAGE_SIZE;
++			j++;
++			continue;
++		}
++		size = MMUPAGE_SIZE;
++		while (++j < PAGE_MMUCOUNT) {
++			if (!cluster[j])
++				break;
++			size += MMUPAGE_SIZE;
++		}
++		if (src)
++			memcpy(dst + offset, src + offset, size);
++		else
++			memset(dst + offset, 0, size);
++		offset += size;
++	}
++	if (src)
++		kunmap_local(src);
++	kunmap_local(dst);
++}
++
++/*
++ * Update page table entries of the cluster, counting how many done.
++ */
++static inline unsigned long set_pte_cluster(pte_t *cluster[], pte_t pte)
++{
++	unsigned long offset = 0;
++	unsigned long rss = 0;
++	int j;
++
++	for (j = 0; j < PAGE_MMUCOUNT; j++, offset += MMUPAGE_SIZE) {
++		if (!cluster[j])
++			continue;
++		set_ptes(NULL, 0, cluster[j], pte_mksub(pte, offset), 1);
++		rss++;
++	}
++	return rss;
++}
++
++/*
++ * Flush TLB entries for the cluster (if ptes were present before).
++ */
++static inline void flush_pte_cluster(pte_t *cluster[],
++	struct vm_area_struct *vma, unsigned long address)
++{
++	unsigned long start, end;
++	int j;
++
++	start = (address - vma_suboffset(vma, address)) & MMUPAGE_MASK;
++	end = start + PAGE_SIZE;
++	for (j = 0; !cluster[j]; j++)
++		start += MMUPAGE_SIZE;
++	for (j = PAGE_MMUCOUNT - 1; !cluster[j]; j--)
++		end -= MMUPAGE_SIZE;
++	flush_tlb_range(vma, start, end);
++}
++
++#define adjust_page_ref_count(page, extra) \
++	page_ref_add(page, extra)
++
++#else  /* PAGE_MMUSHIFT 0 */
++
++static inline int prepare_pte_cluster(pte_t *cluster[],
++	struct vm_area_struct *vma,
++	unsigned long address, pte_t *ptep, int wide)
++{
++	cluster[0] = ptep;
++	return 0;
++}
++
++/*
++ * Calling convention different if !PAGE_MMUSHIFT: page always passed in.
++ *
++ * Check if this is a private page that can be reused for COW.
++ */
++static inline struct page *private_cluster_page(pte_t *cluster[],
++						struct page *page)
++{
++	struct folio *folio = page_folio(page);
++	int doing_wp = pte_present(*cluster[0]);
++	int count;
++
++	if (PageReserved(page))
++		return NULL;
++	if (folio_test_swapcache(folio)) {
++		if (doing_wp) {
++			if (!folio_trylock(folio))
++				return NULL;
++			if (!folio_test_swapcache(folio)) {
++				folio_unlock(folio);
++				return NULL;
++			}
++		}
++		count = page_count(page) + swp_swapcount(folio->swap) - 3;
++		if (doing_wp)
++			folio_unlock(folio);
++		else
++			count--;	/* swap not yet freed */
++	} else {
++		count = page_count(page) - 1;
++	}
++	return count ? NULL : page;
++}
++
++#define private_cluster_page_xchg(cluster, new_page) \
++	(new_page)
++
++#define restrict_pte_cluster(cluster, vma, address, ptep) \
++	do {} while (0)
++
++static inline void copy_pte_cluster(pte_t *cluster[], struct page *dst_page,
++	struct page *src_page, unsigned long address)
++{
++	if (src_page == ZERO_PAGE(address)) {
++		clear_highpage(dst_page);
++	} else {
++		copy_highpage(dst_page, src_page);
++	}
++}
++
++static inline unsigned long set_pte_cluster(pte_t *cluster[], pte_t pte)
++{
++	set_ptes(NULL, 0, cluster[0], pte, 1);
++	return 1;
++}
++
++#define flush_pte_cluster(cluster, vma, address) \
++	flush_tlb_page((vma), (address))
++
++#define adjust_page_ref_count(page, extra) \
++	do {} while (0)
++
++#endif /* PAGE_MMUSHIFT 0 */
++
++#endif /* _LINUX_PTE_CLUSTER_H */
+diff --git a/include/linux/rmap.h b/include/linux/rmap.h
+index 8dc0871e5f00..8675378d588f 100644
+--- a/include/linux/rmap.h
++++ b/include/linux/rmap.h
+@@ -144,9 +144,16 @@ static inline void __folio_large_mapcount_sanity_checks(const struct folio *foli
+ 	 * folio in a single MM as "exclusively mapped". This is primarily
+ 	 * a check on 32bit, where we currently reduce the size of the per-MM
+ 	 * mapcount to a short.
++	 *
++	 * PGCL: mapcount counts hardware (MMUPAGE) PTEs, so a fully PTE-mapped
++	 * folio has folio_large_nr_pages() * PAGE_MMUCOUNT mappings and a
++	 * single add may carry up to one cluster's PAGE_MMUCOUNT sub-PTEs.
++	 * PAGE_MMUCOUNT == 1 at PAGE_MMUSHIFT == 0, so this is the mainline
++	 * bound there (Newton limit).
+ 	 */
+-	VM_WARN_ON_ONCE(diff > folio_large_nr_pages(folio));
+-	VM_WARN_ON_ONCE(folio_large_nr_pages(folio) - 1 > MM_ID_MAPCOUNT_MAX);
++	VM_WARN_ON_ONCE(diff > folio_large_nr_pages(folio) * PAGE_MMUCOUNT);
++	VM_WARN_ON_ONCE(folio_large_nr_pages(folio) * PAGE_MMUCOUNT - 1 >
++			MM_ID_MAPCOUNT_MAX);
+ 
+ 	VM_WARN_ON_ONCE(folio_mm_id(folio, 0) == MM_ID_DUMMY &&
+ 			folio->_mm_id_mapcount[0] != -1);
+@@ -421,6 +428,13 @@ void folio_remove_rmap_ptes(struct folio *, struct page *, int nr_pages,
+ 		struct vm_area_struct *);
+ #define folio_remove_rmap_pte(folio, page, vma) \
+ 	folio_remove_rmap_ptes(folio, page, 1, vma)
++#if PAGE_MMUSHIFT
++/* PGCL: add/remove @count MMUPAGE sub-PTE mappings of ONE kernel page (cluster) */
++void folio_add_rmap_subptes(struct folio *, struct page *, int count,
++		struct vm_area_struct *);
++void folio_remove_rmap_subptes(struct folio *, struct page *, int count,
++		struct vm_area_struct *);
++#endif
+ void folio_remove_rmap_pmd(struct folio *, struct page *,
+ 		struct vm_area_struct *);
+ void folio_remove_rmap_pud(struct folio *, struct page *,
+@@ -871,6 +885,19 @@ struct page_vma_mapped_walk {
+ 	pte_t *pte;
+ 	spinlock_t *ptl;
+ 	unsigned int flags;
++	/*
++	 * Number of consecutive MMUPAGE PTEs at @pte that the current yield
++	 * covers.  For non-PGCL builds (PAGE_MMUSHIFT == 0) always 1.  For
++	 * PGCL the walker yields one kernel page at a time and populates
++	 * this with the count of MMUPAGE PTEs (typically PAGE_MMUCOUNT, less
++	 * at VMA edges or for partial sub-page mappings via remap_file_pages).
++	 *
++	 * PTE-level operations (set_ptes, get_and_clear_ptes, TLB flush, RSS
++	 * accounting, refcount) should consume @nr_mmupages.  Struct-page
++	 * operations (rmap, _mapcount) should treat each yield as a single
++	 * kernel page.
++	 */
++	unsigned int nr_mmupages;
+ };
+ 
+ #define DEFINE_FOLIO_VMA_WALK(name, _folio, _vma, _address, _flags)	\
+@@ -881,6 +908,7 @@ struct page_vma_mapped_walk {
+ 		.vma = _vma,						\
+ 		.address = _address,					\
+ 		.flags = _flags,					\
++		.nr_mmupages = 1,					\
+ 	}
+ 
+ static inline void page_vma_mapped_walk_done(struct page_vma_mapped_walk *pvmw)
+diff --git a/include/vdso/datapage.h b/include/vdso/datapage.h
+index 5977723fb3b5..60de313bb1a8 100644
+--- a/include/vdso/datapage.h
++++ b/include/vdso/datapage.h
+@@ -164,8 +164,8 @@ extern struct vdso_time_data *vdso_k_time_data;
+ extern struct vdso_rng_data *vdso_k_rng_data;
+ extern struct vdso_arch_data *vdso_k_arch_data;
+ 
+-#define VDSO_ARCH_DATA_SIZE ALIGN(sizeof(struct vdso_arch_data), PAGE_SIZE)
+-#define VDSO_ARCH_DATA_PAGES (VDSO_ARCH_DATA_SIZE >> PAGE_SHIFT)
++#define VDSO_ARCH_DATA_SIZE ALIGN(sizeof(struct vdso_arch_data), MMUPAGE_SIZE)
++#define VDSO_ARCH_DATA_PAGES (VDSO_ARCH_DATA_SIZE >> MMUPAGE_SHIFT)
+ 
+ enum vdso_pages {
+ 	VDSO_TIME_PAGE_OFFSET,
+@@ -179,19 +179,19 @@ enum vdso_pages {
+ #else /* !__ASSEMBLY__ */
+ 
+ #ifdef CONFIG_VDSO_GETRANDOM
+-#define __vdso_u_rng_data	PROVIDE(vdso_u_rng_data = vdso_u_data + 2 * PAGE_SIZE);
++#define __vdso_u_rng_data	PROVIDE(vdso_u_rng_data = vdso_u_data + 2 * MMUPAGE_SIZE);
+ #else
+ #define __vdso_u_rng_data
+ #endif
+ 
+ #ifdef CONFIG_ARCH_HAS_VDSO_ARCH_DATA
+-#define __vdso_u_arch_data	PROVIDE(vdso_u_arch_data = vdso_u_data + 3 * PAGE_SIZE);
++#define __vdso_u_arch_data	PROVIDE(vdso_u_arch_data = vdso_u_data + 3 * MMUPAGE_SIZE);
+ #else
+ #define __vdso_u_arch_data
+ #endif
+ 
+ #define VDSO_VVAR_SYMS						\
+-	PROVIDE(vdso_u_data = . - __VDSO_PAGES * PAGE_SIZE);	\
++	PROVIDE(vdso_u_data = . - __VDSO_PAGES * MMUPAGE_SIZE);	\
+ 	PROVIDE(vdso_u_time_data = vdso_u_data);		\
+ 	__vdso_u_rng_data					\
+ 	__vdso_u_arch_data					\
+diff --git a/include/vdso/page.h b/include/vdso/page.h
+index bc47186c07fc..f898f2fbe0a1 100644
+--- a/include/vdso/page.h
++++ b/include/vdso/page.h
+@@ -5,25 +5,43 @@
+ #include <uapi/linux/const.h>
+ 
+ /*
+- * PAGE_SHIFT determines the page size.
++ * MMUPAGE_SHIFT is the hardware MMU page shift (from arch Kconfig).
++ * PAGE_MMUSHIFT is the extra shift for page clustering (Hugh Dickins, 2001).
++ * PAGE_SHIFT = MMUPAGE_SHIFT + PAGE_MMUSHIFT.
+  *
+- * Note: This definition is required because PAGE_SHIFT is used
+- * in several places throughout the codebase.
++ * When PAGE_MMUSHIFT == 0 (default), PAGE_SIZE == MMUPAGE_SIZE and the
++ * kernel behaves identically to a stock configuration.
++ *
++ * When PAGE_MMUSHIFT > 0, the kernel allocates memory in PAGE_SIZE
++ * chunks but maps individual MMUPAGE_SIZE PTEs to userspace, preserving
++ * the standard TLB/MMU base page ABI.
+  */
+-#define PAGE_SHIFT      CONFIG_PAGE_SHIFT
++#define MMUPAGE_SHIFT	CONFIG_PAGE_SHIFT
++#define PAGE_MMUSHIFT	CONFIG_PAGE_MMUSHIFT
++#define PAGE_MMUCOUNT	(_AC(1,UL) << PAGE_MMUSHIFT)
++
++#define MMUPAGE_SIZE	(_AC(1,UL) << MMUPAGE_SHIFT)
++
++#if !defined(CONFIG_64BIT)
++#define MMUPAGE_MASK	(~((1 << MMUPAGE_SHIFT) - 1))
++#else
++#define MMUPAGE_MASK	(~(MMUPAGE_SIZE - 1))
++#endif
++
++#define PAGE_SHIFT	(MMUPAGE_SHIFT + PAGE_MMUSHIFT)
+ 
+-#define PAGE_SIZE	(_AC(1,UL) << CONFIG_PAGE_SHIFT)
++#define PAGE_SIZE	(_AC(1,UL) << PAGE_SHIFT)
+ 
+ #if !defined(CONFIG_64BIT)
+ /*
+  * Applies only to 32-bit architectures.
+  *
+- * Subtle: (1 << CONFIG_PAGE_SHIFT) is an int, not an unsigned long.
++ * Subtle: (1 << PAGE_SHIFT) is an int, not an unsigned long.
+  * So if we assign PAGE_MASK to a larger type it gets extended the
+  * way we want (i.e. with 1s in the high bits) while masking a
+  * 64-bit value such as phys_addr_t.
+  */
+-#define PAGE_MASK	(~((1 << CONFIG_PAGE_SHIFT) - 1))
++#define PAGE_MASK	(~((1 << PAGE_SHIFT) - 1))
+ #else
+ #define PAGE_MASK	(~(PAGE_SIZE - 1))
+ #endif
+-- 
+2.54.0
+

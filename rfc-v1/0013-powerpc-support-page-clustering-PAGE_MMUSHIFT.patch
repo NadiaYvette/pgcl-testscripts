@@ -1,0 +1,804 @@
+From 7584987f81f7f1e8a3102f59bb3554b1e7de50b8 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:32 +0200
+Subject: [RFC PATCH 13/28] powerpc: support page clustering (PAGE_MMUSHIFT)
+
+---
+ arch/powerpc/Kconfig                         |  2 +-
+ arch/powerpc/include/asm/book3s/64/hash.h    |  2 +-
+ arch/powerpc/include/asm/book3s/64/pgtable.h | 10 ++--
+ arch/powerpc/include/asm/book3s/64/radix.h   |  2 +-
+ arch/powerpc/include/asm/elf.h               |  2 +-
+ arch/powerpc/include/asm/shmparam.h          |  2 +-
+ arch/powerpc/include/asm/sparsemem.h         |  2 +-
+ arch/powerpc/include/asm/thread_info.h       |  2 +-
+ arch/powerpc/kernel/head_book3s_32.S         |  9 ++-
+ arch/powerpc/kernel/irq.c                    | 15 +++--
+ arch/powerpc/kernel/misc_32.S                |  4 +-
+ arch/powerpc/kernel/misc_64.S                |  4 +-
+ arch/powerpc/kernel/switch.S                 |  3 +-
+ arch/powerpc/kernel/syscalls.c               |  6 +-
+ arch/powerpc/kernel/vdso.c                   |  6 +-
+ arch/powerpc/kernel/vmlinux.lds.S            |  4 +-
+ arch/powerpc/kvm/book3s_hv_rmhandlers.S      |  3 +-
+ arch/powerpc/lib/code-patching.c             | 58 ++++++++++++--------
+ arch/powerpc/mm/book3s64/radix_pgtable.c     | 22 ++++----
+ arch/powerpc/mm/book3s64/radix_tlb.c         |  8 +--
+ arch/powerpc/mm/nohash/tlb.c                 |  2 +-
+ arch/powerpc/mm/pgtable.c                    | 29 +++++++++-
+ arch/powerpc/mm/ptdump/hashpagetable.c       |  2 +-
+ arch/powerpc/mm/ptdump/ptdump.c              |  2 +-
+ arch/powerpc/platforms/cell/spufs/spufs.h    |  2 +-
+ arch/powerpc/platforms/powernv/opal-prd.c    |  2 +-
+ 26 files changed, 127 insertions(+), 78 deletions(-)
+
+diff --git a/arch/powerpc/Kconfig b/arch/powerpc/Kconfig
+index e93df95b79e7..f41b0b648759 100644
+--- a/arch/powerpc/Kconfig
++++ b/arch/powerpc/Kconfig
+@@ -917,7 +917,7 @@ config ARCH_FORCE_MAX_ORDER
+ 	int "Order of maximal physically contiguous allocations"
+ 	range 7 8 if PPC64 && PPC_64K_PAGES
+ 	default "8" if PPC64 && PPC_64K_PAGES
+-	range 12 12 if PPC64 && !PPC_64K_PAGES
++	range 8 12 if PPC64 && !PPC_64K_PAGES
+ 	default "12" if PPC64 && !PPC_64K_PAGES
+ 	range 8 10 if PPC32 && PPC_16K_PAGES
+ 	default "8" if PPC32 && PPC_16K_PAGES
+diff --git a/arch/powerpc/include/asm/book3s/64/hash.h b/arch/powerpc/include/asm/book3s/64/hash.h
+index 5a8cbd496731..5d10e6a9c8d1 100644
+--- a/arch/powerpc/include/asm/book3s/64/hash.h
++++ b/arch/powerpc/include/asm/book3s/64/hash.h
+@@ -32,7 +32,7 @@
+  * Size of EA range mapped by our pagetables.
+  */
+ #define H_PGTABLE_EADDR_SIZE	(H_PTE_INDEX_SIZE + H_PMD_INDEX_SIZE + \
+-				 H_PUD_INDEX_SIZE + H_PGD_INDEX_SIZE + PAGE_SHIFT)
++				 H_PUD_INDEX_SIZE + H_PGD_INDEX_SIZE + MMUPAGE_SHIFT)
+ #define H_PGTABLE_RANGE		(ASM_CONST(1) << H_PGTABLE_EADDR_SIZE)
+ /*
+  * Top 2 bits are ignored in page table walk.
+diff --git a/arch/powerpc/include/asm/book3s/64/pgtable.h b/arch/powerpc/include/asm/book3s/64/pgtable.h
+index e67e64ac6e8c..2bdf93af0d69 100644
+--- a/arch/powerpc/include/asm/book3s/64/pgtable.h
++++ b/arch/powerpc/include/asm/book3s/64/pgtable.h
+@@ -100,7 +100,7 @@
+  * we are limited by _PAGE_PA_MAX. Clear everything above _PAGE_PA_MAX
+  * and every thing below PAGE_SHIFT;
+  */
+-#define PTE_RPN_MASK	(((1UL << _PAGE_PA_MAX) - 1) & (PAGE_MASK))
++#define PTE_RPN_MASK	(((1UL << _PAGE_PA_MAX) - 1) & (MMUPAGE_MASK))
+ #define PTE_RPN_SHIFT	PAGE_SHIFT
+ /*
+  * set of bits not changed in pmd_modify. Even though we have hash specific bits
+@@ -130,7 +130,7 @@
+  * pages. We always set _PAGE_COHERENT when SMP is enabled or
+  * the processor might need it for DMA coherency.
+  */
+-#define _PAGE_BASE_NC	(_PAGE_PRESENT | _PAGE_ACCESSED)
++#define _PAGE_BASE_NC	(_PAGE_PRESENT | _PAGE_ACCESSED | _PAGE_PTE)
+ #define _PAGE_BASE	(_PAGE_BASE_NC)
+ 
+ #include <asm/pgtable-masks.h>
+@@ -205,7 +205,7 @@ extern unsigned long __pmd_frag_size_shift;
+ 				       H_PGD_INDEX_SIZE : RADIX_PGD_INDEX_SIZE))
+ 
+ /* PMD_SHIFT determines what a second-level page table entry can map */
+-#define PMD_SHIFT	(PAGE_SHIFT + PTE_INDEX_SIZE)
++#define PMD_SHIFT	(MMUPAGE_SHIFT + PTE_INDEX_SIZE)
+ #define PMD_SIZE	(1UL << PMD_SHIFT)
+ #define PMD_MASK	(~(PMD_SIZE-1))
+ 
+@@ -645,9 +645,9 @@ static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
+ #define SWP_TYPE_BITS 5
+ #define SWP_TYPE_MASK		((1UL << SWP_TYPE_BITS) - 1)
+ #define __swp_type(x)		((x).val & SWP_TYPE_MASK)
+-#define __swp_offset(x)		(((x).val & PTE_RPN_MASK) >> PAGE_SHIFT)
++#define __swp_offset(x)		(((x).val & PTE_RPN_MASK) >> MMUPAGE_SHIFT)
+ #define __swp_entry(type, offset)	((swp_entry_t) { \
+-				(type) | (((offset) << PAGE_SHIFT) & PTE_RPN_MASK)})
++				(type) | (((offset) << MMUPAGE_SHIFT) & PTE_RPN_MASK)})
+ /*
+  * swp_entry_t must be independent of pte bits. We build a swp_entry_t from
+  * swap type and offset we get from swap and convert that to pte to find a
+diff --git a/arch/powerpc/include/asm/book3s/64/radix.h b/arch/powerpc/include/asm/book3s/64/radix.h
+index da954e779744..45850f2698ee 100644
+--- a/arch/powerpc/include/asm/book3s/64/radix.h
++++ b/arch/powerpc/include/asm/book3s/64/radix.h
+@@ -44,7 +44,7 @@
+  * Size of EA range mapped by our pagetables.
+  */
+ #define RADIX_PGTABLE_EADDR_SIZE (RADIX_PTE_INDEX_SIZE + RADIX_PMD_INDEX_SIZE +	\
+-			      RADIX_PUD_INDEX_SIZE + RADIX_PGD_INDEX_SIZE + PAGE_SHIFT)
++			      RADIX_PUD_INDEX_SIZE + RADIX_PGD_INDEX_SIZE + MMUPAGE_SHIFT)
+ #define RADIX_PGTABLE_RANGE (ASM_CONST(1) << RADIX_PGTABLE_EADDR_SIZE)
+ 
+ /*
+diff --git a/arch/powerpc/include/asm/elf.h b/arch/powerpc/include/asm/elf.h
+index bb4b94444d3e..492a455e36da 100644
+--- a/arch/powerpc/include/asm/elf.h
++++ b/arch/powerpc/include/asm/elf.h
+@@ -17,7 +17,7 @@
+ #define compat_elf_check_arch(x)	((x)->e_machine == EM_PPC)
+ 
+ #define CORE_DUMP_USE_REGSET
+-#define ELF_EXEC_PAGESIZE	PAGE_SIZE
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ 
+ /*
+  * This is the base location for PIE (ET_DYN with INTERP) loads. On
+diff --git a/arch/powerpc/include/asm/shmparam.h b/arch/powerpc/include/asm/shmparam.h
+index bc0968839565..af9b7a13993e 100644
+--- a/arch/powerpc/include/asm/shmparam.h
++++ b/arch/powerpc/include/asm/shmparam.h
+@@ -2,6 +2,6 @@
+ #ifndef _ASM_POWERPC_SHMPARAM_H
+ #define _ASM_POWERPC_SHMPARAM_H
+ 
+-#define	SHMLBA PAGE_SIZE		 /* attach addr a multiple of this */
++#define	SHMLBA MMUPAGE_SIZE		 /* attach addr a multiple of this */
+ 
+ #endif	/* _ASM_POWERPC_SHMPARAM_H */
+diff --git a/arch/powerpc/include/asm/sparsemem.h b/arch/powerpc/include/asm/sparsemem.h
+index d072866842e4..e0a202fb8db5 100644
+--- a/arch/powerpc/include/asm/sparsemem.h
++++ b/arch/powerpc/include/asm/sparsemem.h
+@@ -8,7 +8,7 @@
+  * SECTION_SIZE_BITS		2^N: how big each section will be
+  * MAX_PHYSMEM_BITS		2^N: how much memory we can have in that space
+  */
+-#define SECTION_SIZE_BITS       24
++#define SECTION_SIZE_BITS       (24 + PAGE_MMUSHIFT)
+ 
+ #endif /* CONFIG_SPARSEMEM */
+ 
+diff --git a/arch/powerpc/include/asm/thread_info.h b/arch/powerpc/include/asm/thread_info.h
+index 97f35f9b1a96..7685b2317822 100644
+--- a/arch/powerpc/include/asm/thread_info.h
++++ b/arch/powerpc/include/asm/thread_info.h
+@@ -20,7 +20,7 @@
+ #define MIN_THREAD_SHIFT	CONFIG_THREAD_SHIFT
+ #endif
+ 
+-#if defined(CONFIG_VMAP_STACK) && MIN_THREAD_SHIFT < PAGE_SHIFT
++#if MIN_THREAD_SHIFT < PAGE_SHIFT
+ #define THREAD_SHIFT		PAGE_SHIFT
+ #else
+ #define THREAD_SHIFT		MIN_THREAD_SHIFT
+diff --git a/arch/powerpc/kernel/head_book3s_32.S b/arch/powerpc/kernel/head_book3s_32.S
+index c1779455ea32..9f67896c022a 100644
+--- a/arch/powerpc/kernel/head_book3s_32.S
++++ b/arch/powerpc/kernel/head_book3s_32.S
+@@ -832,7 +832,9 @@ __secondary_start:
+ 	lwz	r1,TASK_STACK(r1)
+ 
+ 	/* stack */
+-	addi	r1,r1,THREAD_SIZE-STACK_FRAME_MIN_SIZE
++	lis	r0,(THREAD_SIZE-STACK_FRAME_MIN_SIZE)@h
++	ori	r0,r0,(THREAD_SIZE-STACK_FRAME_MIN_SIZE)@l
++	add	r1,r1,r0
+ 	li	r0,0
+ 	tophys(r3,r1)
+ 	stw	r0,0(r3)
+@@ -959,8 +961,11 @@ END_MMU_FTR_SECTION_IFCLR(MMU_FTR_HPTE_TABLE)
+ 	/* stack */
+ 	lis	r1,init_thread_union@ha
+ 	addi	r1,r1,init_thread_union@l
++	lis	r0,(THREAD_SIZE-STACK_FRAME_MIN_SIZE)@h
++	ori	r0,r0,(THREAD_SIZE-STACK_FRAME_MIN_SIZE)@l
++	add	r1,r1,r0
+ 	li	r0,0
+-	stwu	r0,THREAD_SIZE-STACK_FRAME_MIN_SIZE(r1)
++	stw	r0,0(r1)
+ /*
+  * Do early platform-specific initialization,
+  * and set up the MMU.
+diff --git a/arch/powerpc/kernel/irq.c b/arch/powerpc/kernel/irq.c
+index a0e8b998c9b5..098365d26bea 100644
+--- a/arch/powerpc/kernel/irq.c
++++ b/arch/powerpc/kernel/irq.c
+@@ -203,9 +203,11 @@ static inline void check_stack_overflow(unsigned long sp)
+ static __always_inline void call_do_softirq(const void *sp)
+ {
+ 	/* Temporarily switch r1 to sp, call __do_softirq() then restore r1. */
++	const void *newsp = (const char *)sp + THREAD_SIZE - STACK_FRAME_MIN_SIZE;
++
+ 	asm volatile (
+-		 PPC_STLU "	%%r1, %[offset](%[sp])	;"
+-		"mr		%%r1, %[sp]		;"
++		 PPC_STL "	%%r1, 0(%[newsp])	;"
++		"mr		%%r1, %[newsp]		;"
+ #ifdef CONFIG_PPC_KERNEL_PCREL
+ 		"bl		%[callee]@notoc		;"
+ #else
+@@ -214,7 +216,7 @@ static __always_inline void call_do_softirq(const void *sp)
+ 		 PPC_LL "	%%r1, 0(%%r1)		;"
+ 		 : // Outputs
+ 		 : // Inputs
+-		   [sp] "b" (sp), [offset] "i" (THREAD_SIZE - STACK_FRAME_MIN_SIZE),
++		   [newsp] "b" (newsp),
+ 		   [callee] "i" (__do_softirq)
+ 		 : // Clobbers
+ 		   "lr", "xer", "ctr", "memory", "cr0", "cr1", "cr5", "cr6",
+@@ -257,12 +259,13 @@ static void __do_irq(struct pt_regs *regs, unsigned long oldsp)
+ static __always_inline void call_do_irq(struct pt_regs *regs, void *sp)
+ {
+ 	register unsigned long r3 asm("r3") = (unsigned long)regs;
++	void *newsp = (char *)sp + THREAD_SIZE - STACK_FRAME_MIN_SIZE;
+ 
+ 	/* Temporarily switch r1 to sp, call __do_irq() then restore r1. */
+ 	asm volatile (
+-		 PPC_STLU "	%%r1, %[offset](%[sp])	;"
++		 PPC_STL "	%%r1, 0(%[newsp])	;"
+ 		"mr		%%r4, %%r1		;"
+-		"mr		%%r1, %[sp]		;"
++		"mr		%%r1, %[newsp]		;"
+ #ifdef CONFIG_PPC_KERNEL_PCREL
+ 		"bl		%[callee]@notoc		;"
+ #else
+@@ -272,7 +275,7 @@ static __always_inline void call_do_irq(struct pt_regs *regs, void *sp)
+ 		 : // Outputs
+ 		   "+r" (r3)
+ 		 : // Inputs
+-		   [sp] "b" (sp), [offset] "i" (THREAD_SIZE - STACK_FRAME_MIN_SIZE),
++		   [newsp] "b" (newsp),
+ 		   [callee] "i" (__do_irq)
+ 		 : // Clobbers
+ 		   "lr", "xer", "ctr", "memory", "cr0", "cr1", "cr5", "cr6",
+diff --git a/arch/powerpc/kernel/misc_32.S b/arch/powerpc/kernel/misc_32.S
+index acb727f54e9d..f5a205ecc8db 100644
+--- a/arch/powerpc/kernel/misc_32.S
++++ b/arch/powerpc/kernel/misc_32.S
+@@ -316,7 +316,9 @@ EXPORT_SYMBOL(__bswapdi2)
+ _GLOBAL(start_secondary_resume)
+ 	/* Reset stack */
+ 	rlwinm	r1, r1, 0, 0, 31 - THREAD_SHIFT
+-	addi	r1,r1,THREAD_SIZE-STACK_FRAME_MIN_SIZE
++	lis	r0,(THREAD_SIZE-STACK_FRAME_MIN_SIZE)@h
++	ori	r0,r0,(THREAD_SIZE-STACK_FRAME_MIN_SIZE)@l
++	add	r1,r1,r0
+ 	li	r3,0
+ 	stw	r3,0(r1)		/* Zero the stack frame pointer	*/
+ 	bl	start_secondary
+diff --git a/arch/powerpc/kernel/misc_64.S b/arch/powerpc/kernel/misc_64.S
+index a997c7f43dc0..b4285d561f05 100644
+--- a/arch/powerpc/kernel/misc_64.S
++++ b/arch/powerpc/kernel/misc_64.S
+@@ -386,7 +386,9 @@ _GLOBAL(kexec_sequence)
+ 	std	r0,16(r1)
+ 
+ 	/* switch stacks to newstack -- &kexec_stack.stack */
+-	stdu	r1,THREAD_SIZE-STACK_FRAME_MIN_SIZE(r3)
++	LOAD_REG_IMMEDIATE(r0, THREAD_SIZE-STACK_FRAME_MIN_SIZE)
++	add	r3,r3,r0
++	std	r1,0(r3)
+ 	mr	r1,r3
+ 
+ 	li	r0,0
+diff --git a/arch/powerpc/kernel/switch.S b/arch/powerpc/kernel/switch.S
+index 59e3ee99db0e..293697653691 100644
+--- a/arch/powerpc/kernel/switch.S
++++ b/arch/powerpc/kernel/switch.S
+@@ -166,7 +166,8 @@ END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_207S)
+ #endif
+ 	/* Set new PACAKSAVE */
+ 	clrrdi	r7,r8,THREAD_SHIFT	/* base of new stack */
+-	addi	r7,r7,THREAD_SIZE-SWITCH_FRAME_SIZE
++	LOAD_REG_IMMEDIATE(r0, THREAD_SIZE-SWITCH_FRAME_SIZE)
++	add	r7,r7,r0
+ 	std	r7,PACAKSAVE(r13)
+ 
+ #ifdef CONFIG_PPC_64S_HASH_MMU
+diff --git a/arch/powerpc/kernel/syscalls.c b/arch/powerpc/kernel/syscalls.c
+index 68ebb23a5af4..51bf3266ecd5 100644
+--- a/arch/powerpc/kernel/syscalls.c
++++ b/arch/powerpc/kernel/syscalls.c
+@@ -53,7 +53,7 @@ SYSCALL_DEFINE6(mmap2, unsigned long, addr, size_t, len,
+ 		unsigned long, prot, unsigned long, flags,
+ 		unsigned long, fd, unsigned long, pgoff)
+ {
+-	return do_mmap2(addr, len, prot, flags, fd, pgoff, PAGE_SHIFT-12);
++	return do_mmap2(addr, len, prot, flags, fd, pgoff, MMUPAGE_SHIFT-12);
+ }
+ 
+ #ifdef CONFIG_COMPAT
+@@ -62,7 +62,7 @@ COMPAT_SYSCALL_DEFINE6(mmap2,
+ 		       unsigned long, prot, unsigned long, flags,
+ 		       unsigned long, fd, unsigned long, off_4k)
+ {
+-	return do_mmap2(addr, len, prot, flags, fd, off_4k, PAGE_SHIFT-12);
++	return do_mmap2(addr, len, prot, flags, fd, off_4k, MMUPAGE_SHIFT-12);
+ }
+ #endif
+ 
+@@ -70,7 +70,7 @@ SYSCALL_DEFINE6(mmap, unsigned long, addr, size_t, len,
+ 		unsigned long, prot, unsigned long, flags,
+ 		unsigned long, fd, off_t, offset)
+ {
+-	return do_mmap2(addr, len, prot, flags, fd, offset, PAGE_SHIFT);
++	return do_mmap2(addr, len, prot, flags, fd, offset, MMUPAGE_SHIFT);
+ }
+ 
+ #ifdef CONFIG_PPC64
+diff --git a/arch/powerpc/kernel/vdso.c b/arch/powerpc/kernel/vdso.c
+index d3ef251048c9..74bb1a9fc0c0 100644
+--- a/arch/powerpc/kernel/vdso.c
++++ b/arch/powerpc/kernel/vdso.c
+@@ -99,7 +99,7 @@ static int __arch_setup_additional_pages(struct linux_binprm *bprm, int uses_int
+ {
+ 	unsigned long vdso_size, vdso_base, mappings_size;
+ 	struct vm_special_mapping *vdso_spec;
+-	unsigned long vvar_size = VDSO_NR_PAGES * PAGE_SIZE;
++	unsigned long vvar_size = VDSO_NR_PAGES * MMUPAGE_SIZE;
+ 	struct mm_struct *mm = current->mm;
+ 	struct vm_area_struct *vma;
+ 
+@@ -243,14 +243,14 @@ static struct page ** __init vdso_setup_pages(void *start, void *end)
+ {
+ 	int i;
+ 	struct page **pagelist;
+-	int pages = (end - start) >> PAGE_SHIFT;
++	int pages = (end - start) >> MMUPAGE_SHIFT;
+ 
+ 	pagelist = kzalloc_objs(struct page *, pages + 1);
+ 	if (!pagelist)
+ 		panic("%s: Cannot allocate page list for VDSO", __func__);
+ 
+ 	for (i = 0; i < pages; i++)
+-		pagelist[i] = virt_to_page(start + i * PAGE_SIZE);
++		pagelist[i] = virt_to_page(start + i * MMUPAGE_SIZE);
+ 
+ 	return pagelist;
+ }
+diff --git a/arch/powerpc/kernel/vmlinux.lds.S b/arch/powerpc/kernel/vmlinux.lds.S
+index 8fc11d6565bf..6ffc012520ef 100644
+--- a/arch/powerpc/kernel/vmlinux.lds.S
++++ b/arch/powerpc/kernel/vmlinux.lds.S
+@@ -27,8 +27,8 @@
+ 
+ #define STRICT_ALIGN_SIZE	(1 << CONFIG_DATA_SHIFT)
+ 
+-#if STRICT_ALIGN_SIZE < PAGE_SIZE
+-#error "CONFIG_DATA_SHIFT must be >= PAGE_SHIFT"
++#if STRICT_ALIGN_SIZE < MMUPAGE_SIZE
++#error "CONFIG_DATA_SHIFT must be >= MMUPAGE_SHIFT"
+ #endif
+ 
+ ENTRY(_stext)
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 83f7504349d2..697c9236a5f4 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -2691,7 +2691,8 @@ kvmppc_bad_host_intr:
+ 	mr	r9, r1
+ 	std	r1, PACAR1(r13)
+ 	ld	r1, PACAEMERGSP(r13)
+-	subi	r1, r1, THREAD_SIZE/2 + INT_FRAME_SIZE
++	LOAD_REG_IMMEDIATE(r0, THREAD_SIZE/2 + INT_FRAME_SIZE)
++	sub	r1, r1, r0
+ 	std	r9, 0(r1)
+ 	std	r0, GPR0(r1)
+ 	std	r9, GPR1(r1)
+diff --git a/arch/powerpc/lib/code-patching.c b/arch/powerpc/lib/code-patching.c
+index f84e0337cc02..b8a034cdb11a 100644
+--- a/arch/powerpc/lib/code-patching.c
++++ b/arch/powerpc/lib/code-patching.c
+@@ -108,7 +108,7 @@ static int text_area_cpu_up(unsigned int cpu)
+ 	unsigned long addr;
+ 	int err;
+ 
+-	area = get_vm_area(PAGE_SIZE, 0);
++	area = get_vm_area(MMUPAGE_SIZE, 0);
+ 	if (!area) {
+ 		WARN_ONCE(1, "Failed to create text area for cpu %d\n",
+ 			cpu);
+@@ -144,7 +144,7 @@ static void put_patching_mm(struct mm_struct *mm, unsigned long patching_addr)
+ 	struct mmu_gather tlb;
+ 
+ 	tlb_gather_mmu(&tlb, mm);
+-	free_pgd_range(&tlb, patching_addr, patching_addr + PAGE_SIZE, 0, 0);
++	free_pgd_range(&tlb, patching_addr, patching_addr + MMUPAGE_SIZE, 0, 0);
+ 	mmput(mm);
+ }
+ 
+@@ -164,7 +164,7 @@ static int text_area_cpu_up_mm(unsigned int cpu)
+ 	 * [PAGE_SIZE .. DEFAULT_MAP_WINDOW - PAGE_SIZE].
+ 	 * The lower address bound is PAGE_SIZE to avoid the zero-page.
+ 	 */
+-	addr = (1 + (get_random_long() % (DEFAULT_MAP_WINDOW / PAGE_SIZE - 2))) << PAGE_SHIFT;
++	addr = (1 + (get_random_long() % (DEFAULT_MAP_WINDOW / MMUPAGE_SIZE - 2))) << MMUPAGE_SHIFT;
+ 
+ 	/*
+ 	 * PTE allocation uses GFP_KERNEL which means we need to
+@@ -225,12 +225,22 @@ void __init poking_init(void)
+ 	static_branch_enable(&poking_init_done);
+ }
+ 
++/*
++ * Return MMUPAGE-granular PFN for the hardware page containing addr.
++ * pfn_pte() expects PAGE-granular PFNs, but code-patching maps a single
++ * MMUPAGE via __set_pte_at, so we construct the PTE directly using
++ * (pfn << MMUPAGE_SHIFT) to get the correct physical address.
++ */
+ static unsigned long get_patch_pfn(void *addr)
+ {
+-	if (IS_ENABLED(CONFIG_EXECMEM) && is_vmalloc_or_module_addr(addr))
+-		return vmalloc_to_pfn(addr);
+-	else
+-		return __pa_symbol(addr) >> PAGE_SHIFT;
++	if (IS_ENABLED(CONFIG_EXECMEM) && is_vmalloc_or_module_addr(addr)) {
++		struct page *page = vmalloc_to_page(addr);
++		unsigned long pa = page_to_phys(page) +
++			offset_in_page((unsigned long)addr);
++		return pa >> MMUPAGE_SHIFT;
++	} else {
++		return __pa_symbol(addr) >> MMUPAGE_SHIFT;
++	}
+ }
+ 
+ /*
+@@ -240,7 +250,7 @@ static int map_patch_area(void *addr, unsigned long text_poke_addr)
+ {
+ 	unsigned long pfn = get_patch_pfn(addr);
+ 
+-	return map_kernel_page(text_poke_addr, (pfn << PAGE_SHIFT), PAGE_KERNEL);
++	return map_kernel_page(text_poke_addr, (pfn << MMUPAGE_SHIFT), PAGE_KERNEL);
+ }
+ 
+ static void unmap_patch_area(unsigned long addr)
+@@ -275,7 +285,7 @@ static void unmap_patch_area(unsigned long addr)
+ 	 * In hash, pte_clear flushes the tlb, in radix, we have to
+ 	 */
+ 	pte_clear(&init_mm, addr, ptep);
+-	flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
++	flush_tlb_kernel_range(addr, addr + MMUPAGE_SIZE);
+ }
+ 
+ static int __do_patch_mem_mm(void *addr, unsigned long val, bool is_dword)
+@@ -291,13 +301,13 @@ static int __do_patch_mem_mm(void *addr, unsigned long val, bool is_dword)
+ 
+ 	patching_mm = __this_cpu_read(cpu_patching_context.mm);
+ 	text_poke_addr = __this_cpu_read(cpu_patching_context.addr);
+-	patch_addr = (u32 *)(text_poke_addr + offset_in_page(addr));
++	patch_addr = (u32 *)(text_poke_addr + ((unsigned long)(addr) & ~MMUPAGE_MASK));
+ 
+ 	pte = get_locked_pte(patching_mm, text_poke_addr, &ptl);
+ 	if (!pte)
+ 		return -ENOMEM;
+ 
+-	__set_pte_at(patching_mm, text_poke_addr, pte, pfn_pte(pfn, PAGE_KERNEL), 0);
++	__set_pte_at(patching_mm, text_poke_addr, pte, __pte(((pte_basic_t)pfn << MMUPAGE_SHIFT) | pgprot_val(PAGE_KERNEL) | _PAGE_PTE), 0);
+ 
+ 	/* order PTE update before use, also serves as the hwsync */
+ 	asm volatile("ptesync": : :"memory");
+@@ -332,11 +342,11 @@ static int __do_patch_mem(void *addr, unsigned long val, bool is_dword)
+ 	pte_t *pte;
+ 	unsigned long pfn = get_patch_pfn(addr);
+ 
+-	text_poke_addr = (unsigned long)__this_cpu_read(cpu_patching_context.addr) & PAGE_MASK;
+-	patch_addr = (u32 *)(text_poke_addr + offset_in_page(addr));
++	text_poke_addr = (unsigned long)__this_cpu_read(cpu_patching_context.addr) & MMUPAGE_MASK;
++	patch_addr = (u32 *)(text_poke_addr + ((unsigned long)(addr) & ~MMUPAGE_MASK));
+ 
+ 	pte = __this_cpu_read(cpu_patching_context.pte);
+-	__set_pte_at(&init_mm, text_poke_addr, pte, pfn_pte(pfn, PAGE_KERNEL), 0);
++	__set_pte_at(&init_mm, text_poke_addr, pte, __pte(((pte_basic_t)pfn << MMUPAGE_SHIFT) | pgprot_val(PAGE_KERNEL) | _PAGE_PTE), 0);
+ 	/* See ptesync comment in radix__set_pte_at() */
+ 	if (radix_enabled())
+ 		asm volatile("ptesync": : :"memory");
+@@ -344,7 +354,7 @@ static int __do_patch_mem(void *addr, unsigned long val, bool is_dword)
+ 	err = __patch_mem(addr, val, patch_addr, is_dword);
+ 
+ 	pte_clear(&init_mm, text_poke_addr, pte);
+-	flush_tlb_kernel_range(text_poke_addr, text_poke_addr + PAGE_SIZE);
++	flush_tlb_kernel_range(text_poke_addr, text_poke_addr + MMUPAGE_SIZE);
+ 
+ 	return err;
+ }
+@@ -463,7 +473,7 @@ static int __patch_instructions(u32 *patch_addr, u32 *code, size_t len, bool rep
+ 
+ /*
+  * A page is mapped and instructions that fit the page are patched.
+- * Assumes 'len' to be (PAGE_SIZE - offset_in_page(addr)) or below.
++ * Assumes 'len' to be (PAGE_SIZE - ((unsigned long)(addr) & ~MMUPAGE_MASK)) or below.
+  */
+ static int __do_patch_instructions_mm(u32 *addr, u32 *code, size_t len, bool repeat_instr)
+ {
+@@ -477,13 +487,13 @@ static int __do_patch_instructions_mm(u32 *addr, u32 *code, size_t len, bool rep
+ 
+ 	patching_mm = __this_cpu_read(cpu_patching_context.mm);
+ 	text_poke_addr = __this_cpu_read(cpu_patching_context.addr);
+-	patch_addr = (u32 *)(text_poke_addr + offset_in_page(addr));
++	patch_addr = (u32 *)(text_poke_addr + ((unsigned long)(addr) & ~MMUPAGE_MASK));
+ 
+ 	pte = get_locked_pte(patching_mm, text_poke_addr, &ptl);
+ 	if (!pte)
+ 		return -ENOMEM;
+ 
+-	__set_pte_at(patching_mm, text_poke_addr, pte, pfn_pte(pfn, PAGE_KERNEL), 0);
++	__set_pte_at(patching_mm, text_poke_addr, pte, __pte(((pte_basic_t)pfn << MMUPAGE_SHIFT) | pgprot_val(PAGE_KERNEL) | _PAGE_PTE), 0);
+ 
+ 	/* order PTE update before use, also serves as the hwsync */
+ 	asm volatile("ptesync" ::: "memory");
+@@ -514,7 +524,7 @@ static int __do_patch_instructions_mm(u32 *addr, u32 *code, size_t len, bool rep
+ 
+ /*
+  * A page is mapped and instructions that fit the page are patched.
+- * Assumes 'len' to be (PAGE_SIZE - offset_in_page(addr)) or below.
++ * Assumes 'len' to be (PAGE_SIZE - ((unsigned long)(addr) & ~MMUPAGE_MASK)) or below.
+  */
+ static int __do_patch_instructions(u32 *addr, u32 *code, size_t len, bool repeat_instr)
+ {
+@@ -524,11 +534,11 @@ static int __do_patch_instructions(u32 *addr, u32 *code, size_t len, bool repeat
+ 	pte_t *pte;
+ 	int err;
+ 
+-	text_poke_addr = (unsigned long)__this_cpu_read(cpu_patching_context.addr) & PAGE_MASK;
+-	patch_addr = (u32 *)(text_poke_addr + offset_in_page(addr));
++	text_poke_addr = (unsigned long)__this_cpu_read(cpu_patching_context.addr) & MMUPAGE_MASK;
++	patch_addr = (u32 *)(text_poke_addr + ((unsigned long)(addr) & ~MMUPAGE_MASK));
+ 
+ 	pte = __this_cpu_read(cpu_patching_context.pte);
+-	__set_pte_at(&init_mm, text_poke_addr, pte, pfn_pte(pfn, PAGE_KERNEL), 0);
++	__set_pte_at(&init_mm, text_poke_addr, pte, __pte(((pte_basic_t)pfn << MMUPAGE_SHIFT) | pgprot_val(PAGE_KERNEL) | _PAGE_PTE), 0);
+ 	/* See ptesync comment in radix__set_pte_at() */
+ 	if (radix_enabled())
+ 		asm volatile("ptesync" ::: "memory");
+@@ -536,7 +546,7 @@ static int __do_patch_instructions(u32 *addr, u32 *code, size_t len, bool repeat
+ 	err = __patch_instructions(patch_addr, code, len, repeat_instr);
+ 
+ 	pte_clear(&init_mm, text_poke_addr, pte);
+-	flush_tlb_kernel_range(text_poke_addr, text_poke_addr + PAGE_SIZE);
++	flush_tlb_kernel_range(text_poke_addr, text_poke_addr + MMUPAGE_SIZE);
+ 
+ 	return err;
+ }
+@@ -554,7 +564,7 @@ int patch_instructions(u32 *addr, u32 *code, size_t len, bool repeat_instr)
+ 		size_t plen;
+ 		int err;
+ 
+-		plen = min_t(size_t, PAGE_SIZE - offset_in_page(addr), len);
++		plen = min_t(size_t, MMUPAGE_SIZE - ((unsigned long)(addr) & ~MMUPAGE_MASK), len);
+ 
+ 		local_irq_save(flags);
+ 		if (mm_patch_enabled())
+diff --git a/arch/powerpc/mm/book3s64/radix_pgtable.c b/arch/powerpc/mm/book3s64/radix_pgtable.c
+index 10aced261cff..9231ce59f573 100644
+--- a/arch/powerpc/mm/book3s64/radix_pgtable.c
++++ b/arch/powerpc/mm/book3s64/radix_pgtable.c
+@@ -75,7 +75,6 @@ static int early_map_kernel_page(unsigned long ea, unsigned long pa,
+ 			  int nid,
+ 			  unsigned long region_start, unsigned long region_end)
+ {
+-	unsigned long pfn = pa >> PAGE_SHIFT;
+ 	pgd_t *pgdp;
+ 	p4d_t *p4dp;
+ 	pud_t *pudp;
+@@ -85,7 +84,7 @@ static int early_map_kernel_page(unsigned long ea, unsigned long pa,
+ 	pgdp = pgd_offset_k(ea);
+ 	p4dp = p4d_offset(pgdp, ea);
+ 	if (p4d_none(*p4dp)) {
+-		pudp = early_alloc_pgtable(PAGE_SIZE, nid,
++		pudp = early_alloc_pgtable(PUD_TABLE_SIZE, nid,
+ 					   region_start, region_end);
+ 		p4d_populate(&init_mm, p4dp, pudp);
+ 	}
+@@ -95,7 +94,7 @@ static int early_map_kernel_page(unsigned long ea, unsigned long pa,
+ 		goto set_the_pte;
+ 	}
+ 	if (pud_none(*pudp)) {
+-		pmdp = early_alloc_pgtable(PAGE_SIZE, nid, region_start,
++		pmdp = early_alloc_pgtable(PMD_TABLE_SIZE, nid, region_start,
+ 					   region_end);
+ 		pud_populate(&init_mm, pudp, pmdp);
+ 	}
+@@ -105,14 +104,15 @@ static int early_map_kernel_page(unsigned long ea, unsigned long pa,
+ 		goto set_the_pte;
+ 	}
+ 	if (!pmd_present(*pmdp)) {
+-		ptep = early_alloc_pgtable(PAGE_SIZE, nid,
++		ptep = early_alloc_pgtable(PTE_TABLE_SIZE, nid,
+ 						region_start, region_end);
+ 		pmd_populate_kernel(&init_mm, pmdp, ptep);
+ 	}
+ 	ptep = pte_offset_kernel(pmdp, ea);
+ 
+ set_the_pte:
+-	set_pte_at(&init_mm, ea, ptep, pfn_pte(pfn, flags));
++	set_pte_at(&init_mm, ea, ptep,
++		   __pte(__phys_to_pte_val(pa) | pgprot_val(flags) | _PAGE_PTE));
+ 	asm volatile("ptesync": : :"memory");
+ 	return 0;
+ }
+@@ -127,7 +127,6 @@ static int __map_kernel_page(unsigned long ea, unsigned long pa,
+ 			  int nid,
+ 			  unsigned long region_start, unsigned long region_end)
+ {
+-	unsigned long pfn = pa >> PAGE_SHIFT;
+ 	pgd_t *pgdp;
+ 	p4d_t *p4dp;
+ 	pud_t *pudp;
+@@ -172,7 +171,8 @@ static int __map_kernel_page(unsigned long ea, unsigned long pa,
+ 		return -ENOMEM;
+ 
+ set_the_pte:
+-	set_pte_at(&init_mm, ea, ptep, pfn_pte(pfn, flags));
++	set_pte_at(&init_mm, ea, ptep,
++		   __pte(__phys_to_pte_val(pa) | pgprot_val(flags) | _PAGE_PTE));
+ 	asm volatile("ptesync": : :"memory");
+ 	return 0;
+ }
+@@ -309,10 +309,10 @@ static int __meminit create_physical_mapping(unsigned long start,
+ 		max_mapping_size = mapping_sz_limit;
+ 
+ 	if (debug_pagealloc_enabled())
+-		max_mapping_size = PAGE_SIZE;
++		max_mapping_size = MMUPAGE_SIZE;
+ 
+-	start = ALIGN(start, PAGE_SIZE);
+-	end   = ALIGN_DOWN(end, PAGE_SIZE);
++	start = ALIGN(start, MMUPAGE_SIZE);
++	end   = ALIGN_DOWN(end, MMUPAGE_SIZE);
+ 	for (addr = start; addr < end; addr += mapping_size) {
+ 		unsigned long gap, previous_size;
+ 		int rc;
+@@ -332,7 +332,7 @@ static int __meminit create_physical_mapping(unsigned long start,
+ 			mapping_size = PMD_SIZE;
+ 			psize = MMU_PAGE_2M;
+ 		} else {
+-			mapping_size = PAGE_SIZE;
++			mapping_size = MMUPAGE_SIZE;
+ 			psize = mmu_virtual_psize;
+ 		}
+ 
+diff --git a/arch/powerpc/mm/book3s64/radix_tlb.c b/arch/powerpc/mm/book3s64/radix_tlb.c
+index 7de5760164a9..2e51a1f6b6fd 100644
+--- a/arch/powerpc/mm/book3s64/radix_tlb.c
++++ b/arch/powerpc/mm/book3s64/radix_tlb.c
+@@ -1317,7 +1317,7 @@ void radix__flush_tlb_collapsed_pmd(struct mm_struct *mm, unsigned long addr)
+ 		return;
+ 
+ 	/* 4k page size, just blow the world */
+-	if (PAGE_SIZE == 0x1000) {
++	if (MMUPAGE_SIZE == 0x1000) {
+ 		radix__flush_all_mm(mm);
+ 		return;
+ 	}
+@@ -1329,7 +1329,7 @@ void radix__flush_tlb_collapsed_pmd(struct mm_struct *mm, unsigned long addr)
+ 	smp_mb(); /* see radix__flush_tlb_mm */
+ 	type = flush_type_needed(mm, false);
+ 	if (type == FLUSH_TYPE_LOCAL) {
+-		_tlbiel_va_range(addr, end, pid, PAGE_SIZE, mmu_virtual_psize, true);
++		_tlbiel_va_range(addr, end, pid, MMUPAGE_SIZE, mmu_virtual_psize, true);
+ 	} else if (type == FLUSH_TYPE_GLOBAL) {
+ 		if (!mmu_has_feature(MMU_FTR_GTSE)) {
+ 			unsigned long tgt, type, pg_sizes;
+@@ -1343,10 +1343,10 @@ void radix__flush_tlb_collapsed_pmd(struct mm_struct *mm, unsigned long addr)
+ 			pseries_rpt_invalidate(pid, tgt, type, pg_sizes,
+ 					       addr, end);
+ 		} else if (cputlb_use_tlbie())
+-			_tlbie_va_range(addr, end, pid, PAGE_SIZE, mmu_virtual_psize, true);
++			_tlbie_va_range(addr, end, pid, MMUPAGE_SIZE, mmu_virtual_psize, true);
+ 		else
+ 			_tlbiel_va_range_multicast(mm,
+-					addr, end, pid, PAGE_SIZE, mmu_virtual_psize, true);
++					addr, end, pid, MMUPAGE_SIZE, mmu_virtual_psize, true);
+ 	}
+ 
+ 	preempt_enable();
+diff --git a/arch/powerpc/mm/nohash/tlb.c b/arch/powerpc/mm/nohash/tlb.c
+index 0a650742f3a0..f7e801da46cf 100644
+--- a/arch/powerpc/mm/nohash/tlb.c
++++ b/arch/powerpc/mm/nohash/tlb.c
+@@ -317,7 +317,7 @@ void flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 		     unsigned long end)
+ 
+ {
+-	if (end - start == PAGE_SIZE && !(start & ~PAGE_MASK))
++	if (end - start == MMUPAGE_SIZE && !(start & ~MMUPAGE_MASK))
+ 		flush_tlb_page(vma, start);
+ 	else
+ 		flush_tlb_mm(vma->vm_mm);
+diff --git a/arch/powerpc/mm/pgtable.c b/arch/powerpc/mm/pgtable.c
+index a9be337be3e4..579030e7626a 100644
+--- a/arch/powerpc/mm/pgtable.c
++++ b/arch/powerpc/mm/pgtable.c
+@@ -208,6 +208,30 @@ void set_ptes(struct mm_struct *mm, unsigned long addr, pte_t *ptep,
+ 	 * involved that need to be batched.
+ 	 */
+ 
++	/*
++	 * With PGCL (PAGE_MMUSHIFT > 0), set_ptes semantics are:
++	 *   nr == 1: set a single PTE (caller already adjusted sub-page)
++	 *   nr >  1: nr is the number of PTEs (MMUPAGE-granular) to write.
++	 */
++#if PAGE_MMUSHIFT > 0
++	if (nr == 1) {
++		page_table_check_ptes_set(mm, addr, ptep, pte, 1);
++		VM_WARN_ON(pte_hw_valid(*ptep) && !pte_protnone(*ptep));
++		__set_pte_at(mm, addr, ptep, pte, 0);
++	} else {
++		unsigned int i;
++
++		page_table_check_ptes_set(mm, addr, ptep, pte, nr);
++		for (i = 0; i < nr; i++) {
++			VM_WARN_ON(pte_hw_valid(*ptep) && !pte_protnone(*ptep));
++			__set_pte_at(mm, addr, ptep, pte, 0);
++			ptep++;
++			addr += MMUPAGE_SIZE;
++			pte = __pte(pte_val(pte) +
++				    __phys_to_pte_val(MMUPAGE_SIZE));
++		}
++	}
++#else
+ 	page_table_check_ptes_set(mm, addr, ptep, pte, nr);
+ 
+ 	for (;;) {
+@@ -223,9 +247,10 @@ void set_ptes(struct mm_struct *mm, unsigned long addr, pte_t *ptep,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		addr += PAGE_SIZE;
+-		pte = pte_next_pfn(pte);
++		addr += MMUPAGE_SIZE;
++		pte = __pte(pte_val(pte) + __phys_to_pte_val(MMUPAGE_SIZE));
+ 	}
++#endif
+ }
+ 
+ void set_pte_at_unchecked(struct mm_struct *mm, unsigned long addr,
+diff --git a/arch/powerpc/mm/ptdump/hashpagetable.c b/arch/powerpc/mm/ptdump/hashpagetable.c
+index 671d0dc00c6d..139cdac4d592 100644
+--- a/arch/powerpc/mm/ptdump/hashpagetable.c
++++ b/arch/powerpc/mm/ptdump/hashpagetable.c
+@@ -384,7 +384,7 @@ static void walk_pte(struct pg_state *st, pmd_t *pmd, unsigned long start)
+ 	int i, status;
+ 
+ 	for (i = 0; i < PTRS_PER_PTE; i++, pte++) {
+-		addr = start + i * PAGE_SIZE;
++		addr = start + i * MMUPAGE_SIZE;
+ 		pteval = pte_val(*pte);
+ 
+ 		if (addr < VMALLOC_END)
+diff --git a/arch/powerpc/mm/ptdump/ptdump.c b/arch/powerpc/mm/ptdump/ptdump.c
+index 0d499aebee72..3dc4a3acff70 100644
+--- a/arch/powerpc/mm/ptdump/ptdump.c
++++ b/arch/powerpc/mm/ptdump/ptdump.c
+@@ -195,7 +195,7 @@ static void note_prot_wx(struct pg_state *st, unsigned long addr)
+ 		  "powerpc/mm: Found insecure W+X mapping at address %p/%pS\n",
+ 		  (void *)st->start_address, (void *)st->start_address);
+ 
+-	st->wx_pages += (addr - st->start_address) / PAGE_SIZE;
++	st->wx_pages += (addr - st->start_address) / MMUPAGE_SIZE;
+ }
+ 
+ static void note_page_update_state(struct pg_state *st, unsigned long addr, int level, u64 val)
+diff --git a/arch/powerpc/platforms/cell/spufs/spufs.h b/arch/powerpc/platforms/cell/spufs/spufs.h
+index d33787c57c39..ab299cb62e40 100644
+--- a/arch/powerpc/platforms/cell/spufs/spufs.h
++++ b/arch/powerpc/platforms/cell/spufs/spufs.h
+@@ -23,7 +23,7 @@
+ #define SPUFS_PS_MAP_SIZE	0x20000
+ #define SPUFS_MFC_MAP_SIZE	0x1000
+ #define SPUFS_CNTL_MAP_SIZE	0x1000
+-#define SPUFS_SIGNAL_MAP_SIZE	PAGE_SIZE
++#define SPUFS_SIGNAL_MAP_SIZE	MMUPAGE_SIZE
+ #define SPUFS_MSS_MAP_SIZE	0x1000
+ 
+ /* The magic number for our file system */
+diff --git a/arch/powerpc/platforms/powernv/opal-prd.c b/arch/powerpc/platforms/powernv/opal-prd.c
+index dc246ed4b7b4..f6bc81090277 100644
+--- a/arch/powerpc/platforms/powernv/opal-prd.c
++++ b/arch/powerpc/platforms/powernv/opal-prd.c
+@@ -119,7 +119,7 @@ static int opal_prd_mmap(struct file *file, struct vm_area_struct *vma)
+ 			vma->vm_start, vma->vm_end, vma->vm_pgoff,
+ 			vma->vm_flags);
+ 
+-	addr = vma->vm_pgoff << PAGE_SHIFT;
++	addr = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	size = vma->vm_end - vma->vm_start;
+ 
+ 	/* ensure we're mapping within one of the allowable ranges */
+-- 
+2.54.0
+

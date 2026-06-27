@@ -1,0 +1,856 @@
+From 58d64e0c21a014a53fb53a641fbd59876fd6f975 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 27 Jun 2026 01:55:35 +0200
+Subject: [RFC PATCH 16/28] loongarch: support page clustering (PAGE_MMUSHIFT)
+
+---
+ arch/loongarch/Kconfig                    |  9 +++
+ arch/loongarch/include/asm/addrspace.h    |  2 +-
+ arch/loongarch/include/asm/elf.h          |  2 +-
+ arch/loongarch/include/asm/fixmap.h       |  2 +-
+ arch/loongarch/include/asm/kvm_mmu.h      |  4 +-
+ arch/loongarch/include/asm/page.h         |  9 ++-
+ arch/loongarch/include/asm/pgtable-bits.h |  2 +-
+ arch/loongarch/include/asm/pgtable.h      | 69 +++++++++++++++--------
+ arch/loongarch/include/asm/thread_info.h  |  2 +-
+ arch/loongarch/include/asm/vdso/vdso.h    |  2 +-
+ arch/loongarch/kernel/asm-offsets.c       |  1 +
+ arch/loongarch/kernel/process.c           |  6 +-
+ arch/loongarch/kernel/relocate.c          |  6 +-
+ arch/loongarch/kernel/syscall.c           |  8 +--
+ arch/loongarch/kernel/traps.c             |  2 +-
+ arch/loongarch/kernel/vdso.c              | 35 +++++++++---
+ arch/loongarch/kernel/vmlinux.lds.S       | 15 ++++-
+ arch/loongarch/mm/init.c                  | 18 +++---
+ arch/loongarch/mm/kasan_init.c            |  2 +-
+ arch/loongarch/mm/mmap.c                  | 14 ++---
+ arch/loongarch/mm/tlb.c                   | 36 ++++++------
+ arch/loongarch/mm/tlbex.S                 | 17 +++---
+ arch/loongarch/vdso/vdso.S                |  4 +-
+ 23 files changed, 172 insertions(+), 95 deletions(-)
+
+diff --git a/arch/loongarch/Kconfig b/arch/loongarch/Kconfig
+index 606597da46b8..4dac9d8cedcc 100644
+--- a/arch/loongarch/Kconfig
++++ b/arch/loongarch/Kconfig
+@@ -566,6 +566,15 @@ config NODES_SHIFT
+ 
+ config ARCH_FORCE_MAX_ORDER
+ 	int "Maximum zone order"
++	# PGCL widens PAGE_SIZE by 2^PAGE_MMUSHIFT; cap MAX_PAGE_ORDER so
++	# PAGE_SHIFT + MAX_PAGE_ORDER stays under SECTION_SIZE_BITS (=29).
++	# `range` clauses force `make olddefconfig` to clamp a stale value.
++	range 1 5 if PAGE_MMUSHIFT >= 6
++	range 1 8 if PAGE_MMUSHIFT >= 4
++	range 1 10 if PAGE_MMUSHIFT >= 2
++	default "5" if PAGE_MMUSHIFT >= 6
++	default "8" if PAGE_MMUSHIFT >= 4
++	default "10" if PAGE_MMUSHIFT >= 2
+ 	default "13" if PAGE_SIZE_64KB
+ 	default "11" if PAGE_SIZE_16KB
+ 	default "10"
+diff --git a/arch/loongarch/include/asm/addrspace.h b/arch/loongarch/include/asm/addrspace.h
+index d6472cafb32c..31f068c6f018 100644
+--- a/arch/loongarch/include/asm/addrspace.h
++++ b/arch/loongarch/include/asm/addrspace.h
+@@ -138,7 +138,7 @@ extern unsigned long vm_map_base;
+  * PCI_IOBASE ->|-----------------------|
+  *              |         ....          |
+  */
+-#define PCI_IOBASE	((void __iomem *)(vm_map_base + (2 * PAGE_SIZE)))
++#define PCI_IOBASE	((void __iomem *)(vm_map_base + (2 * MMUPAGE_SIZE)))
+ #define PCI_IOSIZE	SZ_32M
+ #define ISA_IOSIZE	SZ_16K
+ #define IO_SPACE_LIMIT	(PCI_IOSIZE - 1)
+diff --git a/arch/loongarch/include/asm/elf.h b/arch/loongarch/include/asm/elf.h
+index 912c50cdd6b7..679b42e3d9f2 100644
+--- a/arch/loongarch/include/asm/elf.h
++++ b/arch/loongarch/include/asm/elf.h
+@@ -297,7 +297,7 @@ do {									\
+ #endif /* CONFIG_64BIT */
+ 
+ #define CORE_DUMP_USE_REGSET
+-#define ELF_EXEC_PAGESIZE	PAGE_SIZE
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ 
+ /*
+  * This yields a mask that user programs can use to figure out what
+diff --git a/arch/loongarch/include/asm/fixmap.h b/arch/loongarch/include/asm/fixmap.h
+index dce2da6ba787..588020a6271e 100644
+--- a/arch/loongarch/include/asm/fixmap.h
++++ b/arch/loongarch/include/asm/fixmap.h
+@@ -25,7 +25,7 @@ enum fixed_addresses {
+ 	__end_of_fixed_addresses
+ };
+ 
+-#define FIXADDR_SIZE	(__end_of_fixed_addresses << PAGE_SHIFT)
++#define FIXADDR_SIZE	(__end_of_fixed_addresses << MMUPAGE_SHIFT)
+ #define FIXADDR_START	(FIXADDR_TOP - FIXADDR_SIZE)
+ #define FIXMAP_PAGE_IO	PAGE_KERNEL_SUC
+ 
+diff --git a/arch/loongarch/include/asm/kvm_mmu.h b/arch/loongarch/include/asm/kvm_mmu.h
+index e36cc7e8ed20..4339de8b7a9f 100644
+--- a/arch/loongarch/include/asm/kvm_mmu.h
++++ b/arch/loongarch/include/asm/kvm_mmu.h
+@@ -25,8 +25,8 @@
+ 
+ #define _KVM_FLUSH_PGTABLE	0x1
+ #define _KVM_HAS_PGMASK		0x2
+-#define kvm_pfn_pte(pfn, prot)	(((pfn) << PFN_PTE_SHIFT) | pgprot_val(prot))
+-#define kvm_pte_pfn(x)		((phys_addr_t)((x & _PFN_MASK) >> PFN_PTE_SHIFT))
++#define kvm_pfn_pte(pfn, prot)	(((pfn) << PAGE_SHIFT) | pgprot_val(prot))
++#define kvm_pte_pfn(x)		((phys_addr_t)((x & _PFN_MASK) >> PAGE_SHIFT))
+ 
+ typedef unsigned long kvm_pte_t;
+ typedef struct kvm_ptw_ctx kvm_ptw_ctx;
+diff --git a/arch/loongarch/include/asm/page.h b/arch/loongarch/include/asm/page.h
+index b9d61f7c032c..207a6ea3d523 100644
+--- a/arch/loongarch/include/asm/page.h
++++ b/arch/loongarch/include/asm/page.h
+@@ -10,7 +10,14 @@
+ 
+ #include <vdso/page.h>
+ 
+-#define HPAGE_SHIFT	(PAGE_SHIFT + PAGE_SHIFT - PTRLOG)
++/*
++ * HPAGE_SHIFT = PMD_SHIFT = 2*MMUPAGE_SHIFT - PTRLOG.
++ * Each MMUPAGE-sized PTE table has (MMUPAGE_SIZE >> PTRLOG) entries,
++ * so a PMD entry covers (MMUPAGE_SIZE >> PTRLOG) * MMUPAGE_SIZE bytes.
++ * With PGCL, PAGE_SHIFT != MMUPAGE_SHIFT, so the old formula
++ * (MMUPAGE_SHIFT + PAGE_SHIFT - PTRLOG) was wrong — it gave 29 instead of 25.
++ */
++#define HPAGE_SHIFT	(MMUPAGE_SHIFT + MMUPAGE_SHIFT - PTRLOG)
+ #define HPAGE_SIZE	(_AC(1, UL) << HPAGE_SHIFT)
+ #define HPAGE_MASK	(~(HPAGE_SIZE - 1))
+ #define HUGETLB_PAGE_ORDER	(HPAGE_SHIFT - PAGE_SHIFT)
+diff --git a/arch/loongarch/include/asm/pgtable-bits.h b/arch/loongarch/include/asm/pgtable-bits.h
+index b565573cd82e..62dffbc8e6fb 100644
+--- a/arch/loongarch/include/asm/pgtable-bits.h
++++ b/arch/loongarch/include/asm/pgtable-bits.h
+@@ -82,7 +82,7 @@
+ #define _PAGE_RPLV		(_ULCAST_(1) << _PAGE_RPLV_SHIFT)
+ #endif
+ #define _CACHE_MASK		(_ULCAST_(3) << _CACHE_SHIFT)
+-#define PFN_PTE_SHIFT		(PAGE_SHIFT - 12 + _PAGE_PFN_SHIFT)
++#define PFN_PTE_SHIFT		(MMUPAGE_SHIFT - 12 + _PAGE_PFN_SHIFT)
+ 
+ #define _PAGE_USER	(PLV_USER << _PAGE_PLV_SHIFT)
+ #define _PAGE_KERN	(PLV_KERN << _PAGE_PLV_SHIFT)
+diff --git a/arch/loongarch/include/asm/pgtable.h b/arch/loongarch/include/asm/pgtable.h
+index 2a0b63ae421f..1d3c8c16c094 100644
+--- a/arch/loongarch/include/asm/pgtable.h
++++ b/arch/loongarch/include/asm/pgtable.h
+@@ -27,21 +27,28 @@
+ #include <asm/highmem.h>
+ #endif
+ 
++/*
++ * LoongArch page table geometry: each level uses MMUPAGE_SIZE tables
++ * (hardware page), not kernel PAGE_SIZE. The hardware page table walker
++ * (lddir/ldpte) and PWCTL registers expect MMUPAGE-granular tables.
++ * With PGCL, PAGE_SIZE > MMUPAGE_SIZE, but page table structure must
++ * match hardware VA width (cpu_vabits).
++ */
+ #if CONFIG_PGTABLE_LEVELS == 2
+-#define PGDIR_SHIFT	(PAGE_SHIFT + (PAGE_SHIFT - PTRLOG))
++#define PGDIR_SHIFT	(MMUPAGE_SHIFT + (MMUPAGE_SHIFT - PTRLOG))
+ #elif CONFIG_PGTABLE_LEVELS == 3
+-#define PMD_SHIFT	(PAGE_SHIFT + (PAGE_SHIFT - PTRLOG))
++#define PMD_SHIFT	(MMUPAGE_SHIFT + (MMUPAGE_SHIFT - PTRLOG))
+ #define PMD_SIZE	(1UL << PMD_SHIFT)
+ #define PMD_MASK	(~(PMD_SIZE-1))
+-#define PGDIR_SHIFT	(PMD_SHIFT + (PAGE_SHIFT - PTRLOG))
++#define PGDIR_SHIFT	(PMD_SHIFT + (MMUPAGE_SHIFT - PTRLOG))
+ #elif CONFIG_PGTABLE_LEVELS == 4
+-#define PMD_SHIFT	(PAGE_SHIFT + (PAGE_SHIFT - PTRLOG))
++#define PMD_SHIFT	(MMUPAGE_SHIFT + (MMUPAGE_SHIFT - PTRLOG))
+ #define PMD_SIZE	(1UL << PMD_SHIFT)
+ #define PMD_MASK	(~(PMD_SIZE-1))
+-#define PUD_SHIFT	(PMD_SHIFT + (PAGE_SHIFT - PTRLOG))
++#define PUD_SHIFT	(PMD_SHIFT + (MMUPAGE_SHIFT - PTRLOG))
+ #define PUD_SIZE	(1UL << PUD_SHIFT)
+ #define PUD_MASK	(~(PUD_SIZE-1))
+-#define PGDIR_SHIFT	(PUD_SHIFT + (PAGE_SHIFT - PTRLOG))
++#define PGDIR_SHIFT	(PUD_SHIFT + (MMUPAGE_SHIFT - PTRLOG))
+ #endif
+ 
+ #define PGDIR_SIZE	(1UL << PGDIR_SHIFT)
+@@ -50,17 +57,17 @@
+ #ifdef CONFIG_32BIT
+ #define VA_BITS		32
+ #else
+-#define VA_BITS		(PGDIR_SHIFT + (PAGE_SHIFT - PTRLOG))
++#define VA_BITS		(PGDIR_SHIFT + (MMUPAGE_SHIFT - PTRLOG))
+ #endif
+ 
+-#define PTRS_PER_PGD	(PAGE_SIZE >> PTRLOG)
++#define PTRS_PER_PGD	(MMUPAGE_SIZE >> PTRLOG)
+ #if CONFIG_PGTABLE_LEVELS > 3
+-#define PTRS_PER_PUD	(PAGE_SIZE >> PTRLOG)
++#define PTRS_PER_PUD	(MMUPAGE_SIZE >> PTRLOG)
+ #endif
+ #if CONFIG_PGTABLE_LEVELS > 2
+-#define PTRS_PER_PMD	(PAGE_SIZE >> PTRLOG)
++#define PTRS_PER_PMD	(MMUPAGE_SIZE >> PTRLOG)
+ #endif
+-#define PTRS_PER_PTE	(PAGE_SIZE >> PTRLOG)
++#define PTRS_PER_PTE	(MMUPAGE_SIZE >> PTRLOG)
+ 
+ #ifdef CONFIG_32BIT
+ #define USER_PTRS_PER_PGD       (TASK_SIZE / PGDIR_SIZE)
+@@ -99,7 +106,7 @@ struct vm_area_struct;
+ #define MODULES_END	(MODULES_VADDR + SZ_256M)
+ 
+ #ifdef CONFIG_KFENCE
+-#define KFENCE_AREA_SIZE	(((CONFIG_KFENCE_NUM_OBJECTS + 1) * 2 + 2) * PAGE_SIZE)
++#define KFENCE_AREA_SIZE	(((CONFIG_KFENCE_NUM_OBJECTS + 1) * 2 + 2) * MMUPAGE_SIZE)
+ #else
+ #define KFENCE_AREA_SIZE	0
+ #endif
+@@ -109,11 +116,11 @@ struct vm_area_struct;
+ #ifndef CONFIG_KASAN
+ #define VMALLOC_END	\
+ 	(vm_map_base +	\
+-	 min(PTRS_PER_PGD * PTRS_PER_PUD * PTRS_PER_PMD * PTRS_PER_PTE * PAGE_SIZE, (1UL << cpu_vabits)) - PMD_SIZE - VMEMMAP_SIZE - KFENCE_AREA_SIZE)
++	 min(PTRS_PER_PGD * PTRS_PER_PUD * PTRS_PER_PMD * PTRS_PER_PTE * MMUPAGE_SIZE, (1UL << cpu_vabits)) - PMD_SIZE - VMEMMAP_SIZE - KFENCE_AREA_SIZE)
+ #else
+ #define VMALLOC_END	\
+ 	(vm_map_base +	\
+-	 min(PTRS_PER_PGD * PTRS_PER_PUD * PTRS_PER_PMD * PTRS_PER_PTE * PAGE_SIZE, (1UL << cpu_vabits) / 2) - PMD_SIZE - VMEMMAP_SIZE - KFENCE_AREA_SIZE)
++	 min(PTRS_PER_PGD * PTRS_PER_PUD * PTRS_PER_PMD * PTRS_PER_PTE * MMUPAGE_SIZE, (1UL << cpu_vabits) / 2) - PMD_SIZE - VMEMMAP_SIZE - KFENCE_AREA_SIZE)
+ #endif
+ 
+ #define VMEMMAP_ALIGN	max(PMD_SIZE, MAX_FOLIO_VMEMMAP_ALIGN)
+@@ -161,7 +168,7 @@ static inline int p4d_none(p4d_t p4d)
+ 
+ static inline int p4d_bad(p4d_t p4d)
+ {
+-	return p4d_val(p4d) & ~PAGE_MASK;
++	return p4d_val(p4d) & ~MMUPAGE_MASK;
+ }
+ 
+ static inline int p4d_present(p4d_t p4d)
+@@ -207,7 +214,7 @@ static inline int pud_none(pud_t pud)
+ 
+ static inline int pud_bad(pud_t pud)
+ {
+-	return pud_val(pud) & ~PAGE_MASK;
++	return pud_val(pud) & ~MMUPAGE_MASK;
+ }
+ 
+ static inline int pud_present(pud_t pud)
+@@ -245,7 +252,7 @@ static inline int pmd_none(pmd_t pmd)
+ 
+ static inline int pmd_bad(pmd_t pmd)
+ {
+-	return (pmd_val(pmd) & ~PAGE_MASK);
++	return (pmd_val(pmd) & ~MMUPAGE_MASK);
+ }
+ 
+ static inline int pmd_present(pmd_t pmd)
+@@ -276,10 +283,28 @@ static inline void pmd_clear(pmd_t *pmdp)
+ 
+ extern void set_pmd_at(struct mm_struct *mm, unsigned long addr, pmd_t *pmdp, pmd_t pmd);
+ 
++/*
++ * PFN encoding: pte_pfn()/pfn_pte() use PAGE_SHIFT (PAGE-granular PFN)
++ * so pfn_to_page(pte_pfn(pte)) works correctly with struct page indexing.
++ * _PFN_MASK still covers all PA bits [MMUPAGE_SHIFT:PFN_END] for pte_modify.
++ * Sub-page advancement is handled by pte_advance_pfn (MMUPAGE granularity
++ * within set_ptes) and __phys_to_pte_val(MMUPAGE_SIZE) in PGCL paths.
++ */
+ #define pte_page(x)		pfn_to_page(pte_pfn(x))
+-#define pte_pfn(x)		((unsigned long)(((x).pte & _PFN_MASK) >> PFN_PTE_SHIFT))
+-#define pfn_pte(pfn, prot)	__pte(((pfn) << PFN_PTE_SHIFT) | pgprot_val(prot))
+-#define pfn_pmd(pfn, prot)	__pmd(((pfn) << PFN_PTE_SHIFT) | pgprot_val(prot))
++#define pte_pfn(x)		((unsigned long)(((x).pte & _PFN_MASK) >> PAGE_SHIFT))
++#define pfn_pte(pfn, prot)	__pte(((pfn) << PAGE_SHIFT) | pgprot_val(prot))
++#define pfn_pmd(pfn, prot)	__pmd(((pfn) << PAGE_SHIFT) | pgprot_val(prot))
++
++/*
++ * pte_advance_pfn: advance PTE by nr PAGE-sized steps.
++ * Since __phys_to_pte_val is identity on LoongArch, adding (nr << PAGE_SHIFT)
++ * directly to pte_val advances the physical address by nr * PAGE_SIZE.
++ */
++#define pte_advance_pfn pte_advance_pfn
++static inline pte_t pte_advance_pfn(pte_t pte, unsigned long nr)
++{
++	return __pte(pte_val(pte) + (nr << PAGE_SHIFT));
++}
+ 
+ /*
+  * Initialize a new pgd / pud / pmd table with invalid pointers.
+@@ -479,7 +504,7 @@ static inline void update_mmu_cache_range(struct vm_fault *vmf,
+ 		__update_tlb(vma, address, ptep);
+ 		if (--nr == 0)
+ 			break;
+-		address += PAGE_SIZE;
++		address += MMUPAGE_SIZE;
+ 		ptep++;
+ 	}
+ }
+@@ -497,7 +522,7 @@ static inline void update_mmu_cache_pmd(struct vm_area_struct *vma,
+ 
+ static inline unsigned long pmd_pfn(pmd_t pmd)
+ {
+-	return (pmd_val(pmd) & _PFN_MASK) >> PFN_PTE_SHIFT;
++	return (pmd_val(pmd) & _PFN_MASK) >> PAGE_SHIFT;
+ }
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+diff --git a/arch/loongarch/include/asm/thread_info.h b/arch/loongarch/include/asm/thread_info.h
+index 4d7117fcdc78..65b662ec2851 100644
+--- a/arch/loongarch/include/asm/thread_info.h
++++ b/arch/loongarch/include/asm/thread_info.h
+@@ -58,7 +58,7 @@ register unsigned long current_stack_pointer __asm__("$sp");
+ /* thread information allocation */
+ #define THREAD_SIZE		SZ_16K
+ #define THREAD_MASK		(THREAD_SIZE - 1UL)
+-#define THREAD_SIZE_ORDER	ilog2(THREAD_SIZE / PAGE_SIZE)
++#define THREAD_SIZE_ORDER	ilog2(DIV_ROUND_UP(THREAD_SIZE, PAGE_SIZE))
+ /*
+  * thread information flags
+  * - these are process state flags that various assembly files may need to
+diff --git a/arch/loongarch/include/asm/vdso/vdso.h b/arch/loongarch/include/asm/vdso/vdso.h
+index 04bd2d452876..d76df6fc8f9e 100644
+--- a/arch/loongarch/include/asm/vdso/vdso.h
++++ b/arch/loongarch/include/asm/vdso/vdso.h
+@@ -14,7 +14,7 @@
+ #include <asm/vdso.h>
+ #include <vdso/datapage.h>
+ 
+-#define VVAR_SIZE (VDSO_NR_PAGES << PAGE_SHIFT)
++#define VVAR_SIZE (VDSO_NR_PAGES << MMUPAGE_SHIFT)
+ 
+ #endif /* __ASSEMBLER__ */
+ 
+diff --git a/arch/loongarch/kernel/asm-offsets.c b/arch/loongarch/kernel/asm-offsets.c
+index 2cc953f113ac..a96050ca72cb 100644
+--- a/arch/loongarch/kernel/asm-offsets.c
++++ b/arch/loongarch/kernel/asm-offsets.c
+@@ -213,6 +213,7 @@ static void __used output_mm_defines(void)
+ 	BLANK();
+ 	DEFINE(_PAGE_SHIFT, PAGE_SHIFT);
+ 	DEFINE(_PAGE_SIZE, PAGE_SIZE);
++	DEFINE(_MMUPAGE_SIZE, MMUPAGE_SIZE);
+ 	BLANK();
+ }
+ 
+diff --git a/arch/loongarch/kernel/process.c b/arch/loongarch/kernel/process.c
+index 5505fc355e1b..7a7a7cc57f71 100644
+--- a/arch/loongarch/kernel/process.c
++++ b/arch/loongarch/kernel/process.c
+@@ -320,11 +320,11 @@ int get_stack_info(unsigned long stack, struct task_struct *task,
+ 
+ unsigned long stack_top(void)
+ {
+-	unsigned long top = TASK_SIZE & PAGE_MASK;
++	unsigned long top = TASK_SIZE & MMUPAGE_MASK;
+ 
+ 	if (current->thread.vdso) {
+ 		/* Space for the VDSO & data page */
+-		top -= PAGE_ALIGN(current->thread.vdso->size);
++		top -= MMUPAGE_ALIGN(current->thread.vdso->size);
+ 		top -= VVAR_SIZE;
+ 
+ 		/* Space to randomize the VDSO base */
+@@ -342,7 +342,7 @@ unsigned long stack_top(void)
+ unsigned long arch_align_stack(unsigned long sp)
+ {
+ 	if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)
+-		sp -= get_random_u32_below(PAGE_SIZE);
++		sp -= get_random_u32_below(MMUPAGE_SIZE);
+ 
+ 	return sp & STACK_ALIGN;
+ }
+diff --git a/arch/loongarch/kernel/relocate.c b/arch/loongarch/kernel/relocate.c
+index 4b61a9632a98..635d3a16a357 100644
+--- a/arch/loongarch/kernel/relocate.c
++++ b/arch/loongarch/kernel/relocate.c
+@@ -214,10 +214,10 @@ static inline void __init *determine_relocation_address(void)
+ 
+ 	kernel_length = (unsigned long)_end - (unsigned long)_text;
+ 
+-	random_offset = get_random_boot() << 16;
++	random_offset = get_random_boot() << PAGE_SHIFT;
+ 	random_offset &= (CONFIG_RANDOMIZE_BASE_MAX_OFFSET - 1);
+ 	if (random_offset < kernel_length)
+-		random_offset += ALIGN(kernel_length, 0xffff);
++		random_offset += ALIGN(kernel_length, PAGE_SIZE - 1);
+ 
+ 	return RELOCATED_KASLR(destination);
+ }
+@@ -252,7 +252,7 @@ static inline int __init relocation_addr_valid(void *location_new)
+ 	unsigned long kernel_start, kernel_size;
+ 	unsigned long initrd_start, initrd_size = 0;
+ 
+-	if ((unsigned long)location_new & 0x00000ffff)
++	if ((unsigned long)location_new & (PAGE_SIZE - 1))
+ 		return 0; /* Inappropriately aligned new location */
+ 
+ 	if ((unsigned long)location_new < (unsigned long)_end)
+diff --git a/arch/loongarch/kernel/syscall.c b/arch/loongarch/kernel/syscall.c
+index 94c1c3b5b0b5..38ef3054f109 100644
+--- a/arch/loongarch/kernel/syscall.c
++++ b/arch/loongarch/kernel/syscall.c
+@@ -29,19 +29,19 @@
+ SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len, unsigned long,
+ 		prot, unsigned long, flags, unsigned long, fd, unsigned long, offset)
+ {
+-	if (offset & ~PAGE_MASK)
++	if (offset & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 
+-	return ksys_mmap_pgoff(addr, len, prot, flags, fd, offset >> PAGE_SHIFT);
++	return ksys_mmap_pgoff(addr, len, prot, flags, fd, offset >> MMUPAGE_SHIFT);
+ }
+ 
+ SYSCALL_DEFINE6(mmap2, unsigned long, addr, unsigned long, len, unsigned long,
+ 		 prot, unsigned long, flags, unsigned long, fd, unsigned long, offset)
+ {
+-	if (offset & (~PAGE_MASK >> 12))
++	if (offset & (~MMUPAGE_MASK >> 12))
+ 		return -EINVAL;
+ 
+-	return ksys_mmap_pgoff(addr, len, prot, flags, fd, offset >> (PAGE_SHIFT - 12));
++	return ksys_mmap_pgoff(addr, len, prot, flags, fd, offset >> (MMUPAGE_SHIFT - 12));
+ }
+ 
+ void *sys_call_table[__NR_syscalls] = {
+diff --git a/arch/loongarch/kernel/traps.c b/arch/loongarch/kernel/traps.c
+index 5d49b742e3bf..4eb7a8b25298 100644
+--- a/arch/loongarch/kernel/traps.c
++++ b/arch/loongarch/kernel/traps.c
+@@ -109,7 +109,7 @@ static void show_stacktrace(struct task_struct *task,
+ 
+ 	printk("%sStack :", loglvl);
+ 	i = 0;
+-	while ((unsigned long) sp & (PAGE_SIZE - 1)) {
++	while ((unsigned long) sp & (THREAD_SIZE - 1)) {
+ 		if (i && ((i % (64 / field)) == 0)) {
+ 			pr_cont("\n");
+ 			printk("%s       ", loglvl);
+diff --git a/arch/loongarch/kernel/vdso.c b/arch/loongarch/kernel/vdso.c
+index 8ce8159c10b9..aae853330d0f 100644
+--- a/arch/loongarch/kernel/vdso.c
++++ b/arch/loongarch/kernel/vdso.c
+@@ -7,6 +7,7 @@
+ #include <linux/binfmts.h>
+ #include <linux/elf.h>
+ #include <linux/err.h>
++#include <linux/gfp.h>
+ #include <linux/init.h>
+ #include <linux/ioport.h>
+ #include <linux/kernel.h>
+@@ -14,6 +15,7 @@
+ #include <linux/random.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
++#include <linux/string.h>
+ #include <linux/vdso_datastore.h>
+ 
+ #include <asm/page.h>
+@@ -46,21 +48,40 @@ static int __init init_vdso(void)
+ {
+ 	unsigned long i, cpu, pfn;
+ 
+-	BUG_ON(!PAGE_ALIGNED(vdso_info.vdso));
++	BUG_ON(!MMUPAGE_ALIGNED(vdso_info.vdso));
+ 
+ 	for_each_possible_cpu(cpu)
+ 		vdso_k_arch_data->pdata[cpu].node = cpu_to_node(cpu);
+ 
+-	vdso_info.size = PAGE_ALIGN(vdso_end - vdso_start);
++	vdso_info.size = MMUPAGE_ALIGN(vdso_end - vdso_start);
+ 	vdso_info.code_mapping.pages =
+-		kzalloc_objs(struct page *, vdso_info.size / PAGE_SIZE);
++		kzalloc_objs(struct page *, vdso_info.size / MMUPAGE_SIZE);
+ 
+ 	if (!vdso_info.code_mapping.pages)
+ 		return -ENOMEM;
+ 
+-	pfn = __phys_to_pfn(__pa_symbol(vdso_info.vdso));
+-	for (i = 0; i < vdso_info.size / PAGE_SIZE; i++)
+-		vdso_info.code_mapping.pages[i] = pfn_to_page(pfn + i);
++	/*
++	 * With PGCL (PAGE_MMUSHIFT > 0), the vDSO binary is only
++	 * MMUPAGE-aligned in the kernel image, not PAGE-aligned.
++	 * Special mappings create PTEs using vm_pgoff-based sub-page
++	 * indexing, so sub-page 0 of the struct page is always mapped
++	 * first.  Copy the vDSO to a fresh PAGE-aligned allocation so
++	 * the code starts at sub-page 0.
++	 */
++	if (PAGE_MMUSHIFT > 0 && !PAGE_ALIGNED(__pa_symbol(vdso_info.vdso))) {
++		unsigned int order = get_order(vdso_info.size);
++		struct page *p = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
++
++		if (!p)
++			return -ENOMEM;
++		memcpy(page_address(p), vdso_info.vdso, vdso_end - vdso_start);
++		pfn = page_to_pfn(p);
++	} else {
++		pfn = __phys_to_pfn(__pa_symbol(vdso_info.vdso));
++	}
++
++	for (i = 0; i < vdso_info.size / MMUPAGE_SIZE; i++)
++		vdso_info.code_mapping.pages[i] = pfn_to_page(pfn + i / PAGE_MMUCOUNT);
+ 
+ 	return 0;
+ }
+@@ -72,7 +93,7 @@ static unsigned long vdso_base(void)
+ 
+ 	if (current->flags & PF_RANDOMIZE) {
+ 		base += get_random_u32_below(VDSO_RANDOMIZE_SIZE);
+-		base = PAGE_ALIGN(base);
++		base = MMUPAGE_ALIGN(base);
+ 	}
+ 
+ 	return base;
+diff --git a/arch/loongarch/kernel/vmlinux.lds.S b/arch/loongarch/kernel/vmlinux.lds.S
+index 840d944c2f73..961e984d5bab 100644
+--- a/arch/loongarch/kernel/vmlinux.lds.S
++++ b/arch/loongarch/kernel/vmlinux.lds.S
+@@ -4,7 +4,13 @@
+ #include <asm/thread_info.h>
+ #include <asm/orc_lookup.h>
+ 
+-#define PAGE_SIZE _PAGE_SIZE
++/*
++ * Linker script alignment uses MMUPAGE_SIZE (hardware page), not kernel
++ * PAGE_SIZE. With PGCL, PAGE_SIZE can be 256KB which creates excessive
++ * padding and misaligns PE/COFF sections relative to PECOFF_SEGMENT_ALIGN.
++ */
++#define PAGE_SIZE _MMUPAGE_SIZE
++#define MMUPAGE_SIZE _MMUPAGE_SIZE
+ #define RO_EXCEPTION_TABLE_ALIGN	4
+ 
+ #ifdef CONFIG_32BIT
+@@ -92,6 +98,13 @@ SECTIONS
+ 	}
+ 
+ #ifdef CONFIG_SMP
++	/*
++	 * PGCL: PERCPU_SECTION uses PAGE_SIZE (redefined to MMUPAGE_SIZE
++	 * above) for alignment, but the percpu allocator checks
++	 * offset_in_page() with the real kernel PAGE_SIZE. Force the
++	 * real PAGE_SIZE alignment here.
++	 */
++	. = ALIGN(_PAGE_SIZE);
+ 	PERCPU_SECTION(1 << CONFIG_L1_CACHE_SHIFT)
+ #endif
+ 
+diff --git a/arch/loongarch/mm/init.c b/arch/loongarch/mm/init.c
+index 031b39eb081c..eb4f7794434d 100644
+--- a/arch/loongarch/mm/init.c
++++ b/arch/loongarch/mm/init.c
+@@ -175,7 +175,7 @@ pte_t * __init populate_kernel_pte(unsigned long addr)
+ 	pmd_t *pmd;
+ 
+ 	if (p4d_none(p4dp_get(p4d))) {
+-		pud = memblock_alloc_or_panic(PAGE_SIZE, PAGE_SIZE);
++		pud = memblock_alloc_or_panic(MMUPAGE_SIZE, MMUPAGE_SIZE);
+ 		p4d_populate(&init_mm, p4d, pud);
+ #ifndef __PAGETABLE_PUD_FOLDED
+ 		pud_init(pud);
+@@ -184,7 +184,7 @@ pte_t * __init populate_kernel_pte(unsigned long addr)
+ 
+ 	pud = pud_offset(p4d, addr);
+ 	if (pud_none(pudp_get(pud))) {
+-		pmd = memblock_alloc_or_panic(PAGE_SIZE, PAGE_SIZE);
++		pmd = memblock_alloc_or_panic(MMUPAGE_SIZE, MMUPAGE_SIZE);
+ 		pud_populate(&init_mm, pud, pmd);
+ #ifndef __PAGETABLE_PMD_FOLDED
+ 		pmd_init(pmd);
+@@ -195,7 +195,7 @@ pte_t * __init populate_kernel_pte(unsigned long addr)
+ 	if (!pmd_present(pmdp_get(pmd))) {
+ 		pte_t *pte;
+ 
+-		pte = memblock_alloc_or_panic(PAGE_SIZE, PAGE_SIZE);
++		pte = memblock_alloc_or_panic(MMUPAGE_SIZE, MMUPAGE_SIZE);
+ 		pmd_populate_kernel(&init_mm, pmd, pte);
+ 		kernel_pte_init(pte);
+ 	}
+@@ -218,10 +218,10 @@ void __init __set_fixmap(enum fixed_addresses idx,
+ 	}
+ 
+ 	if (pgprot_val(flags))
+-		set_pte(ptep, pfn_pte(phys >> PAGE_SHIFT, flags));
++		set_pte(ptep, __pte((phys & MMUPAGE_MASK) | pgprot_val(flags)));
+ 	else {
+ 		pte_clear(&init_mm, addr, ptep);
+-		flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
++		flush_tlb_kernel_range(addr, addr + MMUPAGE_SIZE);
+ 	}
+ }
+ 
+@@ -234,16 +234,16 @@ void __init __set_fixmap(enum fixed_addresses idx,
+  */
+ pgd_t swapper_pg_dir[_PTRS_PER_PGD] __section(".bss..swapper_pg_dir");
+ 
+-pgd_t invalid_pg_dir[_PTRS_PER_PGD] __page_aligned_bss;
++pgd_t invalid_pg_dir[_PTRS_PER_PGD] __section(".bss..page_aligned") __aligned(MMUPAGE_SIZE);
+ #ifndef __PAGETABLE_PUD_FOLDED
+-pud_t invalid_pud_table[PTRS_PER_PUD] __page_aligned_bss;
++pud_t invalid_pud_table[PTRS_PER_PUD] __section(".bss..page_aligned") __aligned(MMUPAGE_SIZE);
+ EXPORT_SYMBOL(invalid_pud_table);
+ #endif
+ #ifndef __PAGETABLE_PMD_FOLDED
+-pmd_t invalid_pmd_table[PTRS_PER_PMD] __page_aligned_bss;
++pmd_t invalid_pmd_table[PTRS_PER_PMD] __section(".bss..page_aligned") __aligned(MMUPAGE_SIZE);
+ EXPORT_SYMBOL(invalid_pmd_table);
+ #endif
+-pte_t invalid_pte_table[PTRS_PER_PTE] __page_aligned_bss;
++pte_t invalid_pte_table[PTRS_PER_PTE] __section(".bss..page_aligned") __aligned(MMUPAGE_SIZE);
+ EXPORT_SYMBOL(invalid_pte_table);
+ 
+ #if defined(CONFIG_EXECMEM) && defined(MODULES_VADDR)
+diff --git a/arch/loongarch/mm/kasan_init.c b/arch/loongarch/mm/kasan_init.c
+index 0fc02ca06457..167dbcb7d279 100644
+--- a/arch/loongarch/mm/kasan_init.c
++++ b/arch/loongarch/mm/kasan_init.c
+@@ -179,7 +179,7 @@ static void __init kasan_pte_populate(pmd_t *pmdp, unsigned long addr,
+ 		phys_addr_t page_phys = early ?
+ 					__pa_symbol(kasan_early_shadow_page)
+ 					      : kasan_alloc_zeroed_page(node);
+-		next = addr + PAGE_SIZE;
++		next = addr + MMUPAGE_SIZE;
+ 		set_pte(ptep, pfn_pte(__phys_to_pfn(page_phys), PAGE_KERNEL));
+ 	} while (ptep++, addr = next, addr != end && __pte_none(early, ptep_get(ptep)));
+ }
+diff --git a/arch/loongarch/mm/mmap.c b/arch/loongarch/mm/mmap.c
+index 1df9e99582cc..96285b68f8a7 100644
+--- a/arch/loongarch/mm/mmap.c
++++ b/arch/loongarch/mm/mmap.c
+@@ -10,11 +10,11 @@
+ #include <linux/mm.h>
+ #include <linux/mman.h>
+ 
+-#define SHM_ALIGN_MASK	(SHMLBA - 1)
++#define SHM_ALIGN_MASK	(MMUPAGE_SIZE - 1)
+ 
+ #define COLOUR_ALIGN(addr, pgoff)			\
+ 	((((addr) + SHM_ALIGN_MASK) & ~SHM_ALIGN_MASK)	\
+-	 + (((pgoff) << PAGE_SHIFT) & SHM_ALIGN_MASK))
++	 + (((pgoff) << MMUPAGE_SHIFT) & SHM_ALIGN_MASK))
+ 
+ enum mmap_allocation_direction {UP, DOWN};
+ 
+@@ -41,7 +41,7 @@ static unsigned long arch_get_unmapped_area_common(struct file *filp,
+ 		 * cache aliasing constraints.
+ 		 */
+ 		if ((flags & MAP_SHARED) &&
+-		    ((addr - (pgoff << PAGE_SHIFT)) & SHM_ALIGN_MASK))
++		    ((addr - (pgoff << MMUPAGE_SHIFT)) & SHM_ALIGN_MASK))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -64,19 +64,19 @@ static unsigned long arch_get_unmapped_area_common(struct file *filp,
+ 	}
+ 
+ 	info.length = len;
+-	info.align_offset = pgoff << PAGE_SHIFT;
++	info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	if (filp && is_file_hugepages(filp))
+ 		info.align_mask = huge_page_mask_align(filp);
+ 	else
+-		info.align_mask = do_color_align ? (PAGE_MASK & SHM_ALIGN_MASK) : 0;
++		info.align_mask = do_color_align ? (MMUPAGE_MASK & SHM_ALIGN_MASK) : 0;
+ 
+ 	if (dir == DOWN) {
+ 		info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+-		info.low_limit = PAGE_SIZE;
++		info.low_limit = MMUPAGE_SIZE;
+ 		info.high_limit = mm->mmap_base;
+ 		addr = vm_unmapped_area(&info);
+ 
+-		if (!(addr & ~PAGE_MASK))
++		if (!(addr & ~MMUPAGE_MASK))
+ 			return addr;
+ 
+ 		/*
+diff --git a/arch/loongarch/mm/tlb.c b/arch/loongarch/mm/tlb.c
+index aaf7d685cc2a..ef34885fa030 100644
+--- a/arch/loongarch/mm/tlb.c
++++ b/arch/loongarch/mm/tlb.c
+@@ -64,9 +64,9 @@ void local_flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 		unsigned long size, flags;
+ 
+ 		local_irq_save(flags);
+-		start = round_down(start, PAGE_SIZE << 1);
+-		end = round_up(end, PAGE_SIZE << 1);
+-		size = (end - start) >> (PAGE_SHIFT + 1);
++		start = round_down(start, MMUPAGE_SIZE << 1);
++		end = round_up(end, MMUPAGE_SIZE << 1);
++		size = (end - start) >> (MMUPAGE_SHIFT + 1);
+ 		if (size <= (current_cpu_data.tlbsizestlbsets ?
+ 			     current_cpu_data.tlbsize / 8 :
+ 			     current_cpu_data.tlbsize / 2)) {
+@@ -74,7 +74,7 @@ void local_flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 
+ 			while (start < end) {
+ 				invtlb(INVTLB_ADDR_GFALSE_AND_ASID, asid, start);
+-				start += (PAGE_SIZE << 1);
++				start += (MMUPAGE_SIZE << 1);
+ 			}
+ 		} else {
+ 			drop_mmu_context(mm, cpu);
+@@ -90,19 +90,19 @@ void local_flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ 	unsigned long size, flags;
+ 
+ 	local_irq_save(flags);
+-	size = (end - start + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
++	size = (end - start + (MMUPAGE_SIZE - 1)) >> MMUPAGE_SHIFT;
+ 	size = (size + 1) >> 1;
+ 	if (size <= (current_cpu_data.tlbsizestlbsets ?
+ 		     current_cpu_data.tlbsize / 8 :
+ 		     current_cpu_data.tlbsize / 2)) {
+ 
+-		start &= (PAGE_MASK << 1);
+-		end += ((PAGE_SIZE << 1) - 1);
+-		end &= (PAGE_MASK << 1);
++		start &= (MMUPAGE_MASK << 1);
++		end += ((MMUPAGE_SIZE << 1) - 1);
++		end &= (MMUPAGE_MASK << 1);
+ 
+ 		while (start < end) {
+ 			invtlb_addr(INVTLB_ADDR_GTRUE_OR_ASID, 0, start);
+-			start += (PAGE_SIZE << 1);
++			start += (MMUPAGE_SIZE << 1);
+ 		}
+ 	} else {
+ 		local_flush_tlb_kernel();
+@@ -118,7 +118,7 @@ void local_flush_tlb_page(struct vm_area_struct *vma, unsigned long page)
+ 		int newpid;
+ 
+ 		newpid = cpu_asid(cpu, vma->vm_mm);
+-		page &= (PAGE_MASK << 1);
++		page &= (MMUPAGE_MASK << 1);
+ 		invtlb(INVTLB_ADDR_GFALSE_AND_ASID, newpid, page);
+ 	} else {
+ 		cpumask_clear_cpu(cpu, mm_cpumask(vma->vm_mm));
+@@ -131,7 +131,7 @@ void local_flush_tlb_page(struct vm_area_struct *vma, unsigned long page)
+  */
+ void local_flush_tlb_one(unsigned long page)
+ {
+-	page &= (PAGE_MASK << 1);
++	page &= (MMUPAGE_MASK << 1);
+ 	invtlb_addr(INVTLB_ADDR_GTRUE_OR_ASID, 0, page);
+ }
+ 
+@@ -144,7 +144,7 @@ static void __update_hugetlb(struct vm_area_struct *vma, unsigned long address,
+ 
+ 	local_irq_save(flags);
+ 
+-	address &= (PAGE_MASK << 1);
++	address &= (MMUPAGE_MASK << 1);
+ 	write_csr_entryhi(address);
+ 	tlb_probe();
+ 	idx = read_csr_tlbidx();
+@@ -187,7 +187,7 @@ void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t *ptep
+ 	if ((unsigned long)ptep & sizeof(pte_t))
+ 		ptep--;
+ 
+-	address &= (PAGE_MASK << 1);
++	address &= (MMUPAGE_MASK << 1);
+ 	write_csr_entryhi(address);
+ 	tlb_probe();
+ 	idx = read_csr_tlbidx();
+@@ -211,17 +211,17 @@ static void __no_sanitize_address setup_ptwalker(void)
+ 	unsigned long pte_i = 0, pte_w = 0;
+ 
+ 	pgd_i = PGDIR_SHIFT;
+-	pgd_w = PAGE_SHIFT - 3;
++	pgd_w = MMUPAGE_SHIFT - 3;
+ #if CONFIG_PGTABLE_LEVELS > 3
+ 	pud_i = PUD_SHIFT;
+-	pud_w = PAGE_SHIFT - 3;
++	pud_w = MMUPAGE_SHIFT - 3;
+ #endif
+ #if CONFIG_PGTABLE_LEVELS > 2
+ 	pmd_i = PMD_SHIFT;
+-	pmd_w = PAGE_SHIFT - 3;
++	pmd_w = MMUPAGE_SHIFT - 3;
+ #endif
+-	pte_i = PAGE_SHIFT;
+-	pte_w = PAGE_SHIFT - 3;
++	pte_i = MMUPAGE_SHIFT;
++	pte_w = MMUPAGE_SHIFT - 3;
+ 
+ 	pwctl0 = pte_i | pte_w << 5 | pmd_i << 10 | pmd_w << 15 | pud_i << 20 | pud_w << 25;
+ 	pwctl1 = pgd_i | pgd_w << 6;
+diff --git a/arch/loongarch/mm/tlbex.S b/arch/loongarch/mm/tlbex.S
+index 84a881a339a7..b32113c349c0 100644
+--- a/arch/loongarch/mm/tlbex.S
++++ b/arch/loongarch/mm/tlbex.S
+@@ -11,10 +11,11 @@
+ 
+ #define INVTLB_ADDR_GFALSE_AND_ASID	5
+ 
+-#define PTRS_PER_PGD_BITS	(PAGE_SHIFT - PTRLOG)
+-#define PTRS_PER_PUD_BITS	(PAGE_SHIFT - PTRLOG)
+-#define PTRS_PER_PMD_BITS	(PAGE_SHIFT - PTRLOG)
+-#define PTRS_PER_PTE_BITS	(PAGE_SHIFT - PTRLOG)
++/* Page table index widths: MMUPAGE-sized tables, not PAGE-sized (PGCL) */
++#define PTRS_PER_PGD_BITS	(MMUPAGE_SHIFT - PTRLOG)
++#define PTRS_PER_PUD_BITS	(MMUPAGE_SHIFT - PTRLOG)
++#define PTRS_PER_PMD_BITS	(MMUPAGE_SHIFT - PTRLOG)
++#define PTRS_PER_PTE_BITS	(MMUPAGE_SHIFT - PTRLOG)
+ 
+ #ifdef CONFIG_32BIT
+ #define PTE_LL	ll.w
+@@ -98,7 +99,7 @@ vmalloc_done_load:
+ 	bltz		ra, tlb_huge_update_load
+ 
+ 	PTR_ROTRI	ra, ra, BITS_PER_LONG - (_PAGE_HUGE_SHIFT + 1)
+-	PTR_BSTRPICK	t0, t0, PTRS_PER_PTE_BITS + PAGE_SHIFT - 1, PAGE_SHIFT
++	PTR_BSTRPICK	t0, t0, PTRS_PER_PTE_BITS + MMUPAGE_SHIFT - 1, MMUPAGE_SHIFT
+ 	PTR_ALSL	t1, t0, ra, _PTE_T_LOG2
+ 
+ #ifdef CONFIG_SMP
+@@ -259,7 +260,7 @@ vmalloc_done_store:
+ 	bltz		ra, tlb_huge_update_store
+ 
+ 	PTR_ROTRI	ra, ra, BITS_PER_LONG - (_PAGE_HUGE_SHIFT + 1)
+-	PTR_BSTRPICK	t0, t0, PTRS_PER_PTE_BITS + PAGE_SHIFT - 1, PAGE_SHIFT
++	PTR_BSTRPICK	t0, t0, PTRS_PER_PTE_BITS + MMUPAGE_SHIFT - 1, MMUPAGE_SHIFT
+ 	PTR_ALSL	t1, t0, ra, _PTE_T_LOG2
+ 
+ #ifdef CONFIG_SMP
+@@ -447,7 +448,7 @@ vmalloc_done_modify:
+ 	bltz		ra, tlb_huge_update_modify
+ 
+ 	PTR_ROTRI	ra, ra, BITS_PER_LONG - (_PAGE_HUGE_SHIFT + 1)
+-	PTR_BSTRPICK	t0, t0, PTRS_PER_PTE_BITS + PAGE_SHIFT - 1, PAGE_SHIFT
++	PTR_BSTRPICK	t0, t0, PTRS_PER_PTE_BITS + MMUPAGE_SHIFT - 1, MMUPAGE_SHIFT
+ 	PTR_ALSL	t1, t0, ra, _PTE_T_LOG2
+ 
+ #ifdef CONFIG_SMP
+@@ -606,7 +607,7 @@ SYM_CODE_START(handle_tlb_refill)
+ 	ld.w		t0, t0, 0
+ 	csrrd		t1, LOONGARCH_CSR_TLBRBADV
+ 	slli.w		t1, t1, (32 - PGDIR_SHIFT)
+-	srli.w		t1, t1, (32 - PGDIR_SHIFT + PAGE_SHIFT + 1)
++	srli.w		t1, t1, (32 - PGDIR_SHIFT + MMUPAGE_SHIFT + 1)
+ 	slli.w		t1, t1, (0x2 + 1)
+ 	add.w		t0, t0, t1
+ 	and		t0, t0, ra
+diff --git a/arch/loongarch/vdso/vdso.S b/arch/loongarch/vdso/vdso.S
+index 46789bade6ff..a0924bd2dbc7 100644
+--- a/arch/loongarch/vdso/vdso.S
++++ b/arch/loongarch/vdso/vdso.S
+@@ -13,10 +13,10 @@
+ 	__PAGE_ALIGNED_DATA
+ 
+ 	.globl vdso_start, vdso_end
+-	.balign PAGE_SIZE
++	.balign MMUPAGE_SIZE
+ vdso_start:
+ 	.incbin "arch/loongarch/vdso/vdso.so"
+-	.balign PAGE_SIZE
++	.balign MMUPAGE_SIZE
+ vdso_end:
+ 
+ 	.previous
+-- 
+2.54.0
+
