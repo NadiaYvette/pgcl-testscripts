@@ -49,7 +49,9 @@ not a page-size change.
 ## Where everything lives
 - **Kernel:** `github.com/NadiaYvette/linux` — branch `pgcl-rfc-v1` (the posted
   series) and `nadia.chambers/page-clustering-001` (full development tree).
-  Mirror: `git.sr.ht/~nadiayvette/linux-pgcl`.
+  Mirror: `git.sr.ht/~nadiayvette/linux-pgcl`. Framagit/Disroot can't host a full
+  kernel tree, so a thin git bundle of all PGCL branches (≈900 K, restorable atop
+  v7.1) lives at `kernel-bundles/` in this repo — durable on all four mirrors.
 - **This repo** (test harness, docs, reproductions) — mirrored to github,
   disroot, sourcehut, framagit as `pgcl-testscripts`.
 - **RFC prose + patches:** `PGCL-COVER-LETTER.md`, `rfc-v1/` (cover + 28 patches).
