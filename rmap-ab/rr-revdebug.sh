@@ -25,6 +25,6 @@ taskset -c 8-11 "$QB/qemu-system-x86_64" -icount shift=auto,sleep=off,rr=replay,
 QPID=$!
 for t in $(seq 1 20); do ss -ltn 2>/dev/null | grep -q ':1234' && break; sleep 1; done
 echo "qemu pid=$QPID, gdbstub ready; gdb starting (watch rr-console.log for replay progress)"
-timeout "$TMO" gdb -nx -batch -x "$GDBF" "$O/vmlinux" 2>&1
+timeout "$TMO" gdb -nx -x "$GDBF" "$O/vmlinux" </dev/null 2>&1
 echo "gdb finished rc=$?  (last guest console: $(grep -aoE '^\[[ 0-9.]+\]' "$D"/rr-console.log 2>/dev/null | tail -1))"
 kill -9 $QPID 2>/dev/null; true
