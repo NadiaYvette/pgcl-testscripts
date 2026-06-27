@@ -132,3 +132,18 @@ mapcount/refcount detectors** (uncounted PTE; refcount reached 0 normally). The 
 probe MUST be **structural**: a PTE-scan for a present PTE pointing to a freed /
 refcount-0 cluster, or enrich bad_page to dump the orphan PTE's owning mm/vma/addr.
 Do not run further count-based A/B probes — they cannot see this bug.
+
+## Update 2026-06-27 (CBMC breakthrough): #143 is a UNIT-MISMATCH over-drop
+The richer CBMC structural model (rmap-ab/formal/, FINDINGS.md PART II) settled the
+mechanism: the orphan is NOT a refcount/lock bug and NOT the PTL-drop race (both
+proven insufficient) — it REQUIRES an **over-drop unit mismatch**: a remove path
+drops ref/rmap for more sub-PTEs than the PTEs it clears in one PTL-section, on a
+shared cluster that straddles a pte-table boundary (PVMW_PGTABLE_CROSSED) or is
+gapped. refcount reaches 0 normally while PAGE_MMUCOUNT-1 sub-PTEs stay present →
+print_bad_pte. This explains why all 4 count-based fix-classes refuted ("the books
+look locally fine"). **Fix:** clear + rmap-drop + ref-drop driven by ONE identical
+per-PTL-section nr (pvmw.nr_mmupages); no cluster-unit shortcut; no whole-folio
+once-only put on a partial cluster. Suspects: rmap.c:2545 early-out, PVMW
+nr_mmupages vs PGTABLE_CROSSED, try_to_migrate_one↔remove_migration_pte, zap_present_ptes.
+The A8 count-scanner is NULL here (sub-ms freed window); the per-section-nr tripwire
+at the remove site is the instrument. Agent A pinning the exact site.
