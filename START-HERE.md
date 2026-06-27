@@ -91,11 +91,13 @@ re-derive everything from:
 - **2001:** Hugh Dickins' "larpage" (Linux 2.4).
 - **2002-2003:** a large-memory-32-bit forward-port that booted Linux on x86-32
   (PAE) with 64 GiB of RAM on Sequent NUMA-Q hardware — to current knowledge the
-  first *verified, publicly-disclosed* characterisation of Linux at that scale.
-  Large-memory 32-bit itself was prior art (that platform ran 64 GiB under
-  DYNIX/ptx; unverified reports of Linux via a 2:2 address-space split were never
-  substantiated), but no such Linux configuration had been measured in the open
-  before. The memmap was made to fit by the author's earlier `struct page` size
+  first *verified, publicly-disclosed* account of Linux running *non-pathologically*
+  at that scale. Large-memory 32-bit itself was prior art (that platform ran 64 GiB
+  under DYNIX/ptx; unverified reports of Linux via a 2:2 address-space split were
+  never substantiated), but no such Linux configuration had been shown working in
+  the open before — `struct page` reduction alone left the memmap nearly exhausting
+  lowmem (scarcely enough kernel VA for `init`), and the address-space-split route
+  only deferred an ABI cost that bit once workloads wanted ~3 GiB of user VA. The memmap was made to fit by the author's earlier `struct page` size
   reductions and by page clustering (one `struct page` per cluster); clustering was
   chosen over address-space switching (XKVA / "4G:4G") because raising the
   allocation unit carries forward to 64-bit and to superpages. *(Archived on

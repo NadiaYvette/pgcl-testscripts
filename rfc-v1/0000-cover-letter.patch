@@ -253,18 +253,20 @@ times, including in the last two years. The through-line, for the record:
 - **The 2.4/2.5 forward-port.** I forward-ported and extended Hugh's larpage
   through the 2.4/2.5 era, including booting Linux on a 64 GiB NUMA-Q on 32-bit
   x86 (PAE) in 2003 — to my knowledge the first verified, publicly-disclosed
-  characterisation of Linux's behaviour at that scale. Large-memory 32-bit was not
-  itself new — that same NUMA-Q hardware ran 64 GiB under Sequent's DYNIX/ptx, and
-  unverified reports of Linux reaching such sizes via a 2:2 address-space split
-  circulated but were never substantiated — so the novelty was the open
-  characterisation, not the memory ceiling. Two things made a 64 GiB memmap fit in
-  32-bit lowmem: the `struct page` size reductions I had landed earlier, already
-  paying off before clustering, and page clustering's one `struct page` per cluster.
-  Page clustering was chosen there
-over full kernel/user address-space switching — the XKVA approach, from the
-DYNIX/ptx and AIX lineage I came from — precisely because address-space switching
-is a terminal 32-bit expedient, whereas raising the allocation unit carries
-forward to 64-bit, and, as it turned out, to superpages. The signed patch series
+  account of Linux running *non-pathologically* at that scale. Large-memory 32-bit
+  itself was not new — that same NUMA-Q hardware ran 64 GiB under Sequent's
+  DYNIX/ptx, and unverified reports of Linux reaching such sizes via a 2:2
+  address-space split circulated but were never substantiated — but "running well"
+  is the distinction. The `struct page` size reductions I had landed earlier
+  helped, yet on their own the memmap nearly exhausted lowmem, leaving scarcely
+  enough kernel virtual address space to run `init`; the address-space-split
+  alternative only deferred its ABI cost, which stayed beneath notice until a
+  workload actually wanted ~3 GiB of user virtual space (an Oracle or a DB2). Page
+  clustering — one `struct page` per cluster — is what turned 64 GiB from marginal
+  into comfortable, and it was chosen over kernel/user address-space switching (the
+  XKVA approach, from the DYNIX/ptx and AIX lineage I came from) because raising
+  the allocation unit carries forward to 64-bit, and, as it turned out, to
+  superpages. The signed patch series
   and the boot logs themselves are still archived [2]. (That work was published
   under my former byline; it is cited here as historical attribution.)
 - **Software PAGE_SIZE, 2007.** Andrea Arcangeli's "CONFIG_PAGE_SHIFT (aka
