@@ -106,3 +106,18 @@ one per-cluster bit while exclusivity is per-sub-PTE; migration (and likely fork
 mis-set it on shared clusters → breaks COW-reuse (ties to open #146 at mm/memory.c:4702)
 and/or teardown symmetry → freed-while-mapped. Artifacts: rmap-ab/fixes/143-producer-detector.patch,
 rmap-ab/build-run-143detect.sh, docs/143-notes/143-migration-anonexclusive-warn.txt.
+
+## Update 2026-06-27 (audit): AnonExclusive REFUTED; 3 fix-classes down; 2 real byproducts
+Rigorous audit: the per-cluster PageAnonExclusive bit is semantically correct
+(exclusivity is per-OWNER, not per-sub-PTE), migration computes it correctly, and
+migrate-out/in are ref+mapcount balanced. The rmap.c:1620/1635 WARNs are confirmed
+**false positives** (PGCL-blind), decorrelated from the crash. **Three #143 fix-classes
+now refuted:** consumer TTU_SYNC, producer-at-install resurrection, migration-AnonExclusive.
+**Real byproducts (separate from #143):** (1) #146 is a genuine large-folio unit bug —
+__wp_can_reuse_large_anon_folio compares MMUPAGE-granular folio_large_mapcount vs
+cluster-unit folio_nr_pages (fix: ×PAGE_MMUCOUNT); order-0 #143 unaffected. (2) Guard
+rmap.c:1620/1635 with `> PAGE_MMUCOUNT - 1` to unbury real corruption dumps.
+**#143 remaining:** (a) wrong-cluster-keyed add (#140 family; discriminator =
+`page_folio(target)!=folio` WARN at install loops); (b) free racing folio_try_get via a
+non-_refcount sentinel. **Next probe:** migrate-pair balance asserts (remove_migration_pte
++ try_to_migrate_one) — the freed-while-mapped creator, fires only on the bug.
