@@ -79,3 +79,15 @@ interleave). Bisected to the **MMUPAGE-unit rmap conversion** commits.
 - **build, no QEMU-rr:** A/B the candidate fix against `run-smp8-live.sh` (the oracle).
 - **full capability:** snapshot-near-crash reverse-debug (§5) for the authoritative trace; or
   re-capture with `rr-record.sh` under `memhog.sh` pressure.
+
+## Update 2026-06-27 (late): reverse-debug is NOT viable for this capture
+The snapshot-near-crash plan in §5 is **refuted**: a no-gdb, `sleep=off` replay of
+`rrcrash-4-KEEP.bin` timed out at 2400 s without reaching the crash — the icount
+*replay itself* is too slow, independent of gdb. **Reverse-debug of #143 is off the
+table.** The viable path is the **live -smp8 KVM oracle** (`rmap-ab/run-smp8-live.sh`
+/ `run-smp8-trip.sh`, fast, ~50-100% repro) as the A/B fix-tester, driven by the
+mechanism understanding: the fix-class is the **producer-side `folio_try_get`
+(increment-unless-zero) acquisition discipline** (CBMC-proven; `rmap-ab/formal/`).
+Fix-1 (consumer `TTU_SYNC`) was A/B-refuted (4/4). **Successor's task:** pin the
+cluster-ref acquisition site that lacks `try_get` protection (`docs/143-notes/`),
+apply `folio_try_get` (bail/retry on false), and A/B against the oracle.
