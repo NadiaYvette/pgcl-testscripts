@@ -1,0 +1,58 @@
+143-orphan-pte-scanner.patch + pgcl143_ptescan.c
+=================================================
+
+A STRUCTURAL detector for the #143 class of bug: an *orphan PTE* — a sub-PTE that
+stays PRESENT in a page table after its rmap entry and refcount were already
+removed, so the backing page/cluster is freed (refcount 0) while a live PTE still
+points at it.  The kernel later trips print_bad_page_map ("Bad page map ...
+mapcount:-1") at teardown and corrupts memory.
+
+WHY THIS, NOT A COUNTER
+-----------------------
+An orphan PTE is INVISIBLE to refcount/mapcount detectors: the leftover PTE is
+uncounted (its rmap is gone) and the freed page's refcount reached 0 normally.
+That is why four count-based #143 fix hypotheses all A/B-refuted (reclaim
+TTU_SYNC; producer refcount-0-at-install; AnonExclusive; migrate-pair imbalance).
+You have to look at the page tables *structurally*, not at the counts.
+
+WHAT IT DOES (two complementary parts)
+--------------------------------------
+1. mm/pgcl143_ptescan.c — a kthread ("pgcl143_scan") that walks every user mm's
+   page tables every ~300 ms and flags any PRESENT pte whose target page is
+   already freed (page_count == 0 or PageBuddy).  On the first hit it dumps the
+   owning pid/comm/addr/vm_flags, dump_page(), and — the payoff — dump_page_owner().
+2. A one-line enhancement to print_bad_page_map() (the existing teardown-side
+   symptom site) to also call dump_page_owner().
+
+THE LINCHPIN: page_owner's FREE stack
+-------------------------------------
+With CONFIG_PAGE_OWNER=y, dump_page_owner() prints the page's last-free stack —
+i.e. the exact call path that freed the page/cluster *while the orphan PTE was
+still live*.  That stack is the CREATOR of the orphan, which the symptom-side
+bad_page (a consumer-side detection) never tells you.  This is the whole point:
+turn a "found it too late" symptom into "here is who did it".
+
+REQUIREMENTS
+------------
+CONFIG_PAGE_OWNER=y (for the free stack) and CONFIG_DEBUG_VM=y (recommended).
+PGCL-gated: the file body is under #if PAGE_MMUSHIFT, so it is a no-op at
+PAGE_MMUSHIFT == 0.  pte_pfn() is assumed to yield the cluster pfn (PGCL model).
+
+APPLY / RUN
+-----------
+  cd <linux>; git apply /path/to/143-orphan-pte-scanner.patch
+  # build with PAGE_OWNER=y, boot under the reproducer (rmap-ab/run-smp8-live.sh).
+  # On the first orphan the console shows "PGCL143-ORPHAN" + the free stack;
+  # if the scanner misses the freed-window, the teardown "Bad page map" now
+  # also carries the free stack.  Tune the scan interval via scan_ms in the .c.
+
+GENERALISABLE
+-------------
+The idea — scan all PTEs for a present entry pointing at a refcount-0 / buddy page,
+then print page_owner's free stack — catches ANY use-after-free-via-stale-PTE, not
+just PGCL clusters.  Drop the #if PAGE_MMUSHIFT gate and the cluster assumption
+to use it on mainline.
+
+STATUS
+------
+Compiles clean; live -smp8 A/B result recorded in the hunt log / docs/143-notes/.

@@ -17,6 +17,8 @@ reusable feature once #143 is closed and the tracer is final.
 
 **Latest full snapshot (2026-06-22): `rmap-ab/tree-backup/rmap143-debug-snapshot-0aceb3e9864a-mmva-tombstone.diff`** (1034 lines, 7 files: rmap.c/memory.c/migrate.c/swap.c/truncate.c/vmscan.c/internal.h). Adds, on top of A1–A7 below: the **deep large-folio-only per-pfn ring** (`pgcl_lev`, head-pfn-keyed, retains a folio's full per-sub-PTE add/remove history under flood); the **(mm,va)-EXACT trackers** — a cluster-keyed add/remove bucket with net-classification `pgcl_va_dump` (under- vs over-remove verdict) and a per-`(mm,va)` **tombstone** hash `pgcl_svtab` (add-set / first-remove-tombstone / second-remove = double-remove dump) that survives pfn reuse and names install vs first-remove paths; **caller-tagged removes** (`pgcl_rm_caller`: `z`=zap/munmap/truncate, `w`=rmap-walk reclaim/migrate) so a remove's *path* is recorded; the `S`(set_pte_range file install) and `M`(migration restore) add tags. These are what drove the #143 narrowing to "shared FILE folio, aggregate/cross-mm over-decrement" — see [[pgcl143-rmap-underflow-hunt]] for the result trail.
 
+**Structural detector added (2026-06-27): `rmap-ab/fixes/143-orphan-pte-scanner.patch`** (+ standalone `pgcl143_ptescan.c` + README) — the in-kernel orphan-PTE scanner (**A8** below). The big lesson of the #143 hunt: the count-based pieces (A1–A3, A7) are **structurally blind to an orphan PTE** (a present sub-PTE whose rmap+ref were already removed) — which is exactly what #143 turned out to be. A8 walks the page tables instead of the counts, and uses `page_owner`'s free stack to name the creator.
+
 ---
 
 ## A. Kernel-side (mm/rmap.c, mm/memory.c, mm/swap.c, mm/internal.h)
@@ -102,6 +104,33 @@ points at a freed page — with the **freer/zapper backtrace + page state**. Gre
 the serial log for these *before* reaching for custom probes; #143's smoking gun
 (`Bad page map ... ext4 file vma ... pfn refcount:0 mapcount:-1`) came from here.
 
+### A8. Structural orphan-PTE scanner + page_owner free-stack  *(generic; the count blind-spot fix)*
+`mm/pgcl143_ptescan.c` — saved as `rmap-ab/fixes/143-orphan-pte-scanner.patch`
+(new file + `mm/Makefile` + a one-line `print_bad_page_map` hook), plus the
+standalone `rmap-ab/fixes/pgcl143_ptescan.c` and `.README.txt`.
+
+Everything above (A1–A3) and the kernel's own checks (A7) are **count-based**, and
+an *orphan PTE* — a sub-PTE left PRESENT after its rmap entry and refcount were
+already removed — is **invisible to all of them**: the leftover PTE is uncounted
+(its rmap is gone) and the freed cluster's refcount reached 0 *normally*. (This is
+why four count-based #143 fix hypotheses A/B-refuted; `pgcl143_freed_mapped` (A2)
+keys on `folio_mapped()`, which is *false* for an orphan.) A8 closes the blind spot
+**structurally**:
+- a kthread (`pgcl143_scan`) walks every user mm's page tables every ~300 ms and
+  flags any PRESENT pte whose target page is already freed (`page_count==0` /
+  `PageBuddy`); on the first hit it dumps pid/comm/addr/vm_flags, `dump_page()`,
+  and `dump_page_owner()` — whose **FREE stack is the path that freed the cluster
+  while the PTE was live = the orphan's CREATOR** (the thing the consumer-side
+  bad_page never tells you);
+- a one-line `print_bad_page_map()` enhancement so the teardown-side symptom (A7)
+  also carries the free stack.
+
+Requires `CONFIG_PAGE_OWNER=y`. It is the **in-kernel analogue** of the F
+dangle-probe (QEMU pgd-walk) and the realization of the F.1 "PTE-vs-struct-page
+discrepancy" NEXT — but in-tree, no QEMU patch. Generic: drop the `#if
+PAGE_MMUSHIFT` gate + the cluster-pfn assumption and it catches any
+use-after-free-via-stale-PTE on mainline.
+
 ---
 
 ## B. Userspace reproducers (userspace/)
@@ -174,7 +203,12 @@ Recurring traps documented the hard way: shared-atomic probes suppress tight
 races; KCSAN perturbs heavily and misses pure atomic-ordering; a ring must
 retain per-pfn history (a flat ring rolls the adds out under load); the
 consequence (teardown underflow) is often far in time and space from the cause
-(the dropped/uncounted mapping).
+(the dropped/uncounted mapping). **And the biggest one (#143's lesson): a
+freed-while-mapped *orphan PTE* is invisible to every mapcount/refcount probe —
+the leftover PTE is uncounted and the free looks normal. When count-based
+detectors all come up empty on a freed-while-mapped symptom, switch to a
+*structural* PTE-scan (A8) or the QEMU pgd-walk (F), and lean on `page_owner`'s
+free stack to name the creating path.**
 
 ---
 
