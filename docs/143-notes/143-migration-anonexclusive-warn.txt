@@ -1,0 +1,24 @@
+[   10.864745] WARNING: mm/rmap.c:1620 at folio_add_anon_rmap_ptes+0x40a/0x5e0, CPU#4: kcompactd0/73
+[   10.870652] Modules linked in:
+[   10.872917] CPU: 4 UID: 0 PID: 73 Comm: kcompactd0 Not tainted 7.1.0-pgcl4debug11+ #83 PREEMPT(lazy) 
+[   10.878797] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org 04/01/2014
+[   10.885544] RIP: 0010:folio_add_anon_rmap_ptes+0x40a/0x5e0
+[   10.888776] Code: fa ff ff 7f 00 0f 8f c7 fe ff ff e9 c4 fe ff ff 8b 45 30 85 c0 0f 8e b6 fd ff ff 48 c7 c6 e8 5f e5 82 48 89 ef e8 96 c3 fc ff <0f> 0b e9 a0 fd ff ff b8 01 00 00 00 49 39 c4 75 95 48 b8 0e 00 00
+[   10.899456] RSP: 0000:ffffc90000bc3840 EFLAGS: 00010246
+[   10.902312] RAX: 0000000000000080 RBX: ffffea0000192800 RCX: 0000000000000003
+[   10.906419] RDX: 0000000000000000 RSI: 0000000000000003 RDI: 0000000000000001
+[   10.910567] RBP: ffffea0000192800 R08: 0000000000000000 R09: ffffc90000bc36d8
+[   10.914462] R10: ffffffff83360588 R11: 3fffffffffffdfff R12: 0000000000000001
+[   10.918345] R13: ffff88800c5a1e00 R14: 0000000000000001 R15: ffffea0000192800
+[   10.922176] FS:  0000000000000000(0000) GS:ffff8880fb740000(0000) knlGS:0000000000000000
+[   10.926493] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[   10.929560] CR2: 00007db7e7677000 CR3: 00000000086f0006 CR4: 0000000000770ef0
+[   10.933358] PKRU: 55555554
+[   10.934912] Call Trace:
+[   10.936314]  <TASK>
+[   10.937507]  remove_migration_pte+0x893/0xa80
+[   10.939960]  rmap_walk_anon+0x10a/0x260
+[   10.942089]  migrate_folio_move+0x353/0x470
+[   10.944389]  ? __pfx_compaction_free+0x10/0x10
+[   10.946815]  ? __pfx_remove_migration_pte+0x10/0x10
+--

@@ -91,3 +91,18 @@ mechanism understanding: the fix-class is the **producer-side `folio_try_get`
 Fix-1 (consumer `TTU_SYNC`) was A/B-refuted (4/4). **Successor's task:** pin the
 cluster-ref acquisition site that lacks `try_get` protection (`docs/143-notes/`),
 apply `folio_try_get` (bail/retry on false), and A/B against the oracle.
+
+## Update 2026-06-27 (detector): at-install resurrection REFUTED → migration/AnonExclusive lead
+Built a non-perturbing detector (VM_WARN_ON_ONCE(!folio_ref_count(folio)) before each
+per-cluster rmap-add) and ran it 8x on the live -smp8 oracle. **The 4 install-site
+detectors fired 0/8** — there is NO refcount-0 map at filemap_set_ptes_cluster /
+set_pte_range / do_swap_page / map_anon_folio, so the at-install producer-resurrection
+is refuted (matches the audit's "no missing folio_try_get site"). The ONLY rmap anomaly
+the repro produces: **remove_migration_pte (kcompactd) marks MULTIPLY-mapped (shared)
+order-0 clusters PageAnonExclusive**, tripping rmap.c:1620 + :1635 ~1576x. Decorrelated
+from the kill-init, but it is the sole rmap anomaly and lives on a PVMW-PTL-dropping path
+over shared clusters (the §4 hypothesis). **Leading lead now:** PGCL's AnonExclusive is
+one per-cluster bit while exclusivity is per-sub-PTE; migration (and likely fork/COW)
+mis-set it on shared clusters → breaks COW-reuse (ties to open #146 at mm/memory.c:4702)
+and/or teardown symmetry → freed-while-mapped. Artifacts: rmap-ab/fixes/143-producer-detector.patch,
+rmap-ab/build-run-143detect.sh, docs/143-notes/143-migration-anonexclusive-warn.txt.
